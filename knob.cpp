@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.10.0"
-#define APP_VERNUM  ((1 << 16) | (10 << 8) | 0)
+#define APP_VERSION L"1.11.0"
+#define APP_VERNUM  ((1 << 16) | (11 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1549,6 +1549,18 @@ static void Text(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r, Strin
     SolidBrush b(c);
     g.DrawString(s, -1, f, r, &sf, &b);
 }
+static int TextLines(Graphics& g, const wchar_t* s, Font* f, float w) {   // wrapped line count
+    StringFormat sf; RectF out; INT chars = 0, lines = 0;
+    g.MeasureString(s, -1, f, RectF(0, 0, w, 10000), &sf, &out, &chars, &lines);
+    return std::max(1, (int)lines);
+}
+static void TextWrap(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r) {   // top-aligned, wraps, ellipsis on overflow
+    StringFormat sf;
+    sf.SetTrimming(StringTrimmingEllipsisWord);
+    sf.SetFormatFlags(StringFormatFlagsLineLimit);
+    SolidBrush b(c);
+    g.DrawString(s, -1, f, r, &sf, &b);
+}
 static float TextW(Graphics& g, const wchar_t* s, Font* f) { RectF out; g.MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width; }
 static void Glyph(Graphics& g, wchar_t ch, Font* f, Color c, float cx, float cy) {
     wchar_t s[2] = {ch, 0};
@@ -2520,15 +2532,25 @@ static void PaintSettings(HDC hdc) {
         Text(g, SP_NAMES[g_setPage], &fTitle, T.t1, RectF(x0 + S(4), y, cw, S(40)));
         y += S(60);
         auto cardRect = [&](float h) { RectF r(x0, y, cw, h); y += h + S(4); return r; };
+        const float lineH = fDesc.GetHeight(&g);
+        auto descLines = [&](const wchar_t* d, float right) { return (d && *d) ? std::min(2, TextLines(g, d, &fDesc, cw - right - S(24))) : 0; };
+        auto cardH = [&](const wchar_t* d, float right) { int n = descLines(d, right); return n == 0 ? S(52) : n == 1 ? S(64) : S(46) + 2 * lineH + S(14); };
+        auto para = [&](const wchar_t* t, float gap) {   // full-width help text, wraps as needed
+            float h = TextLines(g, t, &fDesc, cw) * lineH;
+            TextWrap(g, t, &fDesc, T.t3, RectF(x0 + S(4), y, cw, h + S(2)));
+            y += h + gap;
+        };
         auto titleDesc = [&](RectF r, const wchar_t* t, const wchar_t* d, float right) {
             if (d && *d) {
-                Text(g, t, &fBody, T.t1, RectF(r.X + S(18), r.Y + S(12), r.Width - right - S(24), S(22)));
-                Text(g, d, &fDesc, T.t3, RectF(r.X + S(18), r.Y + S(34), r.Width - right - S(24), S(20)));
+                int n = descLines(d, right);
+                float top = r.Y + (r.Height - (S(22) + n * lineH + S(2))) / 2;
+                Text(g, t, &fBody, T.t1, RectF(r.X + S(18), top, r.Width - right - S(24), S(22)));
+                TextWrap(g, d, &fDesc, T.t3, RectF(r.X + S(18), top + S(22), r.Width - right - S(24), n * lineH + S(2)));
             } else Text(g, t, &fBody, T.t1, RectF(r.X + S(18), r.Y, r.Width - right - S(24), r.Height));
         };
         auto section = [&](const wchar_t* t) { y += S(14); Text(g, t, &fBody600, T.t1, RectF(x0 + S(4), y, cw, S(22))); y += S(30); };
         auto switchCard = [&](int id, const wchar_t* t, const wchar_t* d, bool on) {
-            RectF r = cardRect(d && *d ? S(64) : S(52));
+            RectF r = cardRect(cardH(d, S(90)));
             add(SK_SWITCH, id, r);
             FillRound(g, isHover(SK_SWITCH, id) ? cardHover : card, r, S(6));
             titleDesc(r, t, d, S(90));
@@ -2536,7 +2558,7 @@ static void PaintSettings(HDC hdc) {
             DrawSwitch(g, r.X + r.Width - S(18) - S(40), r.Y + r.Height / 2, on);
         };
         auto linkCard = [&](int id, const wchar_t* t, const wchar_t* d) {
-            RectF r = cardRect(d && *d ? S(64) : S(52));
+            RectF r = cardRect(cardH(d, S(50)));
             add(SK_LINK, id, r);
             FillRound(g, isHover(SK_LINK, id) ? cardHover : card, r, S(6));
             titleDesc(r, t, d, S(50));
@@ -2578,8 +2600,7 @@ static void PaintSettings(HDC hdc) {
                 button(SK_RESETHK, 0, RectF(r.X + r.Width - S(18) - S(140), r.Y + S(10), S(140), S(32)), L"Clear");
             }
             y += S(6);
-            Text(g, L"Opens or closes the Knob panel from anywhere. Click it, then press the new keys (Ctrl, Alt, Shift or Win plus a key). Esc cancels, Backspace turns it off.", &fDesc, T.t3, RectF(x0 + S(4), y, cw, S(36)));
-            y += S(40);
+            para(L"Opens or closes the Knob panel from anywhere. Click it, then press the new keys (Ctrl, Alt, Shift or Win plus a key). Esc cancels, Backspace turns it off.", S(4));
             section(L"Windows settings");
             linkCard(1, L"Sound settings", L"");
             linkCard(2, L"Display settings", L"");
@@ -2588,7 +2609,7 @@ static void PaintSettings(HDC hdc) {
               button(SK_BUTTON, 1, RectF(r.X + r.Width - S(18) - S(110), r.Y + S(10), S(110), S(32)), L"Exit"); }
             break;
         case SP_APPEAR: {
-            RectF r = cardRect(S(64)); FillRound(g, card, r, S(6));
+            RectF r = cardRect(cardH(L"Glass needs Windows 11 22H2 or newer; older versions use Solid", S(200))); FillRound(g, card, r, S(6));
             titleDesc(r, L"Style", T.dark || true ? L"Glass needs Windows 11 22H2 or newer; older versions use Solid" : L"", S(200));
             RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
             FillRound(g, T.subtle, box, S(8));
@@ -2617,8 +2638,8 @@ static void PaintSettings(HDC hdc) {
             break;
         }
         case SP_SOUND:
-            Text(g, L"When several outputs are selected, the main (Windows default) output plays normally and Knob copies its sound to the others. Bluetooth adds its own delay, so delay the faster outputs until they line up.", &fDesc, T.t3, RectF(x0 + S(4), y - S(8), cw, S(52)));
-            y += S(48);
+            y -= S(8);
+            para(L"When several outputs are selected, the main (Windows default) output plays normally and Knob copies its sound to the others. Bluetooth adds its own delay, so delay the faster outputs until they line up.", S(12));
             for (int i = 0; i < (int)g_out.size(); i++) {
                 Endpoint& o = g_out[i];
                 bool main = o.isDefault, on = OutSelected(i);
@@ -2640,8 +2661,8 @@ static void PaintSettings(HDC hdc) {
         case SP_DISPLAY:
             switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
             section(L"Profiles");
-            Text(g, L"Save the brightness and contrast of every display, then switch with one click from the Display tab.", &fDesc, T.t3, RectF(x0 + S(4), y - S(4), cw, S(36)));
-            y += S(30);
+            y -= S(4);
+            para(L"Save the brightness and contrast of every display, then switch with one click from the Display tab.", S(10));
             for (int i = 0; i < (int)g_prof.size(); i++) {
                 RectF r = cardRect(S(64)); FillRound(g, card, r, S(6));
                 bool active = ProfileActive(i);
@@ -2671,12 +2692,14 @@ static void PaintSettings(HDC hdc) {
             Text(g, L"No install, no background services — only built-in Windows parts.", &fDesc, T.t3, RectF(r.X + S(18), r.Y + S(62), r.Width - S(36), S(20)));
             { RectF r = cardRect(S(64)); FillRound(g, card, r, S(6));
               std::wstring st = g_updStatus.empty() ? L"Checks github.com/" UPDATE_REPO L" every 6 hours" : g_updStatus;
+              r.Height = cardH(st.c_str(), S(170)); y += r.Height - S(64); FillRound(g, card, r, S(6));
               titleDesc(r, L"Updates", st.c_str(), S(170));
-              if (g_updState == UPD_AVAILABLE) button(SK_BUTTON, 4, RectF(r.X + r.Width - S(18) - S(150), r.Y + S(16), S(150), S(32)), (L"Update to " + g_updVersion).c_str(), true);
-              else button(SK_BUTTON, 3, RectF(r.X + r.Width - S(18) - S(150), r.Y + S(16), S(150), S(32)), g_updState == UPD_DOWNLOADING ? L"Updating\u2026" : L"Check now", false, g_updState != UPD_DOWNLOADING); }
+              if (g_updState == UPD_AVAILABLE) button(SK_BUTTON, 4, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), (L"Update to " + g_updVersion).c_str(), true);
+              else button(SK_BUTTON, 3, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), g_updState == UPD_DOWNLOADING ? L"Updating\u2026" : L"Check now", false, g_updState != UPD_DOWNLOADING); }
             linkCard(3, L"Open the settings folder", L"settings.ini lives in %APPDATA%\\Knob");
-            { RectF r = cardRect(S(64)); FillRound(g, card, r, S(6)); titleDesc(r, L"Reset all settings", L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness", S(160));
-              button(SK_BUTTON, 2, RectF(r.X + r.Width - S(18) - S(130), r.Y + S(16), S(130), S(32)), L"Reset settings"); }
+            { const wchar_t* rd = L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness";
+              RectF r = cardRect(cardH(rd, S(160))); FillRound(g, card, r, S(6)); titleDesc(r, L"Reset all settings", rd, S(160));
+              button(SK_BUTTON, 2, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)), L"Reset settings"); }
             break;
         }
         }
@@ -2845,7 +2868,7 @@ static void OpenSettings(int page, bool newProfile) {
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
         RECT r = {0, 0, (LONG)S(820), (LONG)S(600)};
-        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME;
+        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;   // fixed size
         AdjustWindowRectExForDpi(&r, style, FALSE, 0, dx);
         int w = r.right - r.left, hgt = r.bottom - r.top;
         int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2, y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - hgt) / 2;
