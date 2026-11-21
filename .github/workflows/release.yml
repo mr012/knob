@@ -2,7 +2,9 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths: [knob.cpp, app.rc, app.manifest, build.sh, .github/workflows/release.yml]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,16 +18,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip
       - name: Build
         run: sh build.sh
-      - name: Check version matches tag
-        run: |
-          v=$(grep -oP '#define APP_VERSION L"\K[^"]+' knob.cpp)
-          test "v$v" = "$GITHUB_REF_NAME" || { echo "knob.cpp says $v but tag is $GITHUB_REF_NAME"; exit 1; }
-      - name: Package
-        run: zip "Knob-${GITHUB_REF_NAME#v}.zip" Knob.exe
-      - name: Publish release
+      - name: Publish release if this version is new
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" Knob.exe "Knob-${GITHUB_REF_NAME#v}.zip" \
-            --title "Knob ${GITHUB_REF_NAME#v}" \
+          v=$(grep -oP '#define APP_VERSION L"\K[^"]+' knob.cpp)
+          if gh release view "v$v" >/dev/null 2>&1; then echo "v$v already released"; exit 0; fi
+          zip "Knob-$v.zip" Knob.exe
+          gh release create "v$v" Knob.exe "Knob-$v.zip" --target "$GITHUB_SHA" \
+            --title "Knob $v" \
             --notes "Download **Knob.exe** and run it. It installs itself to %LOCALAPPDATA%\\Knob and replaces any older version."

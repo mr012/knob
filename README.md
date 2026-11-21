@@ -44,7 +44,6 @@ sudo apt install g++-mingw-w64-x86-64
 ## Releasing
 
 1. Bump `APP_VERSION` / `APP_VERNUM` in `knob.cpp` and the versions in `app.rc` and `app.manifest`.
-2. Commit, then push a tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. The Release workflow builds `Knob.exe` and publishes the GitHub release with it attached.
+2. Push to `main`. The Release workflow builds `Knob.exe` and, if that version has no release yet, publishes `vX.Y.Z` with it attached.
 
 Running copies of Knob check the latest release every 6 hours and offer the update in the panel's footer.
