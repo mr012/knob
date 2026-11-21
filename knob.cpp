@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.11.0"
-#define APP_VERNUM  ((1 << 16) | (11 << 8) | 0)
+#define APP_VERSION L"1.12.0"
+#define APP_VERNUM  ((1 << 16) | (12 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1008,7 +1008,7 @@ static void LoadTheme() {
     T.subtle2 = d ? Color(23, 255, 255, 255) : Color(15, 0, 0, 0);
     T.subtle3 = d ? Color(31, 255, 255, 255) : Color(23, 0, 0, 0);
     if (gl) {
-        T.surface = d ? Color(158, 32, 32, 32) : Color(179, 243, 243, 243);
+        T.surface = d ? Color(36, 24, 24, 24) : Color(40, 250, 250, 250);   // light wash; the acrylic tint does the rest
         T.tabsBg = d ? Color(15, 255, 255, 255) : Color(10, 0, 0, 0);
         T.tabSel = d ? Color(33, 255, 255, 255) : Color(217, 255, 255, 255);
         T.badge = d ? Color(26, 255, 255, 255) : Color(15, 0, 0, 0);
@@ -2093,11 +2093,30 @@ static void RunHotkey(int a) {
 }
 
 // ---------------------------------------------------------------- style (Solid / Glass)
+// Acrylic blur with our own tint (the system backdrop's built-in tint is too heavy to read as glass)
+struct KnobAccentPolicy { int state; int flags; DWORD gradient; int anim; };
+struct KnobWinCompAttr { int attr; PVOID data; SIZE_T size; };
+typedef BOOL (WINAPI* PFN_SWCA)(HWND, KnobWinCompAttr*);
+static bool SetAccent(HWND h, int state, DWORD abgr) {
+    static PFN_SWCA swca = (PFN_SWCA)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+    if (!swca) return false;
+    KnobAccentPolicy ap = {state, 0, abgr, 0};
+    KnobWinCompAttr d = {19 /*WCA_ACCENT_POLICY*/, &ap, sizeof(ap)};
+    return swca(h, &d) != FALSE;
+}
+static bool TransparencyOn() {   // Settings > Personalization > Colors > Transparency effects
+    DWORD v = 1, sz = sizeof(v);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"EnableTransparency", RRF_RT_REG_DWORD, nullptr, &v, &sz);
+    return v != 0;
+}
 static void ApplyStyle() {
-    bool want = g_style == 1;
-    int backdrop = want ? 3 : 1;   // DWMSBT_TRANSIENTWINDOW (acrylic) : DWMSBT_NONE
-    HRESULT hr = DwmSetWindowAttribute(g_hwnd, 38, &backdrop, sizeof(backdrop));   // Windows 11 22H2+
-    T.glass = want && SUCCEEDED(hr);
+    LoadTheme();   // need T.dark for the tint
+    bool want = g_style == 1 && TransparencyOn();
+    int none = 1; DwmSetWindowAttribute(g_hwnd, 38, &none, sizeof(none));   // no system backdrop; we blur ourselves
+    // tint is AABBGGRR: dark ~45% #1C1C1C, light ~55% #F3F3F3
+    DWORD tint = T.dark ? 0x731C1C1C : 0x8CF3F3F3;
+    T.glass = want && SetAccent(g_hwnd, 4 /*ACCENT_ENABLE_ACRYLICBLURBEHIND*/, tint);
+    if (!T.glass) SetAccent(g_hwnd, 0, 0);
     MARGINS m = T.glass ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
     DwmExtendFrameIntoClientArea(g_hwnd, &m);
     BOOL dark = T.dark;
