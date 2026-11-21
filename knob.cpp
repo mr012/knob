@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.13.0"
-#define APP_VERNUM  ((1 << 16) | (13 << 8) | 0)
+#define APP_VERSION L"1.14.0"
+#define APP_VERNUM  ((1 << 16) | (14 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1637,7 +1637,18 @@ static void DrawEl(Graphics& g, int index) {
     El& e = g_els[index];
     if (e.r.Y + e.r.Height < PaneTop() || e.r.Y > PaneBottom()) return;
     bool hovEl = g_hover.el == index;
-    if (e.k == E_H3) { SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1)); return; }
+    if (e.k == E_H3) {
+        SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
+        int n = e.text == L"OUTPUT" ? SelectedOutCount() : 0;
+        if (n > 1) {   // multi-output status, right side of the OUTPUT label
+            wchar_t st[48]; swprintf(st, 48, L"Playing on %d outputs", n);
+            float tw = TextW(g, st, g_fSmall), tx = e.r.X + e.r.Width - tw;
+            SolidBrush dot(T.accent);
+            g.FillEllipse(&dot, tx - S(12), e.r.Y + e.r.Height / 2 - S(3), S(6), S(6));
+            Text(g, st, g_fSmall, T.t3, RectF(tx - S(2), e.r.Y - S(4), tw + S(4), e.r.Height + S(8)));
+        }
+        return;
+    }
     if (e.k == E_NOTE) {
         StringFormat sf; sf.SetLineAlignment(StringAlignmentNear); SolidBrush b(T.t3);
         g.DrawString(e.text.c_str(), -1, g_fSmall, e.r, &sf, &b); return;
@@ -1652,9 +1663,10 @@ static void DrawEl(Graphics& g, int index) {
         if (e.k == E_MASTER) FillRound(g, T.master, e.r, S(10));
         else if (sel) {
             if (T.glass && !T.dark) FillRound(g, Color(90, 255, 255, 255), e.r, S(10));
-            int a = T.glass ? (T.dark ? (rowHover ? 44 : 34) : (rowHover ? 38 : 30)) : (rowHover ? 32 : 24);
+            FillRound(g, rowHover ? T.subtle2 : T.subtle, e.r, S(10));   // neutral lift, then a light accent wash
+            int a = T.glass ? (T.dark ? (rowHover ? 22 : 16) : (rowHover ? 20 : 14)) : (rowHover ? 18 : 13);
             FillRound(g, WithAlpha(T.accent, a), e.r, S(10));
-        } else if (playing) FillRound(g, WithAlpha(T.accent, T.glass ? 26 : 18), e.r, S(10));
+        } else if (playing) FillRound(g, WithAlpha(T.accent, T.glass ? 14 : 11), e.r, S(10));
         else if (pickable && rowHover) FillRound(g, T.hover, e.r, S(10));
 
         float cy1 = RowCy1(e), cy2 = RowCy2(e), lx = e.r.X + S(8) + S(14);
@@ -1988,14 +2000,6 @@ static void Paint(HDC hdc) {
                 Text(g, vt.c_str(), g_fSmall, T.t3, RectF(vx, fy - S(10), vw + S(4), S(20)));
                 vx += vw;
             }
-        }
-        int n = SelectedOutCount();
-        if (n > 1 && g_updState == UPD_NONE) {
-            float sx = vx + S(12);
-            SolidBrush dot(T.accent);
-            g.FillEllipse(&dot, sx, fy - S(3), S(6), S(6));
-            wchar_t st[48]; swprintf(st, 48, L"Playing on %d outputs", n);
-            Text(g, st, g_fSmall, T.t3, RectF(sx + S(12), fy - S(10), MicAllRect().X - sx - S(16), S(20)));
         }
         {   // mute every microphone
             RectF r = MicAllRect();
