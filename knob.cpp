@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.14.0"
-#define APP_VERNUM  ((1 << 16) | (14 << 8) | 0)
+#define APP_VERSION L"1.15.0"
+#define APP_VERNUM  ((1 << 16) | (15 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2372,33 +2372,20 @@ static bool HttpGet(const std::wstring& url, std::string& out, const std::wstrin
     WinHttpCloseHandle(ses);
     return ok;
 }
-static std::string JsonStr(const std::string& j, const std::string& key, size_t from = 0, size_t* at = nullptr) {
-    size_t k = j.find("\"" + key + "\"", from);
-    if (k == std::string::npos) return "";
-    size_t q1 = j.find('"', j.find(':', k) + 1); if (q1 == std::string::npos) return "";
-    size_t q2 = j.find('"', q1 + 1); if (q2 == std::string::npos) return "";
-    if (at) *at = q2;
-    return j.substr(q1 + 1, q2 - q1 - 1);
-}
 struct UpdInfo { std::wstring version, url; };
+// Updates come straight from the repo: dist/version.txt + dist/Knob.exe on the main branch
+#define UPDATE_RAW L"https://raw.githubusercontent.com/" UPDATE_REPO L"/main/dist/"
 static DWORD WINAPI UpdateCheckProc(LPVOID) {
     std::string j;
     UpdInfo* info = nullptr;
     DWORD code = 0;
-    WPARAM kind = 0;   // 0 = result or unreachable, 2 = no release (nothing to update to)
-    if (HttpGet(L"https://api.github.com/repos/" UPDATE_REPO L"/releases/latest", j, L"", &code)) {
-        std::string tag = JsonStr(j, "tag_name");
-        std::string url;   // first asset whose name ends in .exe
-        size_t pos = 0, at = 0;
-        while (true) {
-            std::string u = JsonStr(j, "browser_download_url", pos, &at);
-            if (u.empty()) break;
-            if (u.size() > 4 && _stricmp(u.c_str() + u.size() - 4, ".exe") == 0) { url = u; break; }
-            pos = at + 1;
-        }
-        if (!tag.empty() && !url.empty()) info = new UpdInfo{std::wstring(tag.begin(), tag.end()), std::wstring(url.begin(), url.end())};
-        else kind = 2;   // a release without Knob.exe
-    } else if (code == 404) kind = 2;   // repo has no releases
+    WPARAM kind = 0;   // 0 = result or unreachable, 2 = no build in the repo yet
+    if (HttpGet(UPDATE_RAW L"version.txt", j, L"", &code)) {
+        std::string v;
+        for (char c : j) if ((c >= '0' && c <= '9') || c == '.') v += c; else if (!v.empty()) break;
+        if (!v.empty()) info = new UpdInfo{std::wstring(v.begin(), v.end()), UPDATE_RAW L"Knob.exe"};
+        else kind = 2;
+    } else if (code == 404) kind = 2;
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_UPDINFO, kind, (LPARAM)info)) delete info;
     InterlockedExchange(&g_updBusy, 0);
     return 0;
@@ -2932,7 +2919,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_VERSION: return APP_VERNUM;
     case WM_APP_UPDINFO: {
         if (wp == 1) { g_updState = UPD_FAILED; g_updStatus = L"Download failed"; }
-        else if (wp == 2) { g_updState = UPD_NONE; g_updStatus = L"No releases on GitHub yet \u00B7 you're up to date"; }
+        else if (wp == 2) { g_updState = UPD_NONE; g_updStatus = L"No build on GitHub yet \u00B7 you're up to date"; }
         else if (UpdInfo* u = (UpdInfo*)lp) {
             if (ParseVer(u->version) > APP_VERNUM) {
                 g_updVersion = u->version[0] == L'v' ? u->version.substr(1) : u->version; g_updUrl = u->url;

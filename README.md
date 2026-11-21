@@ -41,9 +41,11 @@ sudo apt install g++-mingw-w64-x86-64
 ./build.sh
 ```
 
-## Releasing
+## Updating
 
-1. Bump `APP_VERSION` / `APP_VERNUM` in `knob.cpp` and the versions in `app.rc` and `app.manifest`.
-2. Build, then publish a GitHub release tagged `vX.Y.Z` with `Knob.exe` attached.
+Knob checks `dist/version.txt` on the `main` branch every 6 hours (and when you click **Check now**).
+If that version is newer than the running one, the footer shows a red **Update to vX** pill;
+clicking it downloads `dist/Knob.exe` and replaces the installed copy.
 
-Running copies of Knob check the latest release every 6 hours and offer the update in the panel's footer.
+To ship an update: bump `APP_VERSION` / `APP_VERNUM` in `knob.cpp` and the versions in `app.rc` and `app.manifest`,
+build, copy `Knob.exe` to `dist/`, write the new version to `dist/version.txt`, and push to `main`.
