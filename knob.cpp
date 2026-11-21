@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.22.0"
-#define APP_VERNUM  ((1 << 16) | (22 << 8) | 0)
+#define APP_VERSION L"1.23.0"
+#define APP_VERNUM  ((1 << 16) | (23 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -61,6 +61,8 @@ static bool g_visible = false;
 static DWORD g_hideTick = 0;
 static std::wstring g_iniPath;
 static int g_trayPinned = -1;   // tray icon on the taskbar: -1 unknown, 0 hidden, 1 shown
+static bool g_trayGuidOk = true;
+static const GUID KNOB_TRAY_GUID = {0x5b3c1e7a, 0x2f4d, 0x4c8e, {0x9a, 0x61, 0x3d, 0x0b, 0x7e, 0x24, 0xc5, 0x91}};
 static bool g_keepAwake = false;
 static int g_tab = T_SOUND;
 static int g_style = 1;      // 0 = Solid, 1 = Glass
@@ -1724,6 +1726,9 @@ static void SaveTrayPinned() {
     wchar_t v[8]; swprintf(v, 8, L"%d", g_trayPinned);
     WritePrivateProfileStringW(L"main", L"traypinned", v, g_iniPath.c_str());
 }
+static void TrayAdd();
+static void UpdateTrayTip();
+static void TrayReAdd() { Shell_NotifyIconW(NIM_DELETE, &g_nid); TrayAdd(); UpdateTrayTip(); }
 static void TrayPinSync(bool enforce) {
     HKEY root;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ | KEY_WRITE, &root) != ERROR_SUCCESS) return;
@@ -1746,10 +1751,12 @@ static void TrayPinSync(bool enforce) {
         if (g_trayPinned < 0) { g_trayPinned = anyOn ? 1 : 0; SaveTrayPinned(); }
         else if (!enforce && allSame && (int)vals[0] != g_trayPinned) { g_trayPinned = (int)vals[0]; SaveTrayPinned(); }   // you changed it
         else if (g_trayPinned == 1) {   // just started, or a new hidden entry appeared: put it back on the taskbar
+            bool changed = false;
             for (size_t i = 0; i < mine.size(); i++) if (!vals[i]) {
                 DWORD one = 1;
-                RegSetKeyValueW(root, mine[i].c_str(), L"IsPromoted", REG_DWORD, &one, sizeof(one));
+                if (RegSetKeyValueW(root, mine[i].c_str(), L"IsPromoted", REG_DWORD, &one, sizeof(one)) == ERROR_SUCCESS) changed = true;
             }
+            if (changed) { RegCloseKey(root); TrayReAdd(); return; }   // Windows reads the setting when the icon is added
         }
     }
     RegCloseKey(root);
@@ -1761,11 +1768,19 @@ static void TrayAdd() {
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
     g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP | (g_trayGuidOk ? NIF_GUID : 0);
+    g_nid.guidItem = KNOB_TRAY_GUID;   // same id across updates, so Windows keeps "show on taskbar"
     g_nid.uCallbackMessage = WM_APP_TRAY;
     g_nid.hIcon = g_trayIcon;
     lstrcpynW(g_nid.szTip, APP_NAME, ARRAYSIZE(g_nid.szTip));
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid) && g_trayGuidOk) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);   // a stale icon with our id: clear it and try again
+        if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {   // Windows won't take the id: plain icon
+            g_trayGuidOk = false;
+            g_nid.uFlags &= ~NIF_GUID;
+            Shell_NotifyIconW(NIM_ADD, &g_nid);
+        }
+    }
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
 }
@@ -1775,14 +1790,14 @@ static void UpdateTrayTip() {
     if (d >= 0) tip += L"\n" + g_out[d].name + L": " + (g_out[d].mute ? std::wstring(L"muted") : std::to_wstring((int)lround(g_out[d].level * 100)) + L"%");
     int n = SelectedOutCount();
     if (n > 1) tip += L"\nPlaying on " + std::to_wstring(n) + L" outputs";
-    g_nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+    g_nid.uFlags = NIF_TIP | NIF_SHOWTIP | (g_trayGuidOk ? NIF_GUID : 0);
     lstrcpynW(g_nid.szTip, tip.c_str(), ARRAYSIZE(g_nid.szTip));
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
 }
 static void UpdateTrayIcon() {
     HICON old = g_trayIcon;
     g_trayIcon = MakeTrayIcon();
-    g_nid.uFlags = NIF_ICON; g_nid.hIcon = g_trayIcon;
+    g_nid.uFlags = NIF_ICON | (g_trayGuidOk ? NIF_GUID : 0); g_nid.hIcon = g_trayIcon;
     Shell_NotifyIconW(NIM_MODIFY, &g_nid);
     if (old) DestroyIcon(old);
 }
