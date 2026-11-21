@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.18.0"
-#define APP_VERNUM  ((1 << 16) | (18 << 8) | 0)
+#define APP_VERSION L"1.19.0"
+#define APP_VERNUM  ((1 << 16) | (19 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2191,25 +2191,23 @@ static void Paint(HDC hdc) {
         // footer (same surface as the panel: no separate band)
         float fy = PaneBottom() + S(FTR) / 2;
         Glyph(g, G_EQ, g_fIconS, T.t1, S(16) + S(7), fy);
-        Text(g, APP_NAME, g_fSmall, T.t1, RectF(S(16) + S(14) + S(8), fy - S(10), S(60), S(20)));
-        float vx = S(16) + S(14) + S(8) + TextW(g, APP_NAME, g_fSmall) + S(4);
-        {
+        {   // "Knob" with the version (or the update pill) underneath
+            float nx = S(16) + S(14) + S(10);
+            Text(g, APP_NAME, g_fSmall600, T.t1, RectF(nx, fy - S(17), S(120), S(17)));
             std::wstring vt = L"v" APP_VERSION;
             bool upd = g_updState != UPD_NONE;
             if (g_updState == UPD_AVAILABLE) vt = L"Update to v" + g_updVersion;
             else if (g_updState == UPD_DOWNLOADING) vt = L"Updating\u2026";
-            else if (g_updState == UPD_FAILED) vt = L"Update failed \u2014 retry";
-            float vw = TextW(g, vt.c_str(), upd ? g_fSmall600 : g_fSmall);
+            else if (g_updState == UPD_FAILED) vt = L"Update failed \u00B7 retry";
+            float vw = TextW(g, vt.c_str(), g_fSmall);
             if (upd) {
-                g_verRect = RectF(vx, fy - S(11), vw + S(16), S(22));
+                g_verRect = RectF(nx - S(6), fy + S(1), vw + S(12), S(17));
                 bool hov = g_hover.h == H_UPDATE;
-                FillRound(g, Color((BYTE)(hov ? 80 : 50), 232, 72, 72), g_verRect, S(11));
-                Text(g, vt.c_str(), g_fSmall600, Color(255, 240, 90, 90), g_verRect, StringAlignmentCenter);
-                vx += vw + S(16);
+                FillRound(g, Color((BYTE)(hov ? 80 : 50), 232, 72, 72), g_verRect, S(8.5f));
+                Text(g, vt.c_str(), g_fSmall, Color(255, 240, 90, 90), g_verRect, StringAlignmentCenter);
             } else {
                 g_verRect = RectF();
-                Text(g, vt.c_str(), g_fSmall, T.t3, RectF(vx, fy - S(10), vw + S(4), S(20)));
-                vx += vw;
+                Text(g, vt.c_str(), g_fSmall, T.t3, RectF(nx, fy + S(1), vw + S(8), S(16)));
             }
         }
         {   // mute every microphone
@@ -2561,8 +2559,7 @@ static bool HttpGet(const std::wstring& url, std::string& out, const std::wstrin
     HINTERNET con = WinHttpConnect(ses, host, uc.nPort, 0);
     HINTERNET req = con ? WinHttpOpenRequest(con, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
     if (req) {
-        const wchar_t* hdr = L"Accept: application/vnd.github+json\r\n";
-        if (WinHttpSendRequest(req, hdr, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr)) {
+        if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr)) {
             DWORD code = 0, sz = sizeof(code);
             WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
             if (status) *status = code;
@@ -2611,12 +2608,34 @@ static void CheckForUpdates() {
 static DWORD WINAPI UpdateDownloadProc(LPVOID p) {   // like G-Helper: download, then the new exe replaces this one and restarts
     std::wstring* url = (std::wstring*)p;
     wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
-    std::wstring file = std::wstring(tmp) + L"Knob-update.exe";
+    std::wstring file = std::wstring(tmp) + L"Knob-update-" + std::to_wstring(GetTickCount()) + L".exe";   // fresh name: an old copy can't block it
     std::string dummy;
-    bool ok = HttpGet(*url, dummy, file);
+    DWORD code = 0;
+    bool ok = HttpGet(*url, dummy, file, &code);
+    if (!ok) { Sleep(1500); ok = HttpGet(*url, dummy, file, &code); }   // one retry
     delete url;
-    if (ok && (INT_PTR)ShellExecuteW(nullptr, L"open", file.c_str(), L"--update", nullptr, SW_SHOWNORMAL) > 32) return 0;   // it closes us
-    PostMessageW(g_hwnd, WM_APP_UPDINFO, 1, 0);   // failed
+    std::wstring err;
+    if (!ok) err = code ? L"GitHub answered HTTP " + std::to_wstring(code) : L"Couldn't download it";
+    else {   // must be a real exe, not an error page
+        HANDLE f = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        char mz[2] = {}; DWORD rd = 0; LARGE_INTEGER sz = {};
+        if (f != INVALID_HANDLE_VALUE) { ReadFile(f, mz, 2, &rd, nullptr); GetFileSizeEx(f, &sz); CloseHandle(f); }
+        if (rd != 2 || mz[0] != 'M' || mz[1] != 'Z' || sz.QuadPart < 100000) err = L"The download wasn't a valid Knob.exe";
+    }
+    if (err.empty()) {
+        std::wstring cmd = L"\"" + file + L"\" --update";
+        STARTUPINFOW si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(file.c_str(), &cmd[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            return 0;   // the new copy closes us
+        }
+        DWORD e = GetLastError();
+        err = e == ERROR_ACCESS_DENIED || e == 1260 /*blocked by policy*/ || e == 4551 /*Smart App Control*/
+            ? L"Windows blocked the new version from starting (error " + std::to_wstring(e) + L")"
+            : L"Couldn't start the new version (error " + std::to_wstring(e) + L")";
+    }
+    if (!err.empty()) DeleteFileW(file.c_str());
+    PostMessageW(g_hwnd, WM_APP_UPDINFO, 1, (LPARAM)new std::wstring(err));
     return 0;
 }
 static void StartUpdate() {
@@ -2932,7 +2951,8 @@ static void PaintSettings(HDC hdc) {
               std::wstring st = g_updStatus.empty() ? L"Checks github.com/" UPDATE_REPO L" every 6 hours" : g_updStatus;
               r.Height = cardH(st.c_str(), S(170)); y += r.Height - S(64); FillRound(g, card, r, S(6));
               titleDesc(r, L"Updates", st.c_str(), S(170));
-              if (g_updState == UPD_AVAILABLE) button(SK_BUTTON, 4, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), (L"Update to " + g_updVersion).c_str(), true);
+              if (g_updState == UPD_FAILED) button(SK_BUTTON, 6, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), L"Download in browser", true);
+              else if (g_updState == UPD_AVAILABLE) button(SK_BUTTON, 4, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), (L"Update to " + g_updVersion).c_str(), true);
               else button(SK_BUTTON, 3, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), g_updState == UPD_DOWNLOADING ? L"Updating\u2026" : L"Check now", false, g_updState != UPD_DOWNLOADING); }
             linkCard(3, L"Open the settings folder", L"settings.ini lives in %APPDATA%\\Knob");
             { const wchar_t* rd = L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness";
@@ -3021,6 +3041,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (it.id == 1) { DestroyWindow(g_hwnd); return 0; }
             if (it.id == 3) { g_updStatus = L"Checking\u2026"; CheckForUpdates(); }
             if (it.id == 5) StartAutoSync();
+            if (it.id == 6) ShellExecuteW(nullptr, L"open", L"https://github.com/" UPDATE_REPO L"/raw/main/dist/Knob.exe", nullptr, nullptr, SW_SHOWNORMAL);
             if (it.id == 4) StartUpdate();
             if (it.id == 2 && MessageBoxW(h, L"Reset all Knob settings to their defaults? Knob will restart.", APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 g_noSave = true; DeleteFileW(g_iniPath.c_str()); g_restartAfterExit = true;
@@ -3144,7 +3165,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOW: ShowFlyout(); return 0;
     case WM_APP_VERSION: return APP_VERNUM;
     case WM_APP_UPDINFO: {
-        if (wp == 1) { g_updState = UPD_FAILED; g_updStatus = L"Download failed"; }
+        if (wp == 1) {
+            g_updState = UPD_FAILED;
+            std::wstring* e = (std::wstring*)lp;
+            g_updStatus = L"Update failed: " + (e ? *e : std::wstring(L"unknown reason"));
+            delete e;
+            lp = 0;
+        }
         else if (wp == 2) { g_updState = UPD_NONE; g_updStatus = L"No build on GitHub yet \u00B7 you're up to date"; }
         else if (UpdInfo* u = (UpdInfo*)lp) {
             if (ParseVer(u->version) > APP_VERNUM) {
@@ -3477,6 +3504,11 @@ static bool InstallOrUpdate() {
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     g_inst = hi;
     if (InstallOrUpdate()) return 0;
+    {   // tidy up downloaded updates
+        wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+        WIN32_FIND_DATAW fd; HANDLE fh = FindFirstFileW((std::wstring(tmp) + L"Knob-update*.exe").c_str(), &fd);
+        if (fh != INVALID_HANDLE_VALUE) { do DeleteFileW((std::wstring(tmp) + fd.cFileName).c_str()); while (FindNextFileW(fh, &fd)); FindClose(fh); }
+    }
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Knob.SingleInstance.v1");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(L"KnobFlyout", nullptr);
