@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.19.0"
-#define APP_VERNUM  ((1 << 16) | (19 << 8) | 0)
+#define APP_VERSION L"1.20.0"
+#define APP_VERNUM  ((1 << 16) | (20 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -160,6 +160,8 @@ static std::vector<AppGroup> g_apps;
 static std::map<std::wstring, ProcInfo> g_procCache;
 static std::map<std::wstring, AppLive> g_live;
 static std::set<std::wstring> g_mirror;   // extra outputs that play a copy of the default output
+static std::set<std::wstring> g_mirrorSaved;   // the group to bring back when Multi is turned on again
+static bool g_multi = false;   // Multi on: clicking outputs adds/removes them; off: clicking switches output
 
 struct MonUI { std::wstring name, detail, gdi; int pct = 0, con = 50, orient = 0; bool ok = false, hasCon = false, internal = false; RECT rc{}; };
 struct MonMsg { int gen; bool fromEnum; std::vector<MonUI> mons; };
@@ -260,6 +262,12 @@ static void LoadSettings() {
     std::wstring s = buf.data(), cur;
     for (wchar_t c : s) { if (c == L'|') { if (!cur.empty()) g_mirror.insert(cur); cur.clear(); } else cur += c; }
     if (!cur.empty()) g_mirror.insert(cur);
+    GetPrivateProfileStringW(L"main", L"mirrorsaved", L"", buf.data(), (DWORD)buf.size(), g_iniPath.c_str());
+    s = buf.data(); cur.clear();
+    for (wchar_t c : s) { if (c == L'|') { if (!cur.empty()) g_mirrorSaved.insert(cur); cur.clear(); } else cur += c; }
+    if (!cur.empty()) g_mirrorSaved.insert(cur);
+    g_multi = GetPrivateProfileIntW(L"main", L"multi", g_mirror.empty() ? 0 : 1, g_iniPath.c_str()) != 0;
+    if (!g_multi) g_mirror.clear();
     g_keepAwake = GetPrivateProfileIntW(L"main", L"keepawake", 0, g_iniPath.c_str()) != 0;
     g_tab = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"tab", 0, g_iniPath.c_str())));
     g_style = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"style", 1, g_iniPath.c_str())));
@@ -317,6 +325,10 @@ static void SaveSettings() {
     std::wstring s;
     for (auto& id : g_mirror) { if (!s.empty()) s += L'|'; s += id; }
     WritePrivateProfileStringW(L"main", L"mirror", s.c_str(), g_iniPath.c_str());
+    s.clear();
+    for (auto& id : g_mirrorSaved) { if (!s.empty()) s += L'|'; s += id; }
+    WritePrivateProfileStringW(L"main", L"mirrorsaved", s.c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"multi", g_multi ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"keepawake", g_keepAwake ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"tab", std::to_wstring(g_tab).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"style", std::to_wstring(g_style).c_str(), g_iniPath.c_str());
@@ -857,7 +869,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
 }
 static void StartAutoSync() {
     if (g_calibrating) return;
-    if (!g_router) { g_calStatus = L"Select two or more outputs in the Sound tab first"; return; }
+    if (!g_router) { g_calStatus = L"Turn on Multi in the Sound tab and pick two or more outputs first"; return; }
     auto* ts = new std::vector<CalTarget>;
     for (auto& t : g_router->targets) {
         std::wstring name = t.id;
@@ -1240,7 +1252,7 @@ enum : wchar_t {
 // ---------------------------------------------------------------- layout model
 enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
@@ -1346,6 +1358,10 @@ static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.
 static RectF BackRect() { return RectF(S(12), S(12), S(36), S(36)); }
 static std::vector<RectF> g_chipRel;   // profile chips (+ Save as the last one), relative to the row's top-left
 static RectF ProfileChip(const El& e, int i) { RectF r = g_chipRel[i]; r.X += e.r.X; r.Y += e.r.Y; return r; }
+static RectF MultiRect(const El& e) {   // "Multi" switch on the right of the OUTPUT label
+    float w = S(70), h = S(22);
+    return RectF(e.r.X + e.r.Width - w + S(4), e.r.Y + e.r.Height / 2 - h / 2, w, h);
+}
 static int ChipCount() { return (int)g_chipRel.size(); }
 static bool SaveAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_PROFILES && ChipCount()) { chip = ProfileChip(e, ChipCount() - 1); return true; } return false; }
 static int SaveOptCount() { return (int)g_prof.size() + 1; }   // "Save as <name>" for each + "New profile..."
@@ -1480,6 +1496,7 @@ static Hit HitTest(float x, float y) {
     if (y < PaneTop() || y >= PaneBottom()) return h;
     for (int i = 0; i < (int)g_els.size(); i++) {
         El& e = g_els[i];
+        if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(MultiRect(e), x, y)) { h.h = H_MULTI; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
@@ -1850,13 +1867,21 @@ static void DrawEl(Graphics& g, int index) {
     bool hovEl = g_hover.el == index;
     if (e.k == E_H3) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
-        int n = e.text == L"OUTPUT" ? SelectedOutCount() : 0;
-        if (n > 1) {   // multi-output status, right side of the OUTPUT label
-            wchar_t st[48]; swprintf(st, 48, L"Playing on %d outputs", n);
-            float tw = TextW(g, st, g_fSmall), tx = e.r.X + e.r.Width - tw;
-            SolidBrush dot(T.accent);
-            g.FillEllipse(&dot, tx - S(12), e.r.Y + e.r.Height / 2 - S(3), S(6), S(6));
-            Text(g, st, g_fSmall, T.t3, RectF(tx - S(2), e.r.Y - S(4), tw + S(4), e.r.Height + S(8)));
+        if (e.text == L"OUTPUT") {
+            RectF m = MultiRect(e);
+            bool hov = g_hover.h == H_MULTI;
+            FillRound(g, g_multi ? WithAlpha(T.accent, hov ? 70 : 50) : (hov ? T.subtle3 : T.subtle2), m, m.Height / 2);
+            // little switch knob + label
+            float kx = m.X + S(9), ky = m.Y + m.Height / 2;
+            SolidBrush kb(g_multi ? T.accent : T.t3);
+            g.FillEllipse(&kb, kx, ky - S(4), S(8), S(8));
+            Text(g, L"Multi", g_fSmall600, g_multi ? T.t1 : T.t2, RectF(kx + S(13), m.Y, m.Width - S(26), m.Height));
+            int n = SelectedOutCount();
+            if (g_multi && n > 1) {   // status, left of the switch
+                wchar_t st[32]; swprintf(st, 32, L"%d playing", n);
+                float tw = TextW(g, st, g_fSmall);
+                Text(g, st, g_fSmall, T.t3, RectF(m.X - S(8) - tw - S(4), e.r.Y - S(4), tw + S(4), e.r.Height + S(8)));
+            }
         }
         return;
     }
@@ -2476,6 +2501,23 @@ static void ToggleOutput(int i) {
     UpdateTrayTip();
 }
 
+static void SetMulti(bool on) {
+    if (on == g_multi) return;
+    g_multi = on;
+    if (!on) { if (!g_mirror.empty()) g_mirrorSaved = g_mirror; g_mirror.clear(); }   // back to just the main output
+    else {   // bring the last group back
+        int di = DefaultOut();
+        for (auto& id : g_mirrorSaved) if (di < 0 || g_out[di].id != id) for (auto& o : g_out) if (o.id == id) g_mirror.insert(id);
+    }
+    SaveSettings();
+    RestartRouter();
+    UpdateTrayTip();
+}
+static void ClickOutput(int i) {
+    if (g_multi) { ToggleOutput(i); return; }
+    if (!g_out[i].isDefault) { SetDefaultDevice(g_out[i].id); LoadEndpoints(eRender, g_out); UpdateTrayTip(); }   // plain switch
+}
+
 // ---------------------------------------------------------------- tray menu (native, follows dark mode)
 static void AllowDarkMenus() {   // undocumented uxtheme ordinals
     HMODULE ux = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -2890,7 +2932,7 @@ static void PaintSettings(HDC hdc) {
                 bool can = g_router && !g_calibrating;
                 std::wstring d = !g_calStatus.empty() ? g_calStatus
                     : (g_router ? L"Plays a short chirp on each output and listens with your microphone. Pause music and keep the room quiet."
-                                : L"Select two or more outputs in the Sound tab to use it");
+                                : L"Turn on Multi in the Sound tab and pick two or more outputs to use it");
                 RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
                 titleDesc(r, L"Auto sync", d.c_str(), S(170));
                 button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)),
@@ -3395,9 +3437,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SetElValue(g_els[ht.el], SliderValueAt(g_els[ht.el], x));
             break;
         case H_MUTE: ToggleMute(g_els[ht.el]); break;
+        case H_MULTI: SetMulti(!g_multi); break;
         case H_ROW: {
             El& e = g_els[ht.el];
-            if (e.k == E_OUT) ToggleOutput(e.idx);
+            if (e.k == E_OUT) ClickOutput(e.idx);
             else if (e.k == E_IN && !g_in[e.idx].isDefault) { SetDefaultDevice(g_in[e.idx].id); LoadEndpoints(eCapture, g_in); }
             break;
         }
