@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.12.0"
-#define APP_VERNUM  ((1 << 16) | (12 << 8) | 0)
+#define APP_VERSION L"1.13.0"
+#define APP_VERNUM  ((1 << 16) | (13 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2333,7 +2333,7 @@ static int ParseVer(const std::wstring& v) {   // "v1.10.2" -> packed number
     swscanf(v.c_str() + (v.size() && (v[0] == L'v' || v[0] == L'V') ? 1 : 0), L"%d.%d.%d", &a, &b, &c);
     return (a << 16) | (b << 8) | c;
 }
-static bool HttpGet(const std::wstring& url, std::string& out, const std::wstring& saveTo = L"") {
+static bool HttpGet(const std::wstring& url, std::string& out, const std::wstring& saveTo = L"", DWORD* status = nullptr) {
     URL_COMPONENTS uc = {sizeof(uc)};
     wchar_t host[256] = {}, path[2048] = {};
     uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
@@ -2348,6 +2348,7 @@ static bool HttpGet(const std::wstring& url, std::string& out, const std::wstrin
         if (WinHttpSendRequest(req, hdr, (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr)) {
             DWORD code = 0, sz = sizeof(code);
             WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &sz, WINHTTP_NO_HEADER_INDEX);
+            if (status) *status = code;
             if (code == 200) {
                 HANDLE f = saveTo.empty() ? INVALID_HANDLE_VALUE : CreateFileW(saveTo.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 ok = saveTo.empty() || f != INVALID_HANDLE_VALUE;
@@ -2379,7 +2380,9 @@ struct UpdInfo { std::wstring version, url; };
 static DWORD WINAPI UpdateCheckProc(LPVOID) {
     std::string j;
     UpdInfo* info = nullptr;
-    if (HttpGet(L"https://api.github.com/repos/" UPDATE_REPO L"/releases/latest", j)) {
+    DWORD code = 0;
+    WPARAM kind = 0;   // 0 = result or unreachable, 2 = no release (nothing to update to)
+    if (HttpGet(L"https://api.github.com/repos/" UPDATE_REPO L"/releases/latest", j, L"", &code)) {
         std::string tag = JsonStr(j, "tag_name");
         std::string url;   // first asset whose name ends in .exe
         size_t pos = 0, at = 0;
@@ -2390,8 +2393,9 @@ static DWORD WINAPI UpdateCheckProc(LPVOID) {
             pos = at + 1;
         }
         if (!tag.empty() && !url.empty()) info = new UpdInfo{std::wstring(tag.begin(), tag.end()), std::wstring(url.begin(), url.end())};
-    }
-    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_UPDINFO, 0, (LPARAM)info)) delete info;
+        else kind = 2;   // a release without Knob.exe
+    } else if (code == 404) kind = 2;   // repo has no releases
+    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_UPDINFO, kind, (LPARAM)info)) delete info;
     InterlockedExchange(&g_updBusy, 0);
     return 0;
 }
@@ -2924,6 +2928,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_VERSION: return APP_VERNUM;
     case WM_APP_UPDINFO: {
         if (wp == 1) { g_updState = UPD_FAILED; g_updStatus = L"Download failed"; }
+        else if (wp == 2) { g_updState = UPD_NONE; g_updStatus = L"No releases on GitHub yet \u00B7 you're up to date"; }
         else if (UpdInfo* u = (UpdInfo*)lp) {
             if (ParseVer(u->version) > APP_VERNUM) {
                 g_updVersion = u->version[0] == L'v' ? u->version.substr(1) : u->version; g_updUrl = u->url;
