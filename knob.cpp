@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.21.0"
-#define APP_VERNUM  ((1 << 16) | (21 << 8) | 0)
+#define APP_VERSION L"1.22.0"
+#define APP_VERNUM  ((1 << 16) | (22 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -64,7 +64,8 @@ static int g_trayPinned = -1;   // tray icon on the taskbar: -1 unknown, 0 hidde
 static bool g_keepAwake = false;
 static int g_tab = T_SOUND;
 static int g_style = 1;      // 0 = Solid, 1 = Glass
-static int g_accentId = 0;   // 0 = Windows accent, 1.. = presets
+static int g_accentId = 0;   // 0 = Windows accent, 1 = custom (g_accentHue / g_accentSat)
+static int g_accentHue = 25, g_accentSat = 85;
 static float g_scroll[4] = {0, 0, 0, 0};   // per tab + shortcuts page
 static int g_view = 0;                       // 0 = main tabs, 1 = shortcuts page
 static int SI();
@@ -271,7 +272,19 @@ static void LoadSettings() {
     g_keepAwake = GetPrivateProfileIntW(L"main", L"keepawake", 0, g_iniPath.c_str()) != 0;
     g_tab = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"tab", 0, g_iniPath.c_str())));
     g_style = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"style", 1, g_iniPath.c_str())));
-    g_accentId = std::max(0, std::min(6, (int)GetPrivateProfileIntW(L"main", L"accent", 0, g_iniPath.c_str())));
+    {
+        static const int oldHue[7] = {0, 181, 113, 37, 346, 262, 0};   // presets from earlier versions
+        int mode = (int)GetPrivateProfileIntW(L"main", L"accentmode", 99, g_iniPath.c_str());
+        if (mode == 99) {   // migrate the old preset choice
+            int old = std::max(0, std::min(6, (int)GetPrivateProfileIntW(L"main", L"accent", 0, g_iniPath.c_str())));
+            mode = old ? 1 : 0;
+            if (old) { g_accentHue = oldHue[old]; g_accentSat = old == 6 ? 0 : 85; }
+        } else {
+            g_accentHue = (int)GetPrivateProfileIntW(L"main", L"accenthue", 25, g_iniPath.c_str()) % 360;
+            g_accentSat = std::max(0, std::min(100, (int)GetPrivateProfileIntW(L"main", L"accentsat", 85, g_iniPath.c_str())));
+        }
+        g_accentId = mode ? 1 : 0;
+    }
     g_osd = GetPrivateProfileIntW(L"main", L"osd", 1, g_iniPath.c_str()) != 0;
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
     g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
@@ -332,7 +345,9 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"keepawake", g_keepAwake ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"tab", std::to_wstring(g_tab).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"style", std::to_wstring(g_style).c_str(), g_iniPath.c_str());
-    WritePrivateProfileStringW(L"main", L"accent", std::to_wstring(g_accentId).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"accentmode", std::to_wstring(g_accentId).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"accenthue", std::to_wstring(g_accentHue).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"accentsat", std::to_wstring(g_accentSat).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"osd", g_osd ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"restorebright", g_restoreBright ? L"1" : L"0", g_iniPath.c_str());
     {
@@ -876,7 +891,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
 }
 static void StartAutoSync() {
     if (g_calibrating) return;
-    if (!g_router) { g_calStatus = L"Turn on Multi in the Sound tab and pick two or more outputs first"; return; }
+    if (!g_router) { g_calStatus = L"Turn on Play together in the Sound tab and pick two or more outputs first"; return; }
     auto* ts = new std::vector<CalTarget>;
     for (auto& t : g_router->targets) {
         std::wstring name = t.id;
@@ -1174,6 +1189,15 @@ static const AccentPreset ACCENTS[7] = {
     {L"Rose", 0xff99b0, 0xb4235a}, {L"Violet", 0xc3a0ff, 0x6b2fbf}, {L"Graphite", 0xc8c8c8, 0x4a4a4a},
 };
 
+static Color Hsl(float h, float sat, float l) {   // h 0..360, sat/l 0..1
+    float c = (1 - fabsf(2 * l - 1)) * sat, hp = fmodf(h, 360.f) / 60.f, x = c * (1 - fabsf(fmodf(hp, 2.f) - 1));
+    float r = 0, g = 0, b = 0;
+    if (hp < 1) { r = c; g = x; } else if (hp < 2) { r = x; g = c; } else if (hp < 3) { g = c; b = x; }
+    else if (hp < 4) { g = x; b = c; } else if (hp < 5) { r = x; b = c; } else { r = c; b = x; }
+    float m = l - c / 2;
+    return Color(255, (BYTE)lroundf((r + m) * 255), (BYTE)lroundf((g + m) * 255), (BYTE)lroundf((b + m) * 255));
+}
+static Color CustomAccent(bool dark, int hue, int sat) { return Hsl((float)hue, sat / 100.f, dark ? 0.64f : 0.42f); }
 static Color WindowsAccent(bool dark) {
     BYTE pal[32]; DWORD psz = sizeof(pal);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent", L"AccentPalette", RRF_RT_REG_BINARY, nullptr, pal, &psz) == ERROR_SUCCESS && psz >= 32) {
@@ -1190,7 +1214,7 @@ static void LoadTheme() {
     T.dark = !(RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v);
     v = 0; sz = sizeof(v);
     T.taskbarLight = RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v;
-    T.accent = g_accentId == 0 ? WindowsAccent(T.dark) : Hex(T.dark ? ACCENTS[g_accentId].dark : ACCENTS[g_accentId].light);
+    T.accent = g_accentId == 0 ? WindowsAccent(T.dark) : CustomAccent(T.dark, g_accentHue, g_accentSat);
     T.onAccent = Color(255, 255, 255, 255);
     bool d = T.dark, gl = T.glass;
     T.t1 = d ? Color(255, 255, 255, 255) : Color(228, 0, 0, 0);
@@ -1365,9 +1389,9 @@ static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.
 static RectF BackRect() { return RectF(S(12), S(12), S(36), S(36)); }
 static std::vector<RectF> g_chipRel;   // profile chips (+ Save as the last one), relative to the row's top-left
 static RectF ProfileChip(const El& e, int i) { RectF r = g_chipRel[i]; r.X += e.r.X; r.Y += e.r.Y; return r; }
-static RectF MultiRect(const El& e) {   // "Multi" switch on the right of the OUTPUT label
-    float w = S(70), h = S(22);
-    return RectF(e.r.X + e.r.Width - w + S(4), e.r.Y + e.r.Height / 2 - h / 2, w, h);
+static RectF MultiRect(const El& e) {   // "Play together" switch on the right of the OUTPUT label (label + toggle)
+    float w = S(128), h = S(24);
+    return RectF(e.r.X + e.r.Width - w + S(6), e.r.Y + e.r.Height / 2 - h / 2, w, h);
 }
 static int ChipCount() { return (int)g_chipRel.size(); }
 static bool SaveAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_PROFILES && ChipCount()) { chip = ProfileChip(e, ChipCount() - 1); return true; } return false; }
@@ -1447,7 +1471,7 @@ static void BuildMenu() {
         items.push_back({M_GLASS, MT_SEG, RectF(ix + S(4) + S(3) + sw + S(2), sy + S(3), sw, S(28)), L"Glass", 0});
         y += S(4) + S(34) + S(4);
     }
-    std::wstring accLbl = std::wstring(L"Accent color · ") + ACCENTS[g_accentId].name;
+    std::wstring accLbl = std::wstring(L"Accent color · ") + (g_accentId ? L"Custom" : L"Windows accent");
     items.push_back({0, MT_LABEL, RectF(ix, y, iw, S(24)), accLbl, 0}); y += S(24);
     for (int i = 0; i < 7; i++) items.push_back({M_ACC0 + i, MT_SWATCH, RectF(ix + S(10) + i * S(28), y + S(6), S(22), S(22)), ACCENTS[i].name, 0});
     y += S(34);
@@ -1857,13 +1881,13 @@ static void DrawIconBtn(Graphics& g, RectF r, wchar_t glyph, Color c, bool hover
     if (hover) FillRound(g, T.hover, r, S(6));
     Glyph(g, glyph, g_fIcon, c, r.X + r.Width / 2, r.Y + r.Height / 2);
 }
-static void DrawSwitch(Graphics& g, float x, float cy, bool on) {
-    RectF r(x, cy - S(10), S(40), S(20));
-    if (on) FillRound(g, T.accent, r, S(10));
-    else { GraphicsPath p; AddRound(p, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), S(10)); Pen pen(T.t2, S(1)); g.DrawPath(&pen, &p); }
-    float kx = on ? r.X + r.Width - S(16) : r.X + S(4);
+static void DrawSwitch(Graphics& g, float x, float cy, bool on, float k = 1.f) {   // Windows-style toggle; k scales it
+    RectF r(x, cy - S(10 * k), S(40 * k), S(20 * k));
+    if (on) FillRound(g, T.accent, r, S(10 * k));
+    else { GraphicsPath p; AddRound(p, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), S(10 * k)); Pen pen(T.t2, S(1)); g.DrawPath(&pen, &p); }
+    float kx = on ? r.X + r.Width - S(16 * k) : r.X + S(4 * k);
     SolidBrush kb(on ? T.onAccent : T.t2);
-    g.FillEllipse(&kb, kx, cy - S(6), S(12), S(12));
+    g.FillEllipse(&kb, kx, cy - S(6 * k), S(12 * k), S(12 * k));
 }
 
 static wchar_t KindGlyph(int k) { return k == DK_HEADPHONES ? G_HEADPHONE : k == DK_MIC ? G_MIC : k == DK_DISPLAY ? G_TV : G_SPEAKERS; }
@@ -1874,21 +1898,12 @@ static void DrawEl(Graphics& g, int index) {
     bool hovEl = g_hover.el == index;
     if (e.k == E_H3) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
-        if (e.text == L"OUTPUT") {
+        if (e.text == L"OUTPUT") {   // same toggle as Settings, smaller, with its label on the left
             RectF m = MultiRect(e);
-            bool hov = g_hover.h == H_MULTI;
-            FillRound(g, g_multi ? WithAlpha(T.accent, hov ? 70 : 50) : (hov ? T.subtle3 : T.subtle2), m, m.Height / 2);
-            // little switch knob + label
-            float kx = m.X + S(9), ky = m.Y + m.Height / 2;
-            SolidBrush kb(g_multi ? T.accent : T.t3);
-            g.FillEllipse(&kb, kx, ky - S(4), S(8), S(8));
-            Text(g, L"Multi", g_fSmall600, g_multi ? T.t1 : T.t2, RectF(kx + S(13), m.Y, m.Width - S(26), m.Height));
-            int n = SelectedOutCount();
-            if (g_multi && n > 1) {   // status, left of the switch
-                wchar_t st[32]; swprintf(st, 32, L"%d playing", n);
-                float tw = TextW(g, st, g_fSmall);
-                Text(g, st, g_fSmall, T.t3, RectF(m.X - S(8) - tw - S(4), e.r.Y - S(4), tw + S(4), e.r.Height + S(8)));
-            }
+            float sw = S(32), sx = m.X + m.Width - S(6) - sw, cy = m.Y + m.Height / 2;
+            if (g_hover.h == H_MULTI) FillRound(g, T.hover, m, S(6));
+            Text(g, L"Play together", g_fSmall, g_multi ? T.t1 : T.t2, RectF(m.X, m.Y, sx - S(8) - m.X, m.Height), StringAlignmentFar);
+            DrawSwitch(g, sx, cy, g_multi, 0.8f);
         }
         return;
     }
@@ -2511,7 +2526,13 @@ static void ToggleOutput(int i) {
 static void SetMulti(bool on) {
     if (on == g_multi) return;
     g_multi = on;
-    if (!on) { if (!g_mirror.empty()) g_mirrorSaved = g_mirror; g_mirror.clear(); }   // back to just the main output
+    if (!on) {   // back to just the main output; sync delays start fresh next time
+        if (!g_mirror.empty()) g_mirrorSaved = g_mirror;
+        for (auto& id : g_mirrorSaved) g_delay.erase(id);
+        for (auto& o : g_out) g_delay.erase(o.id);
+        g_mirror.clear();
+        g_calStatus.clear();
+    }
     else {   // bring the last group back
         int di = DefaultOut();
         for (auto& id : g_mirrorSaved) if (di < 0 || g_out[di].id != id) for (auto& o : g_out) if (o.id == id) g_mirror.insert(id);
@@ -2572,7 +2593,12 @@ static void MenuCommand(int id) {
     case M_SOLID: g_style = 0; SaveSettings(); ApplyStyle(); break;
     case M_GLASS: g_style = 1; SaveSettings(); ApplyStyle(); break;
     default:
-        if (id >= M_ACC0 && id < M_ACC0 + 7) { g_accentId = id - M_ACC0; SaveSettings(); LoadTheme(); }
+        if (id >= M_ACC0 && id < M_ACC0 + 7) {
+            static const int hues[7] = {0, 181, 113, 37, 346, 262, 0};
+            int k = id - M_ACC0; g_accentId = k ? 1 : 0;
+            if (k) { g_accentHue = hues[k]; g_accentSat = k == 6 ? 0 : 85; }
+            SaveSettings(); LoadTheme();
+        }
         break;
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -2699,7 +2725,7 @@ static void StartUpdate() {
 enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_APPEAR, SP_ABOUT, SP_COUNT };
 static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Appearance", L"About"};
 static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
-enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK };
+enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR };
 struct SItem { int kind; int id; RectF r; };
 enum { WM_APP_STARTEDIT = WM_APP + 20 };
 
@@ -2707,7 +2733,7 @@ static HWND g_edit;
 static WNDPROC g_editProc;
 static HFONT g_editFont;
 static HBRUSH g_editBrush;
-static int g_setPage = SP_GENERAL, g_editProfile = -1, g_sDragDelay = -1;
+static int g_setPage = SP_GENERAL, g_editProfile = -1, g_sDragDelay = -1, g_sDragColor = 0;   // 1 hue, 2 intensity
 static int g_setW = 0, g_setH = 0;
 static float g_setScroll = 0, g_setContentH = 0;
 static std::vector<SItem> g_sItems;
@@ -2916,19 +2942,54 @@ static void PaintSettings(HDC hdc) {
                 else if (isHover(SK_STYLE, i)) FillRound(g, T.subtle, b, S(6));
                 Text(g, i == 0 ? L"Solid" : L"Glass", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
             }
-            r = cardRect(S(104)); FillRound(g, card, r, S(6));
-            std::wstring at = std::wstring(L"Accent color · ") + ACCENTS[g_accentId].name;
-            Text(g, at.c_str(), &fBody, T.t1, RectF(r.X + S(18), r.Y + S(12), r.Width - S(36), S(22)));
-            for (int i = 0; i < 7; i++) {
-                RectF sw(r.X + S(22) + i * S(44), r.Y + S(52), S(30), S(30));
-                add(SK_SWATCH, i, sw);
-                if (i == g_accentId) {
-                    SolidBrush ring(T.t1); g.FillEllipse(&ring, sw.X - S(4), sw.Y - S(4), sw.Width + S(8), sw.Height + S(8));
-                    SolidBrush gap(card); g.FillEllipse(&gap, sw.X - S(2), sw.Y - S(2), sw.Width + S(4), sw.Height + S(4));
+            {   // accent: Windows, or your own colour
+                const wchar_t* ad = g_accentId ? L"Pick any colour below" : L"Follows your Windows accent colour";
+                r = cardRect(cardH(ad, S(200))); FillRound(g, card, r, S(6));
+                titleDesc(r, L"Accent color", ad, S(200));
+                RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
+                FillRound(g, T.subtle, box, S(8));
+                for (int i = 0; i < 2; i++) {
+                    RectF b(box.X + S(3) + i * S(87), box.Y + S(3), S(85), S(28));
+                    add(SK_ACCMODE, i, b);
+                    bool on = g_accentId == i;
+                    if (on) FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), b, S(6));
+                    else if (isHover(SK_ACCMODE, i)) FillRound(g, T.subtle, b, S(6));
+                    Text(g, i == 0 ? L"Windows" : L"Custom", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
                 }
-                if (i == 0) { Color cs[4] = {Hex(0x60cdff), Hex(0xc3a0ff), Hex(0xff8fa8), Hex(0x6ccb5f)};
-                              for (int q = 0; q < 4; q++) { SolidBrush b(cs[q]); g.FillPie(&b, sw, -90.f + q * 90.f, 90.f); } }
-                else { SolidBrush b(Hex(T.dark ? ACCENTS[i].dark : ACCENTS[i].light)); g.FillEllipse(&b, sw); }
+            }
+            if (g_accentId) {
+                r = cardRect(S(132)); FillRound(g, card, r, S(6));
+                Color cur = CustomAccent(T.dark, g_accentHue, g_accentSat);
+                // preview chip + hex
+                RectF chip(r.X + r.Width - S(18) - S(96), r.Y + S(14), S(96), S(26));
+                FillRound(g, cur, chip, S(13));
+                wchar_t hx[16]; swprintf(hx, 16, L"#%02X%02X%02X", cur.GetR(), cur.GetG(), cur.GetB());
+                Text(g, hx, g_fSmall600, Color(255, 255, 255, 255), chip, StringAlignmentCenter);
+                Text(g, L"Your colour", &fBody, T.t1, RectF(r.X + S(18), r.Y + S(14), S(200), S(26)));
+                auto track = [&](int id, const wchar_t* label, float yy, float v) {
+                    Text(g, label, &fDesc, T.t2, RectF(r.X + S(18), yy - S(12), S(80), S(24)));
+                    RectF t(r.X + S(100), yy - S(5), r.Width - S(100) - S(28), S(10));
+                    add(SK_COLOR, id, RectF(t.X - S(10), yy - S(14), t.Width + S(20), S(28)));
+                    GraphicsPath gp; AddRound(gp, t, S(5));
+                    LinearGradientBrush lb(PointF(t.X, 0), PointF(t.X + t.Width, 0), Color(255, 0, 0, 0), Color(255, 0, 0, 0));
+                    if (id == 0) {   // hue rainbow
+                        Color cs[7]; REAL pos[7];
+                        for (int q = 0; q < 7; q++) { cs[q] = Hsl(q * 60.f, g_accentSat / 100.f, T.dark ? 0.64f : 0.42f); pos[q] = q / 6.f; }
+                        lb.SetInterpolationColors(cs, pos, 7);
+                    } else {         // intensity: grey -> full colour
+                        Color cs[2] = {CustomAccent(T.dark, g_accentHue, 0), CustomAccent(T.dark, g_accentHue, 100)}; REAL pos[2] = {0, 1};
+                        lb.SetInterpolationColors(cs, pos, 2);
+                    }
+                    g.FillPath(&lb, &gp);
+                    float fx = t.X + t.Width * v, R = S(9);
+                    bool act = g_sDragColor == id + 1 || isHover(SK_COLOR, id);
+                    SolidBrush sh(Color(70, 0, 0, 0)); g.FillEllipse(&sh, fx - R, yy - R + S(1), 2 * R, 2 * R);
+                    SolidBrush wb(Color(255, 255, 255, 255)); g.FillEllipse(&wb, fx - R, yy - R, 2 * R, 2 * R);
+                    float ir = act ? S(6) : S(5.5f);
+                    SolidBrush cb(cur); g.FillEllipse(&cb, fx - ir, yy - ir, 2 * ir, 2 * ir);
+                };
+                track(0, L"Hue", r.Y + S(70), g_accentHue / 359.f);
+                track(1, L"Intensity", r.Y + S(106), g_accentSat / 100.f);
             }
             break;
         }
@@ -2939,7 +3000,7 @@ static void PaintSettings(HDC hdc) {
                 bool can = g_router && !g_calibrating;
                 std::wstring d = !g_calStatus.empty() ? g_calStatus
                     : (g_router ? L"Plays a short chirp on each output and listens with your microphone. Pause music and keep the room quiet."
-                                : L"Turn on Multi in the Sound tab and pick two or more outputs to use it");
+                                : L"Turn on Play together in the Sound tab and pick two or more outputs to use it");
                 RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
                 titleDesc(r, L"Auto sync", d.c_str(), S(170));
                 button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)),
@@ -3042,6 +3103,16 @@ static void SettingsChanged() {   // anything that the flyout also shows
     if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+static void SettingsColorAt(float x) {   // drag on the hue / intensity track
+    for (auto& it : g_sItems) if (it.kind == SK_COLOR && it.id == g_sDragColor - 1) {
+        RectF t(it.r.X + S(10), it.r.Y, it.r.Width - S(20), it.r.Height);
+        float v = std::max(0.f, std::min(1.f, (x - t.X) / t.Width));
+        if (it.id == 0) g_accentHue = (int)lroundf(v * 359); else g_accentSat = (int)lroundf(v * 100);
+        LoadTheme(); BuildSettingsTheme();
+        SettingsChanged();
+        return;
+    }
+}
 static void SettingsDelayAt(float x) {
     for (auto& it : g_sItems) if (it.kind == SK_DELAY && it.id == g_sDragDelay) {
         RectF sl(it.r.X + S(10), it.r.Y, it.r.Width - S(20), it.r.Height);
@@ -3059,6 +3130,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
         if (g_sDragDelay >= 0) { SettingsDelayAt(x); return 0; }
+        if (g_sDragColor) { SettingsColorAt(x); return 0; }
         int hv = SettingsHit(x, y);
         if (hv != g_sHover) { g_sHover = hv; InvalidateRect(h, nullptr, FALSE); }
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0}; TrackMouseEvent(&tme);
@@ -3098,7 +3170,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case SK_STYLE: g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); break;
-        case SK_SWATCH: g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); break;
+        case SK_SWATCH: break;
+        case SK_ACCMODE: g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); SettingsChanged(); break;
+        case SK_COLOR: g_sDragColor = it.id + 1; SetCapture(h); SettingsColorAt(x); return 0;
         case SK_HK: g_capture = it.id; UnregisterHotkeys(); break;
         case SK_STEP: g_step = it.id; SaveSettings(); break;
         case SK_RESETHK: for (int i = 0; i < HK_COUNT; i++) g_hk[i] = HK_DEFAULT[i]; RegisterHotkeys(); SaveSettings(); break;
@@ -3121,6 +3195,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_LBUTTONUP:
         if (g_sDragDelay >= 0) { g_sDragDelay = -1; ReleaseCapture(); SaveSettings(); RestartRouter(); SettingsChanged(); }
+        if (g_sDragColor) { g_sDragColor = 0; ReleaseCapture(); SaveSettings(); UpdateTrayIcon(); SettingsChanged(); }
         return 0;
     case WM_MOUSEWHEEL:
         SetPageScroll(g_setScroll - GET_WHEEL_DELTA_WPARAM(wp) / 120.f * S(60));
