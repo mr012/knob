@@ -43,12 +43,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.15.0"
-#define APP_VERNUM  ((1 << 16) | (15 << 8) | 0)
+#define APP_VERSION L"1.16.0"
+#define APP_VERNUM  ((1 << 16) | (16 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
-enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO };
+enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
 enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
@@ -575,7 +575,8 @@ static bool UpdatePeaks() {   // returns true if anything is (or just was) playi
 
 // ---------------------------------------------------------------- audio: mirroring (loopback of default output -> extra outputs)
 struct RouterTarget { std::wstring id; int delayMs; };
-struct RouterCtx { std::wstring src; std::vector<RouterTarget> targets; volatile LONG stop = 0; HANDLE thread = nullptr; };
+struct RouterCtx { std::wstring src; std::vector<RouterTarget> targets; volatile LONG stop = 0; HANDLE thread = nullptr;
+                   volatile LONG calOnly = -1; };   // auto sync: -1 normal, -2 all copies silent, k = only target k plays
 static RouterCtx* g_router;
 
 static DWORD WINAPI RouterProc(LPVOID p) {
@@ -587,7 +588,7 @@ static DWORD WINAPI RouterProc(LPVOID p) {
     IAudioCaptureClient* cc = nullptr;
     WAVEFORMATEX* wf = nullptr;
     struct Out { IAudioClient* ac = nullptr; IAudioRenderClient* rc = nullptr; UINT32 buf = 0; bool dead = false;
-                 std::vector<BYTE> q; size_t head = 0; UINT32 delayFrames = 0; };   // q = software delay line
+                 std::vector<BYTE> q; size_t head = 0; UINT32 delayFrames = 0; int ti = 0; };   // q = software delay line
     std::vector<Out> outs;
     do {
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) break;
@@ -598,10 +599,11 @@ static DWORD WINAPI RouterProc(LPVOID p) {
         if (FAILED(cap->GetService(__uuidof(IAudioCaptureClient), (void**)&cc))) break;
         const UINT32 rate = wf->nSamplesPerSec, fb = wf->nBlockAlign;
         const UINT32 preFrames = rate * 40 / 1000, hiFrames = rate * 120 / 1000;
-        for (auto& t : ctx->targets) {
+        for (int ti = 0; ti < (int)ctx->targets.size(); ti++) {
+            auto& t = ctx->targets[ti];
             IMMDevice* d = nullptr;
             if (FAILED(en->GetDevice(t.id.c_str(), &d))) continue;
-            Out o;
+            Out o; o.ti = ti;
             o.delayFrames = (UINT32)((UINT64)rate * std::max(0, std::min(1000, t.delayMs)) / 1000);
             o.q.assign((size_t)o.delayFrames * fb, 0);   // start the delay line full of silence
             if (SUCCEEDED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&o.ac)) &&
@@ -629,11 +631,12 @@ static DWORD WINAPI RouterProc(LPVOID p) {
                 if (FAILED(hr = cc->GetBuffer(&data, &fr, &fl, nullptr, nullptr))) break;
                 got = true;
                 size_t bytes = (size_t)fr * fb;
+                LONG only = ctx->calOnly;
                 for (auto& o : outs) {
                     if (o.dead) continue;
                     size_t at = o.q.size();
                     o.q.resize(at + bytes);
-                    if (fl & AUDCLNT_BUFFERFLAGS_SILENT) memset(&o.q[at], 0, bytes); else memcpy(&o.q[at], data, bytes);
+                    if ((fl & AUDCLNT_BUFFERFLAGS_SILENT) || (only != -1 && only != o.ti)) memset(&o.q[at], 0, bytes); else memcpy(&o.q[at], data, bytes);
                 }
                 cc->ReleaseBuffer(fr);
             }
@@ -681,7 +684,10 @@ static void StopRouter() {
     g_router = nullptr;
 }
 
+static volatile LONG g_calibrating = 0;
+static bool g_routerPending = false;
 static void RestartRouter() {
+    if (g_calibrating) { g_routerPending = true; return; }   // auto sync is using the router; restart when it finishes
     StopRouter();
     int di = DefaultOut();
     if (di < 0) return;
@@ -693,6 +699,173 @@ static void RestartRouter() {
     g_router->targets = targets;
     g_router->thread = CreateThread(nullptr, 0, RouterProc, g_router, 0, nullptr);
     if (g_router->thread) SetThreadPriority(g_router->thread, THREAD_PRIORITY_TIME_CRITICAL);
+}
+
+// ---------------------------------------------------------------- auto sync (measure each copy with the microphone)
+// Two chirps go out through the main output. During the first every copy is silent; during the second only
+// copy k plays. The mic hears main alone, then main + copy k: the gap between them is copy k's offset.
+struct CalTarget { std::wstring id, name; int delayMs; };
+struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstring status; };
+static std::wstring g_calStatus;
+static const UINT32 CAL_RATE = 48000;
+
+static const GUID KNOB_IID_IAudioClient2 = {0x726778cd, 0xf60a, 0x4eda, {0x82, 0xde, 0xe4, 0x76, 0x10, 0xcd, 0x78, 0xaa}};
+static std::vector<float> CalChirp() {   // 50 ms sweep 1 -> 6 kHz, Hann window
+    const int n = CAL_RATE / 20;
+    std::vector<float> c(n);
+    const double f0 = 1000, f1 = 6000, T = n / (double)CAL_RATE;
+    for (int i = 0; i < n; i++) {
+        double t = i / (double)CAL_RATE;
+        double ph = 2 * 3.14159265358979 * (f0 * t + (f1 - f0) * t * t / (2 * T));
+        double w = 0.5 - 0.5 * cos(2 * 3.14159265358979 * i / (n - 1));
+        c[i] = (float)(sin(ph) * w);
+    }
+    return c;
+}
+static void CalFormat(WAVEFORMATEX& f) {
+    f = {}; f.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; f.nChannels = 1; f.nSamplesPerSec = CAL_RATE;
+    f.wBitsPerSample = 32; f.nBlockAlign = 4; f.nAvgBytesPerSec = CAL_RATE * 4;
+}
+// one round: returns copy-minus-main offset in ms; flags: 0 ok, 1 copy not heard, 2 nothing heard, 3 device error
+static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std::vector<float>& chirp, double& offsetMs) {
+    WAVEFORMATEX f; CalFormat(f);
+    IAudioClient *rac = nullptr, *cac = nullptr; IAudioRenderClient* rc = nullptr; IAudioCaptureClient* cc = nullptr;
+    std::vector<float> rec;
+    int result = 3;
+    const UINT32 gap = CAL_RATE * 8 / 10, lead = CAL_RATE / 10, total = lead + gap + CAL_RATE * 9 / 10;
+    do {
+        if (FAILED(outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&rac))) break;
+        if (FAILED(micDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cac))) break;
+        IAudioClient2* c2 = nullptr;   // ask for the raw mic signal (no noise suppression), if the driver allows it
+        if (SUCCEEDED(cac->QueryInterface(KNOB_IID_IAudioClient2, (void**)&c2))) {
+            AudioClientProperties pr = {}; pr.cbSize = sizeof(pr); pr.eCategory = AudioCategory_Other; pr.Options = AUDCLNT_STREAMOPTIONS_RAW;
+            c2->SetClientProperties(&pr); c2->Release();
+        }
+        const DWORD fl = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        if (FAILED(rac->Initialize(AUDCLNT_SHAREMODE_SHARED, fl, 30000000, 0, &f, nullptr))) break;
+        if (FAILED(cac->Initialize(AUDCLNT_SHAREMODE_SHARED, fl, 10000000, 0, &f, nullptr))) break;
+        if (FAILED(rac->GetService(__uuidof(IAudioRenderClient), (void**)&rc))) break;
+        if (FAILED(cac->GetService(__uuidof(IAudioCaptureClient), (void**)&cc))) break;
+        UINT32 bufFrames = 0; rac->GetBufferSize(&bufFrames);
+        UINT32 n = std::min(total, bufFrames);
+        BYTE* dst = nullptr;
+        if (FAILED(rc->GetBuffer(n, &dst))) break;
+        float* out = (float*)dst;
+        memset(out, 0, (size_t)n * 4);
+        for (size_t i = 0; i < chirp.size(); i++) {
+            if (lead + i < n) out[lead + i] = 0.6f * chirp[i];
+            if (lead + gap + i < n) out[lead + gap + i] = 0.6f * chirp[i];
+        }
+        rc->ReleaseBuffer(n, 0);
+        if (g_router) InterlockedExchange(&g_router->calOnly, -2);
+        cac->Start(); rac->Start();
+        DWORD t0 = GetTickCount();
+        bool switched = false;
+        while (GetTickCount() - t0 < 2600) {
+            Sleep(5);
+            if (!switched && GetTickCount() - t0 > 500) { if (g_router) InterlockedExchange(&g_router->calOnly, target); switched = true; }
+            UINT32 pk = 0;
+            while (SUCCEEDED(cc->GetNextPacketSize(&pk)) && pk) {
+                BYTE* d = nullptr; UINT32 fr = 0; DWORD bf = 0;
+                if (FAILED(cc->GetBuffer(&d, &fr, &bf, nullptr, nullptr))) break;
+                size_t at = rec.size(); rec.resize(at + fr);
+                if (bf & AUDCLNT_BUFFERFLAGS_SILENT) memset(&rec[at], 0, (size_t)fr * 4); else memcpy(&rec[at], d, (size_t)fr * 4);
+                cc->ReleaseBuffer(fr);
+            }
+        }
+        rac->Stop(); cac->Stop();
+        result = 2;
+    } while (0);
+    if (g_router) InterlockedExchange(&g_router->calOnly, -1);
+    if (cc) cc->Release();
+    if (rc) rc->Release();
+    if (cac) cac->Release();
+    if (rac) rac->Release();
+    if (result == 3) return 3;
+    // matched filter
+    const size_t m = chirp.size();
+    if (rec.size() < m + CAL_RATE) return 2;
+    std::vector<float> corr(rec.size() - m);
+    for (size_t i = 0; i < corr.size(); i++) {
+        float acc = 0; const float* r = &rec[i];
+        for (size_t j = 0; j < m; j++) acc += r[j] * chirp[j];
+        corr[i] = fabsf(acc);
+    }
+    auto peakIn = [&](size_t a, size_t b, size_t skipA = 0, size_t skipB = 0) -> std::pair<size_t, float> {
+        size_t bi = a; float bv = -1;
+        for (size_t i = a; i < b && i < corr.size(); i++) { if (i >= skipA && i < skipB) continue; if (corr[i] > bv) { bv = corr[i]; bi = i; } }
+        return {bi, bv};
+    };
+    const size_t split = CAL_RATE * 3 / 4, guard = CAL_RATE / 100;   // 750 ms, 10 ms
+    double noise = 0; for (size_t i = 0; i < std::min(corr.size(), (size_t)(CAL_RATE / 20)); i++) noise += corr[i]; noise /= (CAL_RATE / 20);
+    auto p1 = peakIn(0, split);
+    if (p1.second < noise * 8 + 1e-4f) return 2;   // mic didn't hear the main output
+    size_t expect = p1.first + gap;
+    auto pa = peakIn(split, corr.size());
+    auto pb = peakIn(split, corr.size(), pa.first > guard ? pa.first - guard : 0, pa.first + guard);
+    size_t mainAt, copyAt; float copyV;
+    auto isNear = [&](size_t x) { return (x > expect ? x - expect : expect - x) < guard; };
+    if (isNear(pa.first)) { mainAt = pa.first; copyAt = pb.first; copyV = pb.second; }
+    else if (isNear(pb.first)) { mainAt = pb.first; copyAt = pa.first; copyV = pa.second; }
+    else return 1;
+    if (copyV < p1.second * 0.2f) {
+        // no second chirp: either the copy lands on top of main (already in sync) or it wasn't heard
+        if (corr[mainAt] > p1.second * 1.35f) { offsetMs = 0; return 0; }
+        return 1;
+    }
+    offsetMs = ((double)copyAt - (double)mainAt) * 1000.0 / CAL_RATE;
+    return 0;
+}
+static DWORD WINAPI CalibrateProc(LPVOID p) {
+    std::vector<CalTarget>* ts = (std::vector<CalTarget>*)p;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    CalResult* res = new CalResult;
+    IMMDeviceEnumerator* en = nullptr; IMMDevice *outDev = nullptr, *micDev = nullptr;
+    std::vector<float> chirp = CalChirp();
+    std::wstring notes;
+    do {
+        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) { res->status = L"Couldn't open audio devices"; break; }
+        if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &outDev))) { res->status = L"No main output"; break; }
+        if (FAILED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &micDev))) { res->status = L"No microphone found — auto sync needs one"; break; }
+        int ok = 0;
+        for (int k = 0; k < (int)ts->size(); k++) {
+            CalTarget& t = (*ts)[k];
+            double off = 0; int r = CalRound(outDev, micDev, k, chirp, off);
+            if (r == 0) {
+                double oSecond = 0;   // measure again and average when the two agree
+                if (CalRound(outDev, micDev, k, chirp, oSecond) == 0 && fabs(oSecond - off) < 15) off = (off + oSecond) / 2;
+                int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
+                if (nd < -10) notes += t.name + L" is slower than the main output — make it the main output. ";
+                nd = std::max(0, std::min(500, nd));
+                res->delays.push_back({t.id, nd});
+                ok++;
+            } else if (r == 2) { res->status = L"The microphone couldn't hear the main output — turn the volume up"; break; }
+            else if (r == 3) notes += L"Couldn't use " + t.name + L". ";
+            else notes += L"Couldn't hear " + t.name + L". ";
+        }
+        if (res->status.empty()) res->status = ok ? (L"Synced " + std::to_wstring(ok) + (ok == 1 ? L" output. " : L" outputs. ") + notes) : notes;
+    } while (0);
+    if (micDev) micDev->Release();
+    if (outDev) outDev->Release();
+    if (en) en->Release();
+    CoUninitialize();
+    delete ts;
+    if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_CALDONE, 0, (LPARAM)res)) delete res;
+    return 0;
+}
+static void StartAutoSync() {
+    if (g_calibrating) return;
+    if (!g_router) { g_calStatus = L"Select two or more outputs in the Sound tab first"; return; }
+    auto* ts = new std::vector<CalTarget>;
+    for (auto& t : g_router->targets) {
+        std::wstring name = t.id;
+        for (auto& e : g_out) if (e.id == t.id) name = e.name + (e.detail.empty() ? L"" : L" (" + e.detail + L")");
+        ts->push_back({t.id, name, t.delayMs});
+    }
+    InterlockedExchange(&g_calibrating, 1);
+    g_calStatus = L"Listening… keep the room quiet";
+    HANDLE h = CreateThread(nullptr, 0, CalibrateProc, ts, 0, nullptr);
+    if (h) CloseHandle(h); else { delete ts; InterlockedExchange(&g_calibrating, 0); g_calStatus = L"Couldn't start"; }
 }
 
 // ---------------------------------------------------------------- display worker (DDC/CI + WMI + orientation)
@@ -2654,6 +2827,17 @@ static void PaintSettings(HDC hdc) {
         case SP_SOUND:
             y -= S(8);
             para(L"When several outputs are selected, the main (Windows default) output plays normally and Knob copies its sound to the others. Bluetooth adds its own delay, so delay the faster outputs until they line up.", S(12));
+            {
+                bool can = g_router && !g_calibrating;
+                std::wstring d = !g_calStatus.empty() ? g_calStatus
+                    : (g_router ? L"Plays a short chirp on each output and listens with your microphone. Pause music and keep the room quiet."
+                                : L"Select two or more outputs in the Sound tab to use it");
+                RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
+                titleDesc(r, L"Auto sync", d.c_str(), S(170));
+                button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)),
+                       g_calibrating ? L"Listening\u2026" : L"Sync now", can, can);
+                y += S(8);
+            }
             for (int i = 0; i < (int)g_out.size(); i++) {
                 Endpoint& o = g_out[i];
                 bool main = o.isDefault, on = OutSelected(i);
@@ -2796,6 +2980,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_BUTTON:
             if (it.id == 1) { DestroyWindow(g_hwnd); return 0; }
             if (it.id == 3) { g_updStatus = L"Checking\u2026"; CheckForUpdates(); }
+            if (it.id == 5) StartAutoSync();
             if (it.id == 4) StartUpdate();
             if (it.id == 2 && MessageBoxW(h, L"Reset all Knob settings to their defaults? Knob will restart.", APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 g_noSave = true; DeleteFileW(g_iniPath.c_str()); g_restartAfterExit = true;
@@ -2928,6 +3113,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else { g_updState = UPD_NONE; g_updStatus = L"You have the latest version"; }
             delete u;
         } else g_updStatus = L"Couldn't reach GitHub";
+        if (g_visible) InvalidateRect(h, nullptr, FALSE);
+        if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+        return 0;
+    }
+    case WM_APP_CALDONE: {
+        CalResult* r = (CalResult*)lp;
+        InterlockedExchange(&g_calibrating, 0);
+        if (r) {
+            for (auto& d : r->delays) g_delay[d.first] = d.second;
+            g_calStatus = r->status;
+            if (!r->delays.empty()) SaveSettings();
+            delete r;
+        }
+        g_routerPending = false; RestartRouter();   // apply the new delays (and any device change that waited)
         if (g_visible) InvalidateRect(h, nullptr, FALSE);
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
