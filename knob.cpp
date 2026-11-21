@@ -43,13 +43,13 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.17.0"
-#define APP_VERNUM  ((1 << 16) | (17 << 8) | 0)
+#define APP_VERSION L"1.18.0"
+#define APP_VERNUM  ((1 << 16) | (18 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -60,6 +60,7 @@ static HICON g_trayIcon;
 static bool g_visible = false;
 static DWORD g_hideTick = 0;
 static std::wstring g_iniPath;
+static int g_trayPinned = -1;   // tray icon on the taskbar: -1 unknown, 0 hidden, 1 shown
 static bool g_keepAwake = false;
 static int g_tab = T_SOUND;
 static int g_style = 1;      // 0 = Solid, 1 = Glass
@@ -265,6 +266,7 @@ static void LoadSettings() {
     g_accentId = std::max(0, std::min(6, (int)GetPrivateProfileIntW(L"main", L"accent", 0, g_iniPath.c_str())));
     g_osd = GetPrivateProfileIntW(L"main", L"osd", 1, g_iniPath.c_str()) != 0;
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
+    g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
     {   // sections stored as key=value lists
         auto readSection = [&](const wchar_t* sec, auto fn) {
             std::vector<wchar_t> b(32768);
@@ -1667,6 +1669,42 @@ static HICON MakeTrayIcon() {
     HICON h = nullptr;
     bmp.GetHICON(&h);
     return h;
+}
+// Keep the tray icon on the taskbar across updates. Windows 11 keeps "show on taskbar" per icon in
+// HKCU\Control Panel\NotifyIconSettings\<id> (IsPromoted); a rebuilt exe can get a fresh, hidden entry.
+static void SaveTrayPinned() {
+    wchar_t v[8]; swprintf(v, 8, L"%d", g_trayPinned);
+    WritePrivateProfileStringW(L"main", L"traypinned", v, g_iniPath.c_str());
+}
+static void TrayPinSync(bool enforce) {
+    HKEY root;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\NotifyIconSettings", 0, KEY_READ | KEY_WRITE, &root) != ERROR_SUCCESS) return;
+    std::vector<std::wstring> mine; std::vector<DWORD> vals;
+    wchar_t name[256];
+    for (DWORD i = 0;; i++) {
+        DWORD nl = 256;
+        if (RegEnumKeyExW(root, i, name, &nl, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        wchar_t path[1024] = {}; DWORD pl = sizeof(path);
+        if (RegGetValueW(root, name, L"ExecutablePath", RRF_RT_REG_SZ, nullptr, path, &pl) != ERROR_SUCCESS) continue;
+        size_t L = wcslen(path);
+        if (L < 9 || _wcsicmp(path + L - 9, L"\\Knob.exe") != 0) continue;
+        DWORD pr = 0, sz = sizeof(pr);
+        RegGetValueW(root, name, L"IsPromoted", RRF_RT_REG_DWORD, nullptr, &pr, &sz);
+        mine.push_back(name); vals.push_back(pr ? 1 : 0);
+    }
+    if (!mine.empty()) {
+        bool anyOn = false, allSame = true;
+        for (DWORD v : vals) { anyOn |= v != 0; allSame &= v == vals[0]; }
+        if (g_trayPinned < 0) { g_trayPinned = anyOn ? 1 : 0; SaveTrayPinned(); }
+        else if (!enforce && allSame && (int)vals[0] != g_trayPinned) { g_trayPinned = (int)vals[0]; SaveTrayPinned(); }   // you changed it
+        else if (g_trayPinned == 1) {   // just started, or a new hidden entry appeared: put it back on the taskbar
+            for (size_t i = 0; i < mine.size(); i++) if (!vals[i]) {
+                DWORD one = 1;
+                RegSetKeyValueW(root, mine[i].c_str(), L"IsPromoted", REG_DWORD, &one, sizeof(one));
+            }
+        }
+    }
+    RegCloseKey(root);
 }
 static void TrayAdd() {
     if (g_trayIcon) DestroyIcon(g_trayIcon);
@@ -3192,6 +3230,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_IDENT) {
             KillTimer(h, TIMER_IDENT);
             CloseIdentify();
+        } else if (wp == TIMER_TRAYPIN) {
+            static int ticks = 0;
+            ticks++;
+            TrayPinSync(ticks <= 3);   // first ~20 s after start: restore your choice; afterwards: follow your changes
+            SetTimer(h, TIMER_TRAYPIN, ticks < 3 ? 6000 : 60000, nullptr);
+            return 0;
         } else if (wp == TIMER_UPDCHECK) {
             SetTimer(h, TIMER_UPDCHECK, 6 * 60 * 60 * 1000, nullptr);   // then every 6 hours
             CheckForUpdates();
@@ -3497,6 +3541,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     UpdateTrayTip();
     RegisterHotkeys();
     SetTimer(g_hwnd, TIMER_UPDCHECK, 15000, nullptr);   // first check 15 s after start
+    SetTimer(g_hwnd, TIMER_TRAYPIN, 3000, nullptr);
     if (cmd && wcsstr(cmd, L"--show")) PostMessageW(g_hwnd, WM_APP_SHOW, 0, 0);   // just installed / updated: show it
 
     MSG m;
