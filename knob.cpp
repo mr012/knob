@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.16.0"
-#define APP_VERNUM  ((1 << 16) | (16 << 8) | 0)
+#define APP_VERSION L"1.17.0"
+#define APP_VERNUM  ((1 << 16) | (17 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2209,6 +2209,7 @@ static void Paint(HDC hdc) {
 }
 
 static void ShowFlyout();
+static HWND g_set;   // Settings window (declared early: the panel checks it)
 static void HideFlyout();
 static void OpenSettings(int page, bool newProfile);
 
@@ -2266,7 +2267,7 @@ static void ShowOsd(int kind, int val, bool muted) {
 }
 
 static void RunHotkey(int a) {
-    if (a == HK_OPEN) { if (g_visible) HideFlyout(); else ShowFlyout(); }
+    if (a == HK_OPEN) { if (g_visible && !g_set) HideFlyout(); else if (g_visible) SetForegroundWindow(g_hwnd); else ShowFlyout(); }
 }
 
 // ---------------------------------------------------------------- style (Solid / Glass)
@@ -2394,6 +2395,7 @@ static void ShowFlyout() {
 
 static void HideFlyout() {
     if (!g_visible) return;
+    if (g_set) return;   // the panel stays while Settings is open (Esc, clicking away, tray and shortcut all wait)
     g_visible = false;
     g_dragEl = -1; g_menuOpen = false; g_ddOpen = -1; g_saveOpen = false; g_view = 0; g_delayOpen = -1; g_dragDelay = false;
     SaveSettings();
@@ -2595,7 +2597,7 @@ enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, 
 struct SItem { int kind; int id; RectF r; };
 enum { WM_APP_STARTEDIT = WM_APP + 20 };
 
-static HWND g_set, g_edit;
+static HWND g_edit;
 static WNDPROC g_editProc;
 static HFONT g_editFont;
 static HBRUSH g_editBrush;
@@ -3095,7 +3097,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_TRAY: {
         UINT ev = LOWORD(lp);
         if (ev == NIN_SELECT || ev == NIN_KEYSELECT) {
-            if (g_visible) HideFlyout();
+            if (g_visible && g_set) SetForegroundWindow(g_hwnd);   // Settings is open: just bring the panel up
+            else if (g_visible) HideFlyout();
             else if (GetTickCount() - g_hideTick > 300) ShowFlyout();
         } else if (ev == WM_CONTEXTMENU) { HideFlyout(); ShowTrayMenu(); }
         return 0;
@@ -3308,7 +3311,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (ht.idx < (int)g_prof.size()) SaveProfile(ht.idx);
             else { OpenSettings(2, true); return 0; }   // name a new profile in Settings
             break;
-        case H_GEAR: if (g_set) DestroyWindow(g_set); else OpenSettings(0, false); return 0;
+        case H_GEAR:   // open Settings, or bring it to the front if it's already open
+            if (g_set) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
+            else OpenSettings(0, false);
+            return 0;
         case H_IDENT: IdentifyDisplays(); return 0;
         case H_REFRESH: RefreshAll(); return 0;
         case H_DROPDOWN: g_ddOpen = ht.idx; break;
