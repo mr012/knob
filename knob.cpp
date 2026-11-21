@@ -43,13 +43,13 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.20.0"
-#define APP_VERNUM  ((1 << 16) | (20 << 8) | 0)
+#define APP_VERSION L"1.21.0"
+#define APP_VERNUM  ((1 << 16) | (21 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -719,7 +719,8 @@ static void RestartRouter() {
 // Two chirps go out through the main output. During the first every copy is silent; during the second only
 // copy k plays. The mic hears main alone, then main + copy k: the gap between them is copy k's offset.
 struct CalTarget { std::wstring id, name; int delayMs; };
-struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstring status; };
+struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstring status, swapTo, swapName; };
+static int g_calPass = 0;   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
 static const UINT32 CAL_RATE = 48000;
 
@@ -842,6 +843,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
         if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &outDev))) { res->status = L"No main output"; break; }
         if (FAILED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &micDev))) { res->status = L"No microphone found — auto sync needs one"; break; }
         int ok = 0;
+        int worst = 0; std::wstring worstId, worstName;   // most negative delay = slowest speaker
         for (int k = 0; k < (int)ts->size(); k++) {
             CalTarget& t = (*ts)[k];
             double off = 0; int r = CalRound(outDev, micDev, k, chirp, off);
@@ -849,7 +851,8 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
                 double oSecond = 0;   // measure again and average when the two agree
                 if (CalRound(outDev, micDev, k, chirp, oSecond) == 0 && fabs(oSecond - off) < 15) off = (off + oSecond) / 2;
                 int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
-                if (nd < -10) notes += t.name + L" is slower than the main output — make it the main output. ";
+                if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
+                if (nd < -10 && g_calPass) notes += t.name + L" is still slower than the main output. ";
                 nd = std::max(0, std::min(500, nd));
                 res->delays.push_back({t.id, nd});
                 ok++;
@@ -857,7 +860,11 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
             else if (r == 3) notes += L"Couldn't use " + t.name + L". ";
             else notes += L"Couldn't hear " + t.name + L". ";
         }
-        if (res->status.empty()) res->status = ok ? (L"Synced " + std::to_wstring(ok) + (ok == 1 ? L" output. " : L" outputs. ") + notes) : notes;
+        if (res->status.empty() && worst < -10 && !g_calPass) {   // let Knob make the slowest speaker the main output, then sync again
+            res->swapTo = worstId; res->swapName = worstName; res->delays.clear();
+            res->status = L"Making " + worstName + L" the main output, then syncing again\u2026";
+        }
+        if (res->status.empty()) res->status = ok ? (std::wstring(g_calPass ? L"Made the slowest speaker the main output. " : L"") + L"Synced " + std::to_wstring(ok) + (ok == 1 ? L" output. " : L" outputs. ") + notes) : notes;
     } while (0);
     if (micDev) micDev->Release();
     if (outDev) outDev->Release();
@@ -3234,9 +3241,22 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             for (auto& d : r->delays) g_delay[d.first] = d.second;
             g_calStatus = r->status;
             if (!r->delays.empty()) SaveSettings();
+            int di = DefaultOut();
+            if (!r->swapTo.empty() && di >= 0) {   // slowest speaker becomes the main output; the old main becomes a copy
+                std::wstring oldMain = g_out[di].id;
+                g_mirror.erase(r->swapTo);
+                g_mirror.insert(oldMain);
+                g_delay[oldMain] = 0;
+                SetDefaultDevice(r->swapTo);
+                LoadEndpoints(eRender, g_out);
+                SaveSettings();
+                g_calPass = 1;
+                SetTimer(h, TIMER_CALRETRY, 2500, nullptr);
+            } else g_calPass = 0;
             delete r;
         }
         g_routerPending = false; RestartRouter();   // apply the new delays (and any device change that waited)
+        if (g_calPass) InterlockedExchange(&g_calibrating, 1);   // stay busy until the second run starts
         if (g_visible) InvalidateRect(h, nullptr, FALSE);
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
@@ -3299,6 +3319,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_IDENT) {
             KillTimer(h, TIMER_IDENT);
             CloseIdentify();
+        } else if (wp == TIMER_CALRETRY) {
+            KillTimer(h, TIMER_CALRETRY);
+            InterlockedExchange(&g_calibrating, 0);
+            RestartRouter();
+            StartAutoSync();   // second run with the new main output
+            if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+            return 0;
         } else if (wp == TIMER_TRAYPIN) {
             static int ticks = 0;
             ticks++;
