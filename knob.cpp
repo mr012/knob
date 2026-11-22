@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.28.0"
-#define APP_VERNUM  ((1 << 16) | (28 << 8) | 0)
+#define APP_VERSION L"1.29.0"
+#define APP_VERNUM  ((1 << 16) | (29 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -560,9 +560,10 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
         else { e.icon = DI_SPEAKER; name = L"Speakers"; conn = codec ? L"Built-in" : L""; }
     }
     else conn = IsCodecName(ifc) ? L"" : conn;   // unknown: no label rather than a wrong one
-    if (conn == name) conn.clear();
-    e.name = name.empty() ? nm : name;
-    e.detail = conn;
+    // names stay exactly as Windows shows them ("Speakers" + "Realtek(R) Audio"); only the icon comes from the checks above
+    (void)name; (void)conn;
+    e.name = nm;
+    e.detail = ifc;
 }
 static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     FreeEndpoints(v);
@@ -2957,12 +2958,16 @@ static void ToggleOutput(int i) {
     UpdateTrayTip();
 }
 
+static bool IsCallEndpoint(const Endpoint& e) {   // Bluetooth hands-free (call quality) output
+    std::wstring l = Lower(e.rawName + L" " + e.rawIface);
+    return e.bt && (Lower(e.rawName) == L"headset" || l.find(L"hands-free") != std::wstring::npos);
+}
 static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
     std::set<std::wstring> now; for (auto& o : g_out) now.insert(o.id);
     if (g_prevOutKnown && g_autoSwitch) {
         const Endpoint* pick = nullptr;   // prefer the music output over a Bluetooth "calls" one
         for (auto& o : g_out) if (!g_prevOutIds.count(o.id) && (o.icon == DI_HEADPHONES || o.icon == DI_EARBUDS))
-            if (!pick || (pick->detail.find(L"calls") != std::wstring::npos && o.detail.find(L"calls") == std::wstring::npos)) pick = &o;
+            if (!pick || (IsCallEndpoint(*pick) && !IsCallEndpoint(o))) pick = &o;
         if (pick) {
             std::wstring id = pick->id; bool isDef = pick->isDefault;
             if (g_multi) g_mirror.insert(id);   // Play together: add it to the group
