@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.23.0"
-#define APP_VERNUM  ((1 << 16) | (23 << 8) | 0)
+#define APP_VERSION L"1.24.0"
+#define APP_VERNUM  ((1 << 16) | (24 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -58,6 +58,8 @@ static UINT WM_TASKBARCREATED;
 static NOTIFYICONDATAW g_nid;
 static HICON g_trayIcon;
 static bool g_visible = false;
+static HWND g_set;   // Settings window (declared early: the panel checks it)
+static bool g_pairHidden = false;   // panel tucked away because Settings went behind other windows
 static DWORD g_hideTick = 0;
 static std::wstring g_iniPath;
 static int g_trayPinned = -1;   // tray icon on the taskbar: -1 unknown, 0 hidden, 1 shown
@@ -2307,7 +2309,16 @@ static void Paint(HDC hdc) {
 }
 
 static void ShowFlyout();
-static HWND g_set;   // Settings window (declared early: the panel checks it)
+static void PairHide() {   // Settings lost the foreground to another app: tuck the panel away with it
+    if (!g_set || !g_visible || g_pairHidden) return;
+    g_pairHidden = true;
+    ShowWindow(g_hwnd, SW_HIDE);
+}
+static void PairShow(bool activateSettings) {   // Settings came back: bring the panel back beside it
+    if (!g_set) return;
+    if (g_pairHidden) { g_pairHidden = false; ShowWindow(g_hwnd, SW_SHOWNOACTIVATE); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (activateSettings) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
+}
 static void HideFlyout();
 static void OpenSettings(int page, bool newProfile);
 
@@ -2365,7 +2376,7 @@ static void ShowOsd(int kind, int val, bool muted) {
 }
 
 static void RunHotkey(int a) {
-    if (a == HK_OPEN) { if (g_visible && !g_set) HideFlyout(); else if (g_visible) SetForegroundWindow(g_hwnd); else ShowFlyout(); }
+    if (a == HK_OPEN) { if (g_set && (g_visible || g_pairHidden)) PairShow(true); else if (g_visible) HideFlyout(); else ShowFlyout(); }
 }
 
 // ---------------------------------------------------------------- style (Solid / Glass)
@@ -2476,6 +2487,7 @@ static void PositionFlyout() {
 static void StartAnim() { if (g_visible && g_tab == T_APPS) SetTimer(g_hwnd, TIMER_ANIM, 70, nullptr); else KillTimer(g_hwnd, TIMER_ANIM); }
 
 static void ShowFlyout() {
+    if (g_pairHidden) { PairShow(true); return; }   // Settings is open: bring the pair back
     LoadEndpoints(eRender, g_out);
     LoadEndpoints(eCapture, g_in);
     LoadApps();
@@ -2757,7 +2769,23 @@ static Theme g_setTheme;
 static RectF g_editRect;
 static const float NAVW = 240;
 
-static void BuildSettingsTheme() {   // Settings always uses the solid look (text boxes need an opaque surface)
+static bool g_setGlass = false;   // Settings window uses the Glass style too
+static void ApplySettingsStyle() {
+    if (!g_set) return;
+    g_setGlass = g_style == 1 && TransparencyOn();
+    BOOL dark = g_setTheme.dark; DwmSetWindowAttribute(g_set, 20, &dark, sizeof(dark));
+    int backdrop = g_setGlass ? 3 : 1;   // acrylic behind the whole window (title bar included), or none
+    DwmSetWindowAttribute(g_set, 38, &backdrop, sizeof(backdrop));
+    MARGINS m = g_setGlass ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
+    DwmExtendFrameIntoClientArea(g_set, &m);
+    // solid: paint the title bar the same colour as the window body
+    COLORREF cap = g_setGlass ? 0xFFFFFFFF /*default*/ : (g_setTheme.dark ? RGB(32, 32, 32) : RGB(243, 243, 243));
+    DwmSetWindowAttribute(g_set, 35 /*DWMWA_CAPTION_COLOR*/, &cap, sizeof(cap));
+    COLORREF border = g_setGlass ? 0xFFFFFFFF : cap;
+    DwmSetWindowAttribute(g_set, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
+    InvalidateRect(g_set, nullptr, TRUE);
+}
+static void BuildSettingsTheme() {
     Theme keep = T;
     T.glass = false;
     LoadTheme();
@@ -2837,13 +2865,14 @@ static void PaintSettings(HDC hdc) {
         Bitmap canvas(g_setW, g_setH, g_setW * 4, PixelFormat32bppPARGB, (BYTE*)bits);
         Graphics g(&canvas);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        g.SetTextRenderingHint(g_setGlass ? TextRenderingHintAntiAliasGridFit : TextRenderingHintClearTypeGridFit);   // ClearType needs an opaque background
         g.SetPixelOffsetMode(PixelOffsetModeHalf);
-        g.Clear(T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243));
+        if (g_setGlass) g.Clear(T.dark ? Color(110, 24, 24, 24) : Color(120, 246, 246, 246));   // acrylic shows through
+        else g.Clear(T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243));
         Font fTitle(g_famSemi, S(26), FontStyleRegular, UnitPixel), fBody(g_famText, S(14), FontStyleRegular, UnitPixel);
         Font fBody600(g_famSemi, S(14), FontStyleRegular, UnitPixel), fDesc(g_famText, S(12), FontStyleRegular, UnitPixel);
-        Color card = T.dark ? Color(255, 43, 43, 43) : Color(255, 251, 251, 251);
-        Color cardHover = T.dark ? Color(255, 50, 50, 50) : Color(255, 246, 246, 246);
+        Color card = g_setGlass ? (T.dark ? Color(150, 48, 48, 48) : Color(170, 255, 255, 255)) : (T.dark ? Color(255, 43, 43, 43) : Color(255, 251, 251, 251));
+        Color cardHover = g_setGlass ? (T.dark ? Color(170, 58, 58, 58) : Color(200, 255, 255, 255)) : (T.dark ? Color(255, 50, 50, 50) : Color(255, 246, 246, 246));
         auto add = [&](int k, int id, RectF r) { g_sItems.push_back({k, id, r}); return (int)g_sItems.size() - 1; };
         auto isHover = [&](int k, int id) { return g_sHover >= 0 && g_sHover < (int)g_sItems.size() && g_sItems[g_sHover].kind == k && g_sItems[g_sHover].id == id; };
 
@@ -3139,7 +3168,13 @@ static void SettingsDelayAt(float x) {
 
 static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_SIZE: g_setW = LOWORD(lp); g_setH = HIWORD(lp); SetPageScroll(g_setScroll); InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) { PairHide(); return 0; }
+        g_setW = LOWORD(lp); g_setH = HIWORD(lp); SetPageScroll(g_setScroll); InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_ACTIVATE:   // the panel follows Settings: back when Settings comes forward, away when another app takes over
+        if (LOWORD(wp) != WA_INACTIVE) PairShow(false);
+        else if ((HWND)lp != g_hwnd) PairHide();
+        break;
     case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); PaintSettings(dc); EndPaint(h, &ps); return 0; }
     case WM_ERASEBKGND: return 1;
     case WM_MOUSEMOVE: {
@@ -3184,7 +3219,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DestroyWindow(g_hwnd); return 0;
             }
             break;
-        case SK_STYLE: g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); break;
+        case SK_STYLE: g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); break;
         case SK_SWATCH: break;
         case SK_ACCMODE: g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); SettingsChanged(); break;
         case SK_COLOR: g_sDragColor = it.id + 1; SetCapture(h); SettingsColorAt(x); return 0;
@@ -3245,7 +3280,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
         if (g_edit) CommitRename(true);
         g_set = nullptr;
-        if (g_visible) SetForegroundWindow(g_hwnd);   // hand focus back so the panel closes normally again
+        if (g_pairHidden) { g_pairHidden = false; HideFlyout(); }   // it was tucked away: close it properly
+        else if (g_visible) SetForegroundWindow(g_hwnd);   // hand focus back so the panel closes normally again
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -3278,8 +3314,7 @@ static void OpenSettings(int page, bool newProfile) {
         }
         g_set = CreateWindowExW(0, L"KnobSettings", L"Knob Settings", style, x, y, w, hgt, nullptr, nullptr, g_inst, nullptr);
         if (!g_set) return;
-        BOOL dark = g_setTheme.dark; DwmSetWindowAttribute(g_set, 20, &dark, sizeof(dark));
-        int mica = 2; DwmSetWindowAttribute(g_set, 38, &mica, sizeof(mica));   // Mica title bar on Windows 11
+        ApplySettingsStyle();
     }
     g_setPage = page; g_setScroll = 0;
     ShowWindow(g_set, IsIconic(g_set) ? SW_RESTORE : SW_SHOW);
@@ -3295,7 +3330,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_TRAY: {
         UINT ev = LOWORD(lp);
         if (ev == NIN_SELECT || ev == NIN_KEYSELECT) {
-            if (g_visible && g_set) SetForegroundWindow(g_hwnd);   // Settings is open: just bring the panel up
+            if (g_set && (g_visible || g_pairHidden)) PairShow(true);   // Settings is open: bring the pair forward
             else if (g_visible) HideFlyout();
             else if (GetTickCount() - g_hideTick > 300) ShowFlyout();
         } else if (ev == WM_CONTEXTMENU) { HideFlyout(); ShowTrayMenu(); }
@@ -3434,7 +3469,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(wp) == WA_INACTIVE && g_visible && !g_set) HideFlyout();   // stays open while Settings is open
+        if (LOWORD(wp) == WA_INACTIVE && g_visible) {
+            if (!g_set) HideFlyout();
+            else if ((HWND)lp != g_set) PairHide();   // clicked another app: panel and Settings step back together
+        }
         return 0;
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
@@ -3542,7 +3580,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else { OpenSettings(2, true); return 0; }   // name a new profile in Settings
             break;
         case H_GEAR:   // open Settings, or bring it to the front if it's already open
-            if (g_set) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
+            if (g_set) PairShow(true);
             else OpenSettings(0, false);
             return 0;
         case H_IDENT: IdentifyDisplays(); return 0;
@@ -3602,7 +3640,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETTINGCHANGE:
         if (lp && lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
             LoadTheme(); ApplyStyle(); UpdateTrayIcon(); AllowDarkMenus();
-            if (g_set) { BuildSettingsTheme(); BOOL dk = g_setTheme.dark; DwmSetWindowAttribute(g_set, 20, &dk, sizeof(dk)); InvalidateRect(g_set, nullptr, FALSE); }
+            if (g_set) { BuildSettingsTheme(); ApplySettingsStyle(); }
         }
         return 0;
     case WM_DWMCOLORIZATIONCOLORCHANGED: LoadTheme(); if (g_visible) InvalidateRect(h, nullptr, FALSE); return 0;
