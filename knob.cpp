@@ -44,13 +44,13 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.27.0"
-#define APP_VERNUM  ((1 << 16) | (27 << 8) | 0)
+#define APP_VERSION L"1.28.0"
+#define APP_VERNUM  ((1 << 16) | (28 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -141,6 +141,7 @@ struct Meter : public IUnknown {
 static const PROPERTYKEY PK_FriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
 static const PROPERTYKEY PK_DeviceDesc = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 2};
 static const PROPERTYKEY PK_IfaceName = {{0x026e516e, 0xb814, 0x414b, {0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22}}, 2};
+static const PROPERTYKEY PK_HwInstance = {{0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2};   // "{1}.USB\\VID_..." / "{1}.BTHENUM\\..." / "{1}.HDAUDIO\\..."
 static const PROPERTYKEY PK_FormFactor = {{0x1da5d803, 0xd492, 0x4edd, {0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e}}, 0};
 
 // ---------------------------------------------------------------- models
@@ -159,6 +160,8 @@ struct Endpoint {
 struct AppGroup {
     std::wstring key, name, path;
     bool system = false;
+    std::vector<DWORD> pids;
+    std::wstring outId;   // output this app is sent to (empty = follows the main output)
     std::vector<ISimpleAudioVolume*> vols;
     std::vector<Meter*> meters;
     float level = 1;
@@ -177,7 +180,8 @@ static std::set<std::wstring> g_mirror;   // extra outputs that play a copy of t
 static std::set<std::wstring> g_mirrorSaved;   // the group to bring back when Multi is turned on again
 static bool g_multi = false;   // Multi on: clicking outputs adds/removes them; off: clicking switches output
 
-struct MonUI { std::wstring name, detail, gdi; int pct = 0, con = 50, orient = 0; bool ok = false, hasCon = false, internal = false; RECT rc{}; };
+struct MonUI { std::wstring name, detail, gdi; int pct = 0, con = 50, orient = 0; bool ok = false, hasCon = false, internal = false; RECT rc{};
+               std::vector<int> rates; int rate = 0; std::vector<int> inputs; int input = -1; };
 struct MonMsg { int gen; bool fromEnum; std::vector<MonUI> mons; };
 static std::vector<MonUI> g_mons;
 static int g_monGen = -1;
@@ -516,8 +520,12 @@ static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the
 }
 static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& path) {
     std::wstring nm = e.rawName, ifc = e.rawIface, both = Lower(nm + L" " + ifc);
-    bool bt = path.find(L"bth") != std::wstring::npos;
-    bool usb = path.find(L"usb") != std::wstring::npos;
+    bool bt = path.find(L"bth") != std::wstring::npos || path.find(L"bluetooth") != std::wstring::npos;
+    bool usb = !bt && path.find(L"usb") != std::wstring::npos;
+    bool codec = !bt && !usb && (path.find(L"hdaudio") != std::wstring::npos || path.find(L"intelaudio") != std::wstring::npos ||
+                 path.find(L"intcaudio") != std::wstring::npos || path.find(L"acp") != std::wstring::npos || path.find(L"sst") != std::wstring::npos ||
+                 path.find(L"soundwire") != std::wstring::npos || path.find(L"pci") != std::wstring::npos);   // built-in sound chip
+    if (!bt && !usb && !codec && (ff == 3 || ff == 5) && !IsCodecName(ifc) && !ifc.empty() && LooksLikeEarbuds(ifc)) bt = true;   // earbuds are wireless
     bool virt = path.find(L"root#") != std::wstring::npos || path.find(L"\\root") != std::wstring::npos;
     for (auto w : {L"vb-audio", L"voicemeeter", L"virtual", L"steam streaming", L"nvidia broadcast", L"cable input", L"cable output"}) if (both.find(w) != std::wstring::npos) virt = true;
     if (bt) virt = false;
@@ -531,22 +539,27 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
         else if (usb) conn = L"USB";
         else if (virt) { conn = L"Virtual"; e.icon = DI_VIRTUAL; }
         else if (ff == 4 || IsGenericName(nm)) {   // built-in or jack
-            if (headset) { name = L"Headset microphone"; conn = L"3.5 mm jack"; }
-            else if (Lower(nm).find(L"array") != std::wstring::npos || IsLaptop()) { name = IsLaptop() ? L"Laptop microphone" : L"Microphone"; conn = L"Built-in"; }
-            else conn = L"Built-in";
+            if (headset) { name = L"Headset microphone"; conn = codec ? L"3.5 mm jack" : L""; }
+            else if (codec || path.size() <= 1) { if (IsLaptop() || Lower(nm).find(L"array") != std::wstring::npos) name = IsLaptop() ? L"Laptop microphone" : L"Microphone"; conn = L"Built-in"; }
+            else conn = IsCodecName(ifc) ? L"" : conn;
         }
     } else if (ff == 9) { e.icon = DI_DISPLAY; conn = L"HDMI / DP"; if (IsGenericName(nm) || IsCodecName(nm)) name = ifc.empty() ? L"Display audio" : ifc; }
     else if (ff == 0) { e.icon = DI_DISPLAY; conn = L"Wireless display"; }
     else if (virt) { e.icon = DI_VIRTUAL; conn = L"Virtual"; }
-    else if (bt) { e.icon = (LooksLikeEarbuds(name) ? DI_EARBUDS : headset ? DI_HEADPHONES : DI_SPEAKER); conn = L"Bluetooth"; }
+    else if (bt) { e.icon = (LooksLikeEarbuds(name) ? DI_EARBUDS : headset ? DI_HEADPHONES : DI_SPEAKER); conn = ff == 5 ? L"Bluetooth \u00B7 calls" : L"Bluetooth"; }
     else if (usb) { e.icon = headset ? (LooksLikeEarbuds(name) ? DI_EARBUDS : DI_HEADPHONES) : DI_USB; conn = L"USB"; }
-    else if (headset) { e.icon = DI_HEADPHONES; conn = L"3.5 mm jack"; if (IsCodecName(name) || IsGenericName(name)) name = L"Headphones"; }
+    else if (headset) {   // only call it a jack when it's really the built-in sound chip
+        e.icon = LooksLikeEarbuds(name) ? DI_EARBUDS : DI_HEADPHONES;
+        conn = codec ? L"3.5 mm jack" : L"";
+        if (codec && (IsCodecName(name) || IsGenericName(name))) name = L"Headphones";
+    }
     else if (ff == 8) { e.icon = DI_SPEAKER; conn = L"Optical"; }
     else if (ff == 2) { e.icon = DI_SPEAKER; conn = L"Line out"; }
-    else if (ff == 1 || IsGenericName(nm)) {
-        if (IsLaptop()) { e.icon = DI_LAPTOP; name = L"Laptop speakers"; } else { e.icon = DI_SPEAKER; name = L"Speakers"; }
-        conn = L"Built-in";
+    else if ((ff == 1 || IsGenericName(nm)) && (codec || path.size() <= 1)) {
+        if (IsLaptop()) { e.icon = DI_LAPTOP; name = L"Laptop speakers"; conn = L"Built-in"; }
+        else { e.icon = DI_SPEAKER; name = L"Speakers"; conn = codec ? L"Built-in" : L""; }
     }
+    else conn = IsCodecName(ifc) ? L"" : conn;   // unknown: no label rather than a wrong one
     if (conn == name) conn.clear();
     e.name = name.empty() ? nm : name;
     e.detail = conn;
@@ -589,7 +602,9 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         }
         if (e.name.empty()) e.name = L"Audio device";
         e.rawName = e.name; e.rawIface = e.detail;
-        Classify(e, flow == eCapture, ff, ConnectedPath(dev));
+        std::wstring hwPath;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = Lower(PropStr(ps, PK_HwInstance)); ps->Release(); ps = nullptr; }
+        Classify(e, flow == eCapture, ff, hwPath + L"|" + ConnectedPath(dev));
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
         if (e.vol) { e.vol->GetMasterVolumeLevelScalar(&e.level); e.vol->GetMute(&e.mute); if (g_volCb) e.vol->RegisterControlChangeNotify(g_volCb); }
@@ -638,6 +653,68 @@ static void FreeApps() {
     g_apps.clear();
 }
 
+// ---- per-app output: the same Windows feature as Settings > Volume mixer > app > Output device.
+// Windows offers no public API for it; this uses the one Windows itself and EarTrumpet use.
+typedef HRESULT (WINAPI* PFN_RoGetActivationFactory)(void* cls, REFIID iid, void** f);
+typedef HRESULT (WINAPI* PFN_WindowsCreateString)(PCWSTR s, UINT32 n, void** hs);
+typedef HRESULT (WINAPI* PFN_WindowsDeleteString)(void* hs);
+typedef PCWSTR (WINAPI* PFN_WindowsGetStringRawBuffer)(void* hs, UINT32* n);
+static void* g_apcf = nullptr;   // IAudioPolicyConfigFactory
+static PFN_WindowsCreateString pWCS; static PFN_WindowsDeleteString pWDS; static PFN_WindowsGetStringRawBuffer pWGB;
+static bool AppRouteReady() {
+    static int state = 0;   // 0 not tried, 1 ok, 2 unavailable
+    if (state) return state == 1;
+    state = 2;
+    HMODULE cb = LoadLibraryW(L"combase.dll");
+    if (!cb) return false;
+    auto pRGAF = (PFN_RoGetActivationFactory)(void*)GetProcAddress(cb, "RoGetActivationFactory");
+    pWCS = (PFN_WindowsCreateString)(void*)GetProcAddress(cb, "WindowsCreateString");
+    pWDS = (PFN_WindowsDeleteString)(void*)GetProcAddress(cb, "WindowsDeleteString");
+    pWGB = (PFN_WindowsGetStringRawBuffer)(void*)GetProcAddress(cb, "WindowsGetStringRawBuffer");
+    if (!pRGAF || !pWCS || !pWDS || !pWGB) return false;
+    const wchar_t* cls = L"Windows.Media.Internal.AudioPolicyConfig";
+    void* hs = nullptr;
+    if (FAILED(pWCS(cls, (UINT32)wcslen(cls), &hs))) return false;
+    static const GUID iidNew = {0xab3d4648, 0xe242, 0x459f, {0xb0, 0x2f, 0x54, 0x1c, 0x70, 0x30, 0x63, 0x24}};   // Windows 10 21H2 and later
+    static const GUID iidOld = {0x2a59116d, 0x6c4f, 0x45e0, {0xa7, 0x4f, 0x70, 0x7e, 0x3f, 0xef, 0x92, 0x58}};
+    if (FAILED(pRGAF(hs, iidNew, &g_apcf)) || !g_apcf) { g_apcf = nullptr; pRGAF(hs, iidOld, &g_apcf); }
+    pWDS(hs);
+    if (!g_apcf) return false;
+    state = 1;
+    return true;
+}
+typedef HRESULT (STDMETHODCALLTYPE* PFN_SetPersisted)(void* self, UINT pid, EDataFlow flow, ERole role, void* devId);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_GetPersisted)(void* self, UINT pid, EDataFlow flow, ERole role, void** devId);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_ClearAll)(void* self);
+static void** ApcfVtbl() { return *(void***)g_apcf; }
+static std::wstring AppOutputGet(DWORD pid) {   // endpoint id the app is pinned to, or empty
+    if (!AppRouteReady()) return L"";
+    void* hs = nullptr;
+    std::wstring r;
+    if (SUCCEEDED(((PFN_GetPersisted)ApcfVtbl()[26])(g_apcf, pid, eRender, eMultimedia, &hs)) && hs) {
+        UINT32 n = 0; PCWSTR b = pWGB(hs, &n);
+        std::wstring full(b ? b : L"", n);
+        size_t a = full.find(L"MMDEVAPI#"), z = full.rfind(L"#{");
+        if (a != std::wstring::npos && z != std::wstring::npos && z > a + 9) r = full.substr(a + 9, z - a - 9);
+        pWDS(hs);
+    }
+    return r;
+}
+static bool AppOutputSet(const AppGroup& a, const std::wstring& endpointId) {   // empty id = follow the main output again
+    if (!AppRouteReady() || a.pids.empty()) return false;
+    void* hs = nullptr;
+    if (!endpointId.empty()) {
+        std::wstring full = L"\\\\?\\SWD#MMDEVAPI#" + endpointId + L"#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+        if (FAILED(pWCS(full.c_str(), (UINT32)full.size(), &hs))) return false;
+    }
+    bool ok = true;
+    for (DWORD pid : a.pids)
+        for (ERole role : {eConsole, eMultimedia})
+            if (FAILED(((PFN_SetPersisted)ApcfVtbl()[25])(g_apcf, pid, eRender, role, hs))) ok = false;
+    if (hs) pWDS(hs);
+    return ok;
+}
+static void AppOutputResetAll() { if (AppRouteReady()) ((PFN_ClearAll)ApcfVtbl()[27])(g_apcf); }
 static void LoadApps() {
     FreeApps();
     if (!g_enum) return;
@@ -687,6 +764,8 @@ static void LoadApps() {
                                     it = idx.find(key);
                                 }
                                 g_apps[it->second].vols.push_back(sv);
+                                if (!sys && std::find(g_apps[it->second].pids.begin(), g_apps[it->second].pids.end(), pid) == g_apps[it->second].pids.end())
+                                    g_apps[it->second].pids.push_back(pid);
                                 Meter* mi = nullptr;
                                 if (SUCCEEDED(sc->QueryInterface(IID_Meter, (void**)&mi)) && mi)
                                     g_apps[it->second].meters.push_back(mi);
@@ -708,6 +787,7 @@ static void LoadApps() {
         if (a.system != b.system) return b.system;
         return lstrcmpiW(a.name.c_str(), b.name.c_str()) < 0;
     });
+    for (auto& a : g_apps) if (!a.system && !a.pids.empty()) a.outId = AppOutputGet(a.pids[0]);   // where each app is sent
 }
 
 static bool AppPlaying(const AppGroup& a) {
@@ -1037,7 +1117,33 @@ struct Mon {
     std::wstring name, detail, gdi; HANDLE phys = nullptr; bool wmi = false, internal = false, ok = false, hasCon = false;
     DWORD mn = 0, mx = 100, cur = 50, cmn = 0, cmx = 100, ccur = 50; int orient = 0; RECT rc{};
     bool vcpB = false, vcpC = false;   // fall back to raw VCP codes 0x10 / 0x12 when the high-level API fails
+    std::vector<int> inputs; int input = -1;   // VCP 0x60 input sources the monitor lists
 };
+static std::map<std::wstring, std::vector<int>> w_inputCache;   // capability strings are slow: ask each monitor once
+static std::vector<int> ReadInputs(HANDLE phys) {
+    std::vector<int> v;
+    DWORD len = 0;
+    if (!GetCapabilitiesStringLength(phys, &len) || !len || len > 16384) return v;
+    std::vector<char> buf(len + 1);
+    if (!CapabilitiesRequestAndCapabilitiesReply(phys, buf.data(), len)) return v;
+    std::string caps(buf.data());
+    for (auto& c : caps) c = (char)toupper((unsigned char)c);
+    size_t vcp = caps.find("VCP(");
+    size_t p = caps.find("60(", vcp == std::string::npos ? 0 : vcp);
+    while (p != std::string::npos && p > 0 && isxdigit((unsigned char)caps[p - 1])) p = caps.find("60(", p + 1);   // a real code, not part of 160(
+    if (p == std::string::npos) return v;
+    size_t e = caps.find(')', p);
+    std::string list = caps.substr(p + 3, e == std::string::npos ? std::string::npos : e - p - 3);
+    size_t i = 0;
+    while (i < list.size()) {
+        while (i < list.size() && !isxdigit((unsigned char)list[i])) i++;
+        size_t j = i;
+        while (j < list.size() && isxdigit((unsigned char)list[j])) j++;
+        if (j > i) v.push_back((int)strtol(list.substr(i, j - i).c_str(), nullptr, 16) & 0xFF);
+        i = j;
+    }
+    return v;
+}
 static std::vector<Mon> w_mons;
 static CRITICAL_SECTION g_bcs;
 static HANDLE g_bEvent;
@@ -1177,6 +1283,13 @@ static void WorkerEnum() {
                         DWORD cur = 0, mx = 0;
                         if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x10, nullptr, &cur, &mx) && mx > 0) { m.mn = 0; m.cur = cur; m.mx = mx; m.ok = true; m.vcpB = true; }
                     }
+                    {   // input sources (HDMI / DisplayPort / USB-C), asked once per monitor
+                        auto ic = w_inputCache.find(m.name + m.gdi);
+                        if (ic == w_inputCache.end()) ic = w_inputCache.emplace(m.name + m.gdi, ReadInputs(m.phys)).first;
+                        m.inputs = ic->second;
+                        if (m.inputs.size() >= 2) { DWORD cur = 0, mx = 0; if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x60, nullptr, &cur, &mx)) m.input = (int)(cur & 0xFF); }
+                        else m.inputs.clear();
+                    }
                     {
                         DWORD ca = 0, cb = 0, ccx = 0;
                         if (GetMonitorContrast(m.phys, &ca, &cb, &ccx) && ccx > ca) { m.cmn = ca; m.ccur = cb; m.cmx = ccx; m.hasCon = true; }
@@ -1226,6 +1339,19 @@ static void WorkerPost(bool fromEnum) {
         MonUI u; u.name = m.name; u.detail = m.detail; u.gdi = m.gdi; u.ok = m.ok; u.internal = m.internal;
         u.hasCon = m.hasCon; u.orient = m.orient; u.rc = m.rc;
         u.pct = Pct(m.mn, m.mx, m.cur); u.con = Pct(m.cmn, m.cmx, m.ccur);
+        u.inputs = m.inputs; u.input = m.input;
+        {   // refresh rates offered at the current resolution
+            DEVMODEW cur = {}; cur.dmSize = sizeof(cur);
+            if (EnumDisplaySettingsW(m.gdi.c_str(), ENUM_CURRENT_SETTINGS, &cur)) {
+                u.rate = (int)cur.dmDisplayFrequency;
+                std::set<int> rs;
+                DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+                for (DWORD i = 0; EnumDisplaySettingsW(m.gdi.c_str(), i, &dm); i++)
+                    if (dm.dmPelsWidth == cur.dmPelsWidth && dm.dmPelsHeight == cur.dmPelsHeight && dm.dmBitsPerPel == cur.dmBitsPerPel && dm.dmDisplayFrequency > 1)
+                        rs.insert((int)dm.dmDisplayFrequency);
+                u.rates.assign(rs.begin(), rs.end());
+            }
+        }
         msg->mons.push_back(u);
     }
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_MONITORS, 0, (LPARAM)msg)) delete msg;
@@ -1244,9 +1370,10 @@ static DWORD WINAPI BrightProc(LPVOID) {
         if (en) { WorkerEnum(); w_gen++; WorkerPost(true); }
         if (setGen == w_gen) {
             for (auto& kv : sets) {
-                int idx = kv.first / 2, type = kv.first % 2;
+                int idx = kv.first / 4, type = kv.first % 4;
                 if (idx < 0 || idx >= (int)w_mons.size()) continue;
                 auto& m = w_mons[idx];
+                if (type == 2) { if (m.phys && SetVCPFeature(m.phys, 0x60, (DWORD)kv.second)) m.input = kv.second; continue; }   // switch input
                 if (!m.ok) continue;
                 int pct = std::max(0, std::min(100, kv.second));
                 if (type == 0) {
@@ -1283,12 +1410,40 @@ static void MonSet(int idx, int type, int pct) {
         lm.second = type == 1 ? pct : (m.hasCon ? m.con : -1);
     }
     EnterCriticalSection(&g_bcs);
-    g_bSets[idx * 2 + type] = pct;
+    g_bSets[idx * 4 + type] = pct;
     g_bSetGen = g_monGen;
     LeaveCriticalSection(&g_bcs);
     SetEvent(g_bEvent);
 }
 
+static void SetMonitorInput(int idx, int code) {
+    if (idx < 0 || idx >= (int)g_mons.size()) return;
+    g_mons[idx].input = code;
+    EnterCriticalSection(&g_bcs);
+    g_bSets[idx * 4 + 2] = code;
+    g_bSetGen = g_monGen;
+    LeaveCriticalSection(&g_bcs);
+    SetEvent(g_bEvent);
+}
+static void SetRefreshRate(int idx, int hz) {
+    if (idx < 0 || idx >= (int)g_mons.size()) return;
+    DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(g_mons[idx].gdi.c_str(), ENUM_CURRENT_SETTINGS, &dm)) return;
+    dm.dmDisplayFrequency = (DWORD)hz;
+    dm.dmFields = DM_DISPLAYFREQUENCY | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
+    if (ChangeDisplaySettingsExW(g_mons[idx].gdi.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr) == DISP_CHANGE_SUCCESSFUL)
+        g_mons[idx].rate = hz;
+}
+static std::wstring InputName(int code, const std::vector<int>& all) {
+    auto has = [&](int c) { return std::find(all.begin(), all.end(), c) != all.end(); };
+    switch (code) {
+    case 0x01: return L"VGA"; case 0x02: return L"VGA 2"; case 0x03: return L"DVI"; case 0x04: return L"DVI 2";
+    case 0x0F: return has(0x10) ? L"DisplayPort 1" : L"DisplayPort"; case 0x10: return L"DisplayPort 2";
+    case 0x11: return has(0x12) ? L"HDMI 1" : L"HDMI"; case 0x12: return L"HDMI 2"; case 0x13: return L"HDMI 3";
+    case 0x1B: case 0x19: return L"USB-C";
+    default: { wchar_t b[24]; swprintf(b, 24, L"Input %02X", code); return b; }
+    }
+}
 static void SetOrientation(int idx, int orient) {
     if (idx < 0 || idx >= (int)g_mons.size()) return;
     DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
@@ -1410,9 +1565,9 @@ enum : wchar_t {
 };
 
 // ---------------------------------------------------------------- layout model
-enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW };
+enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
@@ -1422,7 +1577,8 @@ static float g_contentH = 0;
 static Hit g_hover;
 static int g_dragEl = -1;
 static int g_hoverSlider = -1; static DWORD g_hoverSince = 0, g_lastScroll = 0;
-static int g_ddOpen = -1;          // display index whose orientation list is open
+static int g_ddOpen = -1;          // display index whose list is open (0 for the profile list)
+static int g_ddKind = 0;           // which list: 0 orientation, 1 refresh rate, 2 input, 3 profiles
 static bool g_menuOpen = false;    // settings menu (gear)
 static DWORD g_spinUntil = 0;      // refresh icon animation
 static bool g_saveOpen = false;    // "save profile as" list
@@ -1433,7 +1589,7 @@ static float PaneBottom() { return g_H - S(FTR); }
 static float PaneX() { return S(12); }
 static float PaneW() { return g_W - S(24); }
 
-static float ProfileRowHeight(float w);
+[[maybe_unused]] static float ProfileRowHeight(float w);
 static void Layout() {
     g_els.clear();
     float x = PaneX(), w = PaneW();
@@ -1460,8 +1616,8 @@ static void Layout() {
         for (int i = 0; i < (int)g_apps.size(); i++) row(E_APP, i);
         if (g_apps.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y, w, S(24)), L"No apps are using sound right now"}); y += S(30); }
     } else {
-        h3(L"PROFILES");
-        { float ph = ProfileRowHeight(w); g_els.push_back({E_PROFILES, 0, RectF(x, y, w, ph), L""}); y += ph; }
+        y += S(10);
+        g_els.push_back({E_DTOP, 0, RectF(x, y, w, S(40)), L""}); y += S(40);   // profile list + turn off displays
         h3(L"DISPLAYS");
         if (g_mons.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y + S(6), w, S(24)), g_monsLoaded ? L"No displays found" : L"Looking for displays…"}); y += S(36); }
         for (int i = 0; i < (int)g_mons.size(); i++) {
@@ -1502,6 +1658,10 @@ static RectF RefreshRect() { RectF i = IdentRect(); return RectF(i.X - S(10) - S
 static RectF MicAllRect() { RectF r = RefreshRect(); return RectF(r.X - S(10) - S(32), r.Y, S(32), S(32)); }
 static int g_delayOpen = -1;     // output whose sync-delay popup is open
 static bool g_dragDelay = false;
+static RectF AppOutChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(132), e.r.Y + S(9), S(132), S(24)); }
+static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return true; return false; }
+static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
+static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return o.name; return L"Default output"; }
 static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(84), e.r.Y + S(9), S(84), S(24)); }
 static bool DelayAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_OUT && e.idx == g_delayOpen) { chip = DelayChip(e); return true; } return false; }
 static RectF DelayPopup(const RectF& chip) {
@@ -1555,18 +1715,59 @@ static RectF StepBox(const El& e) { float bw = S(50); return RectF(e.r.X + e.r.W
 static RectF StepBtn(const El& e, int i) { RectF box = StepBox(e); float bw = S(50); return RectF(box.X + S(3) + i * (bw + S(1)), box.Y + S(3), bw, S(26)); }
 static RectF ResetBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(150), e.r.Y + e.r.Height / 2 - S(15), S(150), S(30)); }
 
-// ---- orientation list (in-panel popup, styled like the panel)
+// ---- Display tab controls and their lists (in-panel popups, styled like the panel)
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
+static RectF DTopOff(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(146), e.r.Y + S(4), S(146), S(32)); }
+static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(6), e.r.Y + S(4), o.X - S(8) - e.r.X - S(6), S(32)); }
+static RectF InputBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(124), e.r.Y + e.r.Height / 2 - S(13), S(124), S(26)); }
+static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
+static RectF RateBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); float w = S(96); return RectF(sl.X + sl.Width - w, sl.Y, w, sl.Height); }
+static RectF OrientBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); if (HasRates(e.idx)) sl.Width -= S(96) + S(8); return sl; }
+static bool ProfileActive(int p);
+static void ApplyProfile(int p);
+static std::vector<int> g_ddProfMap;   // list row -> profile index (-1 new, -2 manage)
+static std::vector<std::wstring> DropdownOptions(int& cur) {
+    std::vector<std::wstring> o; cur = -1;
+    if (g_ddKind == 3) {
+        g_ddProfMap.clear();
+        for (int i = 0; i < (int)g_prof.size(); i++) if (!g_prof[i].v.empty()) { o.push_back(g_prof[i].name); g_ddProfMap.push_back(i); if (ProfileActive(i)) cur = (int)o.size() - 1; }
+        o.push_back(L"+ Save current as new profile"); g_ddProfMap.push_back(-1);
+        o.push_back(L"Manage profiles\u2026"); g_ddProfMap.push_back(-2);
+        return o;
+    }
+    if (g_ddKind == 4) {   // where an app plays
+        if (g_ddOpen < 0 || g_ddOpen >= (int)g_apps.size()) return o;
+        o.push_back(L"Default output"); cur = 0;
+        for (size_t i = 0; i < g_out.size(); i++) { o.push_back(g_out[i].name); if (g_out[i].id == g_apps[g_ddOpen].outId) cur = (int)i + 1; }
+        return o;
+    }
+    if (g_ddOpen < 0 || g_ddOpen >= (int)g_mons.size()) return o;
+    MonUI& m = g_mons[g_ddOpen];
+    if (g_ddKind == 0) { for (int i = 0; i < 4; i++) o.push_back(ORIENT_NAMES[i]); cur = m.orient; }
+    else if (g_ddKind == 1) { for (size_t i = 0; i < m.rates.size(); i++) { o.push_back(std::to_wstring(m.rates[i]) + L" Hz"); if (m.rates[i] == m.rate) cur = (int)i; } }
+    else if (g_ddKind == 2) { for (size_t i = 0; i < m.inputs.size(); i++) { o.push_back(InputName(m.inputs[i], m.inputs)); if (m.inputs[i] == m.input) cur = (int)i; } }
+    return o;
+}
 static bool DropdownRect(RectF& btn) {
     if (g_ddOpen < 0) return false;
-    for (auto& e : g_els) if (e.k == E_MONO && e.idx == g_ddOpen) { btn = CtlSlider(e, SliderCy(e)); return true; }
+    for (auto& e : g_els) {
+        if (g_ddKind == 3 && e.k == E_DTOP) { btn = DTopProfile(e); return true; }
+        if (g_ddKind == 4) { if (e.k == E_APP && e.idx == g_ddOpen) { btn = AppOutChip(e); return true; } continue; }
+        if (e.idx != g_ddOpen) continue;
+        if (g_ddKind == 0 && e.k == E_MONO) { btn = OrientBtn(e); return true; }
+        if (g_ddKind == 1 && e.k == E_MONO) { btn = RateBtn(e); return true; }
+        if (g_ddKind == 2 && e.k == E_MONHEAD) { btn = InputBtn(e); return true; }
+    }
     return false;
 }
 static RectF DropdownPopup(const RectF& btn) {
-    float h = S(4) * 2 + S(32) * 4 + S(2) * 3;
+    int cur; int n = (int)DropdownOptions(cur).size();
+    float h = S(4) * 2 + S(32) * n + S(2) * std::max(0, n - 1);
+    float w = std::max(btn.Width, g_ddKind == 3 ? S(240) : g_ddKind == 4 ? S(220) : S(150));
+    float x = g_ddKind == 3 ? btn.X : btn.X + btn.Width - w;   // small buttons open towards the left
     float y = btn.Y + btn.Height + S(4);
     if (y + h > PaneBottom() - S(4)) y = btn.Y - S(4) - h;
-    return RectF(btn.X, y, btn.Width, h);
+    return RectF(x, y, w, h);
 }
 static RectF DropdownOption(const RectF& pop, int i) { return RectF(pop.X + S(4), pop.Y + S(4) + i * (S(32) + S(2)), pop.Width - S(8), S(32)); }
 
@@ -1642,7 +1843,8 @@ static Hit HitTest(float x, float y) {
     if (DropdownRect(btn)) {
         RectF pop = DropdownPopup(btn);
         if (InRect(pop, x, y)) {
-            for (int i = 0; i < 4; i++) if (InRect(DropdownOption(pop, i), x, y)) { h.h = H_DDOPT; h.idx = i; return h; }
+            int cur; int n = (int)DropdownOptions(cur).size();
+            for (int i = 0; i < n; i++) if (InRect(DropdownOption(pop, i), x, y)) { h.h = H_DDOPT; h.idx = i; return h; }
             h.h = H_MENUBG; return h;
         }
     }
@@ -1656,12 +1858,14 @@ static Hit HitTest(float x, float y) {
     if (y < PaneTop() || y >= PaneBottom()) return h;
     for (int i = 0; i < (int)g_els.size(); i++) {
         El& e = g_els[i];
+        if (e.k == E_H3 && e.text == L"APPS" && AnyAppRouted() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
             float cy2 = RowCy2(e);
             RectF sl = CtlSlider(e, cy2); sl.X -= S(10); sl.Width += S(20);
             if (e.k == E_OUT && HasDelayChip(e.idx) && InRect(DelayChip(e), x, y)) h.h = H_DELAYCHIP;
+            else if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady() && InRect(AppOutChip(e), x, y)) h.h = H_APPOUT;
             else if (InRect(CtlMute(e, cy2), x, y)) h.h = H_MUTE;
             else if (InRect(RectF(sl.X, cy2 - S(18), sl.Width, S(36)), x, y)) h.h = H_SLIDER;
             else h.h = (e.k == E_OUT || e.k == E_IN) ? H_ROW : H_NONE;
@@ -1669,7 +1873,13 @@ static Hit HitTest(float x, float y) {
             RectF sl = CtlSlider(e, SliderCy(e)); sl.X -= S(10); sl.Width += S(20);
             if (InRect(sl, x, y) && g_mons[e.idx].ok) h.h = H_SLIDER;
         } else if (e.k == E_MONO) {
-            if (InRect(CtlSlider(e, SliderCy(e)), x, y)) h.h = H_DROPDOWN;
+            if (InRect(OrientBtn(e), x, y)) h.h = H_DROPDOWN;
+            else if (HasRates(e.idx) && InRect(RateBtn(e), x, y)) h.h = H_RATEDD;
+        } else if (e.k == E_MONHEAD) {
+            if (!g_mons[e.idx].inputs.empty() && InRect(InputBtn(e), x, y)) h.h = H_INPUTDD;
+        } else if (e.k == E_DTOP) {
+            if (InRect(DTopProfile(e), x, y)) h.h = H_PROFDD;
+            else if (InRect(DTopOff(e), x, y)) h.h = H_SCREENOFF;
         } else if (e.k == E_PROFILES) {
             for (int c = 0; c < ChipCount(); c++) if (InRect(ProfileChip(e, c), x, y)) { h.h = H_PROFILE; h.idx = c; }
         } else if (e.k == E_HK) {
@@ -2067,6 +2277,10 @@ static void DrawEl(Graphics& g, int index) {
     bool hovEl = g_hover.el == index;
     if (e.k == E_H3) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
+        if (e.text == L"APPS" && AnyAppRouted()) {   // put every app back on the main output
+            RectF r = ResetOutRect(e);
+            Text(g, L"Reset outputs", g_fSmall600, g_hover.h == H_RESETOUT ? T.t1 : T.accent, RectF(r.X, r.Y, r.Width - S(6), r.Height), StringAlignmentFar);
+        }
         if (e.text == L"OUTPUT") {   // status only; the switch lives in Settings > Sound
             RectF m = MultiRect(e);
             const wchar_t* st = g_multi ? L"Play together \u00B7 On" : L"Play together \u00B7 Off";
@@ -2120,6 +2334,16 @@ static void DrawEl(Graphics& g, int index) {
             else Glyph(g, lg, g_fIconS, sel ? T.onAccent : T.t1, lx, cy1);
         }
         float nx = e.r.X + S(8) + S(28) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
+        if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady()) {   // where this app plays
+            RectF c = AppOutChip(e);
+            maxW = c.X - S(8) - nx;
+            bool hov = hovEl && g_hover.h == H_APPOUT, open = g_ddOpen == e.idx && g_ddKind == 4;
+            bool routed = !g_apps[e.idx].outId.empty();
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, S(12));
+            Glyph(g, G_VOLUME, g_fIconS, routed ? T.accent : T.t2, c.X + S(13), c.Y + c.Height / 2);
+            std::wstring on = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
+            Text(g, on.c_str(), g_fSmall, routed ? T.t1 : T.t2, RectF(c.X + S(24), c.Y, c.Width - S(30), c.Height));
+        }
         if (e.k == E_OUT && HasDelayChip(e.idx)) {
             RectF c = DelayChip(e);
             maxW = c.X - S(8) - nx;
@@ -2206,6 +2430,22 @@ static void DrawEl(Graphics& g, int index) {
         }
         return;
     }
+    if (e.k == E_DTOP) {
+        RectF pb = DTopProfile(e), ob = DTopOff(e);
+        bool open = g_ddOpen >= 0 && g_ddKind == 3;
+        FillRound(g, open || (hovEl && g_hover.h == H_PROFDD) ? T.ddBtnHover : T.ddBtn, pb, S(T.glass ? 9 : 6));
+        int act = -1; for (int i = 0; i < (int)g_prof.size(); i++) if (ProfileActive(i)) { act = i; break; }
+        Glyph(g, 0xE74E, g_fIconS, T.t2, pb.X + S(18), pb.Y + pb.Height / 2);
+        Text(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(34), pb.Y, pb.Width - S(60), pb.Height));
+        float gx = pb.X + pb.Width - S(18), gy = pb.Y + pb.Height / 2;
+        if (open) { g.TranslateTransform(gx, gy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
+        else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, gy);
+        FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.ddBtnHover : T.ddBtn, ob, S(T.glass ? 9 : 6));
+        float tw = TextW(g, L"Turn off displays", g_fSmall), sx = ob.X + (ob.Width - (S(14) + S(6) + tw)) / 2;
+        Glyph(g, 0xE7E8, g_fIconS, T.t1, sx + S(7), ob.Y + ob.Height / 2);   // power
+        Text(g, L"Turn off displays", g_fSmall, T.t1, RectF(sx + S(20), ob.Y, tw + S(4), ob.Height));
+        return;
+    }
     MonUI& m = g_mons[e.idx];
     float cy = e.r.Y + e.r.Height / 2, lx = e.r.X + S(8) + S(14);
     if (e.k == E_MONHEAD) {
@@ -2215,6 +2455,16 @@ static void DrawEl(Graphics& g, int index) {
         wchar_t num[4]; swprintf(num, 4, L"%d", e.idx + 1);
         Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter);
         float nx = e.r.X + S(8) + S(28) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
+        if (!m.inputs.empty()) {   // input switch, aligned right on the name row
+            RectF ib = InputBtn(e);
+            maxW = ib.X - S(8) - nx;
+            bool open = g_ddOpen == e.idx && g_ddKind == 2;
+            FillRound(g, open || (hovEl && g_hover.h == H_INPUTDD) ? T.ddBtnHover : T.ddBtn, ib, S(T.glass ? 8 : 5));
+            Glyph(g, G_TV, g_fIconS, T.t2, ib.X + S(14), ib.Y + ib.Height / 2);
+            std::wstring in = m.input >= 0 ? InputName(m.input, m.inputs) : L"Input";
+            Text(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(26), ib.Y, ib.Width - S(46), ib.Height));
+            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, ib.X + ib.Width - S(12), ib.Y + ib.Height / 2);
+        }
         float nw = std::min(TextW(g, m.name.c_str(), g_fName), maxW * 0.7f);
         Text(g, m.name.c_str(), g_fName, T.t1, RectF(nx, cy - S(10), nw + S(2), S(20)));
         if (!m.detail.empty()) Text(g, m.detail.c_str(), g_fSmall, T.t3, RectF(nx + nw + S(8), cy - S(9), std::max(0.f, maxW - nw - S(8)), S(18)));
@@ -2223,14 +2473,17 @@ static void DrawEl(Graphics& g, int index) {
     wchar_t lead = e.k == E_MONB ? G_BRIGHT : e.k == E_MONC ? G_CONTRAST : G_ROTATE;
     Glyph(g, lead, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
     RectF sl = CtlSlider(e, cy);
-    if (e.k == E_MONO) {
-        bool hov = hovEl && g_hover.h == H_DROPDOWN;
-        FillRound(g, hov || g_ddOpen == e.idx ? T.ddBtnHover : T.ddBtn, sl, S(T.glass ? 9 : 6));
+    if (e.k == E_MONO) {   // orientation and refresh rate, side by side
+        auto ddBtn = [&](RectF b, const wchar_t* label, bool open, bool hov) {
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, b, S(T.glass ? 9 : 6));
+            Text(g, label, g_fName, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
+            float gx = b.X + b.Width - S(18);
+            if (open) { g.TranslateTransform(gx, cy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
+            else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, cy);
+        };
         int o = std::max(0, std::min(3, m.orient));
-        Text(g, ORIENT_NAMES[o], g_fName, T.t1, RectF(sl.X + S(12), sl.Y, sl.Width - S(40), sl.Height));
-        float gx = sl.X + sl.Width - S(18);
-        if (g_ddOpen == e.idx) { g.TranslateTransform(gx, cy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
-        else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, cy);
+        ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN);
+        if (HasRates(e.idx)) { std::wstring r = std::to_wstring(m.rate) + L" Hz"; ddBtn(RateBtn(e), r.c_str(), g_ddOpen == e.idx && g_ddKind == 1, hovEl && g_hover.h == H_RATEDD); }
         return;
     }
     if (!m.ok) { Text(g, L"Not available — turn on DDC/CI in the monitor menu", g_fSmall, T.t3, RectF(sl.X - S(8), sl.Y, sl.Width + S(46), sl.Height)); return; }
@@ -2247,15 +2500,16 @@ static void DrawDropdown(Graphics& g) {
     float rad = S(T.glass ? 12 : 8);
     Shadow(g, pop, rad);
     FillRound(g, T.popup, pop, rad);
-    for (int i = 0; i < 4; i++) {
+    int curIdx; auto opts = DropdownOptions(curIdx);
+    for (int i = 0; i < (int)opts.size(); i++) {
         RectF r = DropdownOption(pop, i);
-        bool cur = g_mons[g_ddOpen].orient == i, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
+        bool cur = curIdx == i, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
         if (cur) {
             if (T.glass) FillRound(g, WithAlpha(T.accent, 36), r, S(8));
             else { FillRound(g, T.subtle, r, S(5)); FillRound(g, T.accent, RectF(r.X, r.Y + S(9), S(3), S(14)), S(1.5f)); }
         }
         if (hov) FillRound(g, T.subtle2, r, S(T.glass ? 8 : 5));
-        Text(g, ORIENT_NAMES[i], g_fName, T.t1, RectF(r.X + S(12), r.Y, r.Width - S(16), r.Height));
+        Text(g, opts[i].c_str(), g_fName, T.t1, RectF(r.X + S(12), r.Y, r.Width - S(16), r.Height));
     }
 }
 
@@ -2706,15 +2960,18 @@ static void ToggleOutput(int i) {
 static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
     std::set<std::wstring> now; for (auto& o : g_out) now.insert(o.id);
     if (g_prevOutKnown && g_autoSwitch) {
-        for (auto& o : g_out) if (!g_prevOutIds.count(o.id) && (o.icon == DI_HEADPHONES || o.icon == DI_EARBUDS)) {
-            if (g_multi) g_mirror.insert(o.id);   // Play together: add it to the group
-            else if (!o.isDefault) {
+        const Endpoint* pick = nullptr;   // prefer the music output over a Bluetooth "calls" one
+        for (auto& o : g_out) if (!g_prevOutIds.count(o.id) && (o.icon == DI_HEADPHONES || o.icon == DI_EARBUDS))
+            if (!pick || (pick->detail.find(L"calls") != std::wstring::npos && o.detail.find(L"calls") == std::wstring::npos)) pick = &o;
+        if (pick) {
+            std::wstring id = pick->id; bool isDef = pick->isDefault;
+            if (g_multi) g_mirror.insert(id);   // Play together: add it to the group
+            else if (!isDef) {
                 for (auto& d : g_out) if (d.isDefault) g_autoPrev = d.id;
-                g_autoTarget = o.id;
-                SetDefaultDevice(o.id);
+                g_autoTarget = id;
+                SetDefaultDevice(id);
                 LoadEndpoints(eRender, g_out);
             }
-            break;
         }
         if (!g_autoTarget.empty() && !now.count(g_autoTarget)) {   // they disconnected
             if (!g_multi && now.count(g_autoPrev)) { SetDefaultDevice(g_autoPrev); LoadEndpoints(eRender, g_out); }
@@ -3697,6 +3954,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_IDENT) {
             KillTimer(h, TIMER_IDENT);
             CloseIdentify();
+        } else if (wp == TIMER_SCREENOFF) {
+            KillTimer(h, TIMER_SCREENOFF);
+            PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);   // all displays off; any input wakes them
+            return 0;
         } else if (wp == TIMER_CALRETRY) {
             KillTimer(h, TIMER_CALRETRY);
             InterlockedExchange(&g_calibrating, 0);
@@ -3797,14 +4058,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (ht.h == H_PROFILE && ht.idx == ChipCount() - 1) return 0;
         }
         if (g_ddOpen >= 0 && ht.h != H_DDOPT && ht.h != H_MENUBG) {
-            bool sameBtn = ht.h == H_DROPDOWN && ht.idx == g_ddOpen;
+            int btnKind = ht.h == H_DROPDOWN ? 0 : ht.h == H_RATEDD ? 1 : ht.h == H_INPUTDD ? 2 : ht.h == H_PROFDD ? 3 : ht.h == H_APPOUT ? 4 : -1;
+            bool sameBtn = btnKind == g_ddKind && (btnKind == 3 || ht.idx == g_ddOpen);
             g_ddOpen = -1; InvalidateRect(h, nullptr, FALSE);
-            if (sameBtn || ht.h != H_DROPDOWN) return 0;
+            if (sameBtn || btnKind < 0) return 0;
         }
         switch (ht.h) {
         case H_MENU: MenuCommand(ht.idx); return 0;
         case H_MENUBG: return 0;
-        case H_DDOPT: { int idx = g_ddOpen; g_ddOpen = -1; SetOrientation(idx, ht.idx); InvalidateRect(h, nullptr, FALSE); return 0; }
+        case H_DDOPT: {
+            int idx = g_ddOpen, kind = g_ddKind, k = ht.idx;
+            int cur; auto opts = DropdownOptions(cur);
+            g_ddOpen = -1;
+            if (kind == 0) SetOrientation(idx, k);
+            else if (kind == 1 && idx < (int)g_mons.size() && k < (int)g_mons[idx].rates.size()) SetRefreshRate(idx, g_mons[idx].rates[k]);
+            else if (kind == 2 && idx < (int)g_mons.size() && k < (int)g_mons[idx].inputs.size()) SetMonitorInput(idx, g_mons[idx].inputs[k]);
+            else if (kind == 4 && idx < (int)g_apps.size()) {
+                std::wstring id = k > 0 && k - 1 < (int)g_out.size() ? g_out[k - 1].id : L"";
+                if (AppOutputSet(g_apps[idx], id)) g_apps[idx].outId = id;
+            }
+            else if (kind == 3 && k < (int)g_ddProfMap.size()) {
+                int pi = g_ddProfMap[k];
+                if (pi >= 0) ApplyProfile(pi);
+                else { OpenSettings(2, pi == -1); return 0; }   // new profile / manage, in Settings > Display
+            }
+            InvalidateRect(h, nullptr, FALSE); return 0;
+        }
+        case H_RATEDD: g_ddOpen = ht.idx; g_ddKind = 1; break;
+        case H_APPOUT: g_ddOpen = ht.idx; g_ddKind = 4; break;
+        case H_RESETOUT: AppOutputResetAll(); for (auto& a : g_apps) a.outId.clear(); break;
+        case H_INPUTDD: g_ddOpen = ht.idx; g_ddKind = 2; break;
+        case H_PROFDD: g_ddOpen = 0; g_ddKind = 3; break;
+        case H_SCREENOFF: HideFlyout(); SetTimer(h, TIMER_SCREENOFF, 500, nullptr); return 0;   // after the click settles, or the mouse wakes them
         case H_TAB: SetTab(ht.idx); return 0;
         case H_MICALL: MicToggleMute(); break;
         case H_UPDATE: StartUpdate(); break;
@@ -3838,7 +4123,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case H_IDENT: IdentifyDisplays(); return 0;
         case H_REFRESH: RefreshAll(); return 0;
-        case H_DROPDOWN: g_ddOpen = ht.idx; break;
+        case H_DROPDOWN: g_ddOpen = ht.idx; g_ddKind = 0; break;
         case H_SLIDER:
             g_dragEl = ht.el;
             SetCapture(h);
