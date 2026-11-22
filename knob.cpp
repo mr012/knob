@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.24.0"
-#define APP_VERNUM  ((1 << 16) | (24 << 8) | 0)
+#define APP_VERSION L"1.25.0"
+#define APP_VERNUM  ((1 << 16) | (25 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2772,7 +2772,7 @@ static const float NAVW = 240;
 static bool g_setGlass = false;   // Settings window uses the Glass style too
 static void ApplySettingsStyle() {
     if (!g_set) return;
-    g_setGlass = g_style == 1 && TransparencyOn();
+    g_setGlass = false;   // Settings always uses the solid look; Glass is for the panel only
     BOOL dark = g_setTheme.dark; DwmSetWindowAttribute(g_set, 20, &dark, sizeof(dark));
     int backdrop = g_setGlass ? 3 : 1;   // acrylic behind the whole window (title bar included), or none
     DwmSetWindowAttribute(g_set, 38, &backdrop, sizeof(backdrop));
