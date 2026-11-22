@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.31.0"
-#define APP_VERNUM  ((1 << 16) | (31 << 8) | 0)
+#define APP_VERSION L"1.32.0"
+#define APP_VERNUM  ((1 << 16) | (32 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -562,8 +562,9 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
     else conn = IsCodecName(ifc) ? L"" : conn;   // unknown: no label rather than a wrong one
     // names stay exactly as Windows shows them ("Speakers" + "Realtek(R) Audio"); only the icon comes from the checks above
     (void)name; (void)conn;
-    e.name = nm;
-    e.detail = ifc;
+    // the device's own name first ("realme Brick Speaker"), Windows' type name ("Speakers") second
+    if (!ifc.empty() && Lower(ifc) != Lower(nm)) { e.name = ifc; e.detail = nm; }
+    else { e.name = nm; e.detail = L""; }
 }
 static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     FreeEndpoints(v);
@@ -1104,7 +1105,7 @@ static void StartAutoSync() {
     auto* ts = new std::vector<CalTarget>;
     for (auto& t : g_router->targets) {
         std::wstring name = t.id;
-        for (auto& e : g_out) if (e.id == t.id) name = e.name + (e.detail.empty() ? L"" : L" (" + e.detail + L")");
+        for (auto& e : g_out) if (e.id == t.id) name = e.name;
         ts->push_back({t.id, name, t.delayMs});
     }
     InterlockedExchange(&g_calibrating, 1);
@@ -1644,8 +1645,8 @@ static void ClampScroll() {
 static float RowCy1(const El& e) { return e.r.Y + S(21); }
 static float RowCy2(const El& e) { return e.r.Y + S(54); }
 static RectF CtlMute(const El& e, float cy) { return RectF(e.r.X + S(6), cy - S(16), S(32), S(32)); }
-static RectF CtlSlider(const El& e, float cy) { float l = e.r.X + S(48), r = e.r.X + e.r.Width - S(6) - S(36) - S(10); return RectF(l, cy - S(16), r - l, S(32)); }
-static RectF CtlVal(const El& e, float cy) { return RectF(e.r.X + e.r.Width - S(6) - S(36), cy - S(10), S(36), S(20)); }
+static RectF CtlSlider(const El& e, float cy) { float l = e.r.X + S(48), r = e.r.X + e.r.Width - S(6) - S(40) - S(10); return RectF(l, cy - S(16), r - l, S(32)); }
+static RectF CtlVal(const El& e, float cy) { return RectF(e.r.X + e.r.Width - S(6) - S(40), cy - S(10), S(40), S(20)); }
 static bool IsRowKind(ElKind k) { return k == E_OUT || k == E_IN || k == E_MASTER || k == E_APP; }
 static float SliderCy(const El& e) { return IsRowKind(e.k) ? RowCy2(e) : e.r.Y + e.r.Height / 2; }
 
@@ -1659,11 +1660,11 @@ static RectF RefreshRect() { RectF i = IdentRect(); return RectF(i.X - S(10) - S
 static RectF MicAllRect() { RectF r = RefreshRect(); return RectF(r.X - S(10) - S(32), r.Y, S(32), S(32)); }
 static int g_delayOpen = -1;     // output whose sync-delay popup is open
 static bool g_dragDelay = false;
-static RectF AppOutChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(132), e.r.Y + S(9), S(132), S(24)); }
+static RectF AppOutChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(156), e.r.Y + S(8), S(156), S(26)); }
 static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return true; return false; }
 static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
 static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return o.name; return L"Default output"; }
-static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(84), e.r.Y + S(9), S(84), S(24)); }
+static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(104), e.r.Y + S(8), S(104), S(26)); }
 static bool DelayAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_OUT && e.idx == g_delayOpen) { chip = DelayChip(e); return true; } return false; }
 static RectF DelayPopup(const RectF& chip) {
     float w = S(250), h = S(96);
@@ -1720,7 +1721,7 @@ static RectF ResetBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(1
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
 static RectF DTopOff(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(146), e.r.Y + S(4), S(146), S(32)); }
 static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(6), e.r.Y + S(4), o.X - S(8) - e.r.X - S(6), S(32)); }
-static RectF InputBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(124), e.r.Y + e.r.Height / 2 - S(13), S(124), S(26)); }
+static RectF InputBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(140), e.r.Y + e.r.Height / 2 - S(14), S(140), S(28)); }
 static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
 static RectF RateBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); float w = S(96); return RectF(sl.X + sl.Width - w, sl.Y, w, sl.Height); }
 static RectF OrientBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); if (HasRates(e.idx)) sl.Width -= S(96) + S(8); return sl; }
@@ -2349,19 +2350,19 @@ static void DrawEl(Graphics& g, int index) {
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_APPOUT, open = g_ddOpen == e.idx && g_ddKind == 4;
             bool routed = !g_apps[e.idx].outId.empty();
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, S(12));
-            Glyph(g, G_VOLUME, g_fIconS, routed ? T.accent : T.t2, c.X + S(13), c.Y + c.Height / 2);
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
+            Glyph(g, G_VOLUME, g_fIconS, routed ? T.accent : T.t2, c.X + S(17), c.Y + c.Height / 2);
             std::wstring on = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
-            Text(g, on.c_str(), g_fSmall, routed ? T.t1 : T.t2, RectF(c.X + S(24), c.Y, c.Width - S(30), c.Height));
+            Text(g, on.c_str(), g_fSmall, routed ? T.t1 : T.t2, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(14), c.Height));
         }
         if (e.k == E_OUT && HasDelayChip(e.idx)) {
             RectF c = DelayChip(e);
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_DELAYCHIP, open = g_delayOpen == e.idx;
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, S(12));
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
             wchar_t t[32]; swprintf(t, 32, L"Sync %d ms", DelayOf(e.idx));
-            Glyph(g, 0xE916, g_fIconS, T.t1, c.X + S(14), c.Y + c.Height / 2);   // stopwatch
-            Text(g, t, g_fSmall, T.t1, RectF(c.X + S(24), c.Y, c.Width - S(28), c.Height));
+            Glyph(g, 0xE916, g_fIconS, T.t1, c.X + S(17), c.Y + c.Height / 2);   // stopwatch
+            Text(g, t, g_fSmall, T.t1, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(12), c.Height));
         }
         Font* nf = e.k == E_MASTER ? g_fName600 : g_fName;
         float nw = std::min(TextW(g, name.c_str(), nf), maxW * 0.7f);
@@ -2470,10 +2471,10 @@ static void DrawEl(Graphics& g, int index) {
             maxW = ib.X - S(8) - nx;
             bool open = g_ddOpen == e.idx && g_ddKind == 2;
             FillRound(g, open || (hovEl && g_hover.h == H_INPUTDD) ? T.ddBtnHover : T.ddBtn, ib, S(T.glass ? 8 : 5));
-            Glyph(g, G_TV, g_fIconS, T.t2, ib.X + S(14), ib.Y + ib.Height / 2);
+            Glyph(g, G_TV, g_fIconS, T.t2, ib.X + S(17), ib.Y + ib.Height / 2);
             std::wstring in = m.input >= 0 ? InputName(m.input, m.inputs) : L"Input";
-            Text(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(26), ib.Y, ib.Width - S(46), ib.Height));
-            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, ib.X + ib.Width - S(12), ib.Y + ib.Height / 2);
+            Text(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(32), ib.Y, ib.Width - S(32) - S(34), ib.Height));
+            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, ib.X + ib.Width - S(18), ib.Y + ib.Height / 2);
         }
         float nw = std::min(TextW(g, m.name.c_str(), g_fName), maxW * 0.7f);
         Text(g, m.name.c_str(), g_fName, T.t1, RectF(nx, cy - S(10), nw + S(2), S(20)));
