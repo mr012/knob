@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.29.0"
-#define APP_VERNUM  ((1 << 16) | (29 << 8) | 0)
+#define APP_VERSION L"1.30.0"
+#define APP_VERNUM  ((1 << 16) | (30 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1552,8 +1552,8 @@ static void InitFonts() {
     g_fH3 = new Font(g_famSemi, S(10.5f), FontStyleRegular, UnitPixel);
     g_fTab = new Font(g_famText, S(13), FontStyleRegular, UnitPixel);
     g_fTab600 = new Font(g_famSemi, S(13), FontStyleRegular, UnitPixel);
-    g_fIcon = new Font(g_famIcon, S(16), FontStyleRegular, UnitPixel);
-    g_fIconS = new Font(g_famIcon, S(14), FontStyleRegular, UnitPixel);
+    g_fIcon = new Font(g_famIcon, S(18), FontStyleRegular, UnitPixel);
+    g_fIconS = new Font(g_famIcon, S(16), FontStyleRegular, UnitPixel);
     g_fNum = new Font(g_famSemi, S(10), FontStyleRegular, UnitPixel);
 }
 
@@ -2245,7 +2245,7 @@ static void DrawSwitch(Graphics& g, float x, float cy, bool on, float k = 1.f) {
 }
 
 static void DrawDevIcon(Graphics& g, int icon, float cx, float cy, Color c) {   // 20-unit line icons, same family as the UI
-    float k = S(16) / 20.f, ox = cx - 10 * k, oy = cy - 10 * k;
+    float k = S(18) / 20.f, ox = cx - 10 * k, oy = cy - 10 * k;
     Pen p(c, std::max(1.f, 1.45f * k)); p.SetStartCap(LineCapRound); p.SetEndCap(LineCapRound); p.SetLineJoin(LineJoinRound);
     SolidBrush b(c);
     auto X = [&](float x) { return ox + x * k; }; auto Y = [&](float y) { return oy + y * k; };
@@ -2311,30 +2311,39 @@ static void DrawEl(Graphics& g, int index) {
         } else if (playing) FillRound(g, WithAlpha(T.accent, T.glass ? 14 : 11), e.r, S(10));
         else if (pickable && rowHover) FillRound(g, T.hover, e.r, S(10));
 
-        float cy1 = RowCy1(e), cy2 = RowCy2(e), lx = e.r.X + S(8) + S(14);
+        float cy1 = RowCy1(e), cy2 = RowCy2(e), lx = e.r.X + S(8) + S(16);
         std::wstring name, detail; wchar_t muteG = G_VOLUME;
         bool muted = ElMuted(e);
         if (e.k == E_APP) {
             AppGroup& a = g_apps[e.idx];
             name = a.name;
             Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
-            float isz = S(22);
+            float isz = S(24);
             if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(lx - isz / 2, cy1 - isz / 2, isz, isz)); }
-            else { FillRound(g, T.badge, RectF(lx - S(11), cy1 - S(11), S(22), S(22)), S(7)); Glyph(g, a.system ? G_RINGER : G_APPS, g_fIconS, T.t1, lx, cy1); }
+            else { FillRound(g, T.badge, RectF(lx - S(12), cy1 - S(12), S(24), S(24)), S(7)); Glyph(g, a.system ? G_RINGER : G_APPS, g_fIconS, T.t1, lx, cy1); }
             muteG = muted ? G_MUTE : G_VOLUME;
         } else {
-            wchar_t lg = G_VOLUME; int devIcon = -1;
+            wchar_t lg = G_VOLUME; int devIcon = -1; bool devBt = false;
             if (e.k == E_MASTER) { name = L"Master volume"; muteG = muted ? G_MUTE : G_VOLUME; }
             else {
                 Endpoint& d = (e.k == E_OUT ? g_out : g_in)[e.idx];
-                name = d.name; detail = d.detail; lg = KindGlyph(d.kind); devIcon = d.icon;
+                name = d.name; detail = d.detail; lg = KindGlyph(d.kind); devIcon = d.icon; devBt = d.bt;
                 muteG = e.k == E_IN ? (muted ? G_MICOFF : G_MIC) : (muted ? G_MUTE : G_VOLUME);
             }
-            FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(14), cy1 - S(14), S(28), S(28)), S(9));   // rounded-square badge
+            FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
             if (devIcon >= 0 && devIcon != DI_MIC) DrawDevIcon(g, devIcon, lx, cy1, sel ? T.onAccent : T.t1);
-            else Glyph(g, lg, g_fIconS, sel ? T.onAccent : T.t1, lx, cy1);
+            else Glyph(g, lg, g_fIcon, sel ? T.onAccent : T.t1, lx, cy1);
+            if (devBt) {   // Bluetooth: one clear blue circle on the corner of the icon
+                float bx = lx + S(13.5f), by = cy1 + S(13.5f), br = S(8.5f);
+                SolidBrush bb(Color(255, 31, 111, 235)); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
+                float k = S(11) / 20.f, ox = bx - 10 * k, oy = by - 10 * k;
+                Pen bp(Color(255, 255, 255, 255), std::max(1.f, 2.f * k)); bp.SetLineJoin(LineJoinRound); bp.SetStartCap(LineCapRound); bp.SetEndCap(LineCapRound);
+                PointF pts[6] = {PointF(ox + 7 * k, oy + 7 * k), PointF(ox + 13 * k, oy + 13 * k), PointF(ox + 10 * k, oy + 16 * k),
+                                 PointF(ox + 10 * k, oy + 4 * k), PointF(ox + 13 * k, oy + 7 * k), PointF(ox + 7 * k, oy + 13 * k)};
+                g.DrawLines(&bp, pts, 6);
+            }
         }
-        float nx = e.r.X + S(8) + S(28) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
+        float nx = e.r.X + S(8) + S(32) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
         if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady()) {   // where this app plays
             RectF c = AppOutChip(e);
             maxW = c.X - S(8) - nx;
@@ -2598,6 +2607,29 @@ static void DrawMenu(Graphics& g) {
 
 static bool g_dwmRound = false;
 
+// Smooth changes: when the theme, style or accent changes, both windows fade from the old look to the new one.
+struct Fade { std::vector<BYTE> last, from; int w = 0, h = 0; DWORD start = 0; bool on = false; };
+static Fade g_fadeFly, g_fadeSet;
+static const DWORD FADE_MS = 220;
+enum { TIMER_FADE = 11 };
+static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after drawing, before showing
+    BYTE* bits = (BYTE*)bitsV; size_t n = (size_t)w * h * 4;
+    std::vector<BYTE> fresh(bits, bits + n);
+    if (f.on) {
+        float t = (GetTickCount() - f.start) / (float)FADE_MS;
+        if (t >= 1 || f.w != w || f.h != h || f.from.size() != n) f.on = false;
+        else {
+            t = t * t * (3 - 2 * t);   // ease in-out
+            int a = (int)(t * 256);
+            for (size_t i = 0; i < n; i++) bits[i] = (BYTE)(f.from[i] + (((int)bits[i] - (int)f.from[i]) * a >> 8));
+        }
+    }
+    f.last.swap(fresh); f.w = w; f.h = h;
+}
+static void StartFade() {
+    for (Fade* f : {&g_fadeFly, &g_fadeSet}) if (!f->last.empty()) { f->from = f->last; f->start = GetTickCount(); f->on = true; }
+    if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
+}
 static void Paint(HDC hdc) {
     if (g_W <= 0 || g_H <= 0) return;
     // 32-bit premultiplied canvas: alpha is honoured by DWM when Glass (acrylic) is on
@@ -2710,6 +2742,7 @@ static void Paint(HDC hdc) {
         DrawMenu(g);
         if (!g_dwmRound) { Pen bp(T.subtle3, S(1)); g.DrawRectangle(&bp, RectF(0, 0, g_W - 1.f, g_H - 1.f)); }
     }
+    FadeApply(g_fadeFly, bits, g_W, g_H);
     BitBlt(hdc, 0, 0, g_W, g_H, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, old);
     DeleteObject(dib);
@@ -2962,6 +2995,52 @@ static bool IsCallEndpoint(const Endpoint& e) {   // Bluetooth hands-free (call 
     std::wstring l = Lower(e.rawName + L" " + e.rawIface);
     return e.bt && (Lower(e.rawName) == L"headset" || l.find(L"hands-free") != std::wstring::npos);
 }
+// "Turn off displays" without locking: real screen-off sends Modern Standby laptops to sleep (and the lock screen),
+// so Knob covers every screen with black and turns brightness to 0, then puts everything back on any input.
+static std::vector<HWND> g_blackWnds;
+static std::vector<int> g_blackPrev;
+static POINT g_blackPt; static DWORD g_blackTick;
+static void BlackoutEnd() {
+    if (g_blackWnds.empty()) return;
+    for (HWND w : g_blackWnds) DestroyWindow(w);
+    g_blackWnds.clear();
+    ShowCursor(TRUE);
+    for (int i = 0; i < (int)g_blackPrev.size() && i < (int)g_mons.size(); i++) if (g_blackPrev[i] >= 0) { g_mons[i].pct = g_blackPrev[i]; MonSet(i, 0, g_blackPrev[i]); }
+    g_blackPrev.clear();
+}
+static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
+    case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
+    case WM_MOUSEMOVE: {
+        if (GetTickCount() - g_blackTick < 800) return 0;   // ignore the click that started it
+        POINT p; GetCursorPos(&p);
+        if (abs(p.x - g_blackPt.x) > 6 || abs(p.y - g_blackPt.y) > 6) BlackoutEnd();
+        return 0;
+    }
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_MOUSEWHEEL:
+        if (GetTickCount() - g_blackTick > 300) BlackoutEnd();
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static BOOL CALLBACK BlackMonProc(HMONITOR, HDC, LPRECT rc, LPARAM) {
+    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"KnobBlack", L"", WS_POPUP, rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top, nullptr, nullptr, g_inst, nullptr);
+    if (w) { ShowWindow(w, SW_SHOW); g_blackWnds.push_back(w); }
+    return TRUE;
+}
+static void BlackoutStart() {
+    if (!g_blackWnds.empty()) return;
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = BlackProc; wc.hInstance = g_inst; wc.lpszClassName = L"KnobBlack"; wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); RegisterClassW(&wc); reg = true; }
+    EnumDisplayMonitors(nullptr, nullptr, BlackMonProc, 0);
+    if (g_blackWnds.empty()) return;
+    SetForegroundWindow(g_blackWnds[0]);
+    ShowCursor(FALSE);
+    GetCursorPos(&g_blackPt); g_blackTick = GetTickCount();
+    g_blackPrev.assign(g_mons.size(), -1);   // dim every display we control to 0, remember where it was
+    for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }
+}
 static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
     std::set<std::wstring> now; for (auto& o : g_out) now.insert(o.id);
     if (g_prevOutKnown && g_autoSwitch) {
@@ -3189,7 +3268,15 @@ enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_APPEAR, SP_ABOUT, SP_COUNT };
 static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Appearance", L"About"};
 static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
 enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT };
-static int g_sddOpen = -1;   // open Settings dropdown: 1 call device, 2 during calls
+static int g_sddOpen = -1;
+static float g_segPos[3] = {-1, -1, -1};   // animated pill position: theme, style, accent
+static float SegPos(int which, int target) {   // eases towards the selected option; keeps repainting until it gets there
+    float& p = g_segPos[which];
+    if (p < 0) p = (float)target;
+    if (fabsf(p - target) > 0.01f) { p += (target - p) * 0.35f; if (g_set) SetTimer(g_set, 77, 15, nullptr); }
+    else p = (float)target;
+    return p;
+}   // open Settings dropdown: 1 call device, 2 during calls
 struct SItem { int kind; int id; RectF r; };
 enum { WM_APP_STARTEDIT = WM_APP + 20 };
 
@@ -3430,12 +3517,12 @@ static void PaintSettings(HDC hdc) {
                 RectF box(r.X + r.Width - S(18) - S(246), r.Y + r.Height / 2 - S(17), S(246), S(34));
                 FillRound(g, T.subtle, box, S(8));
                 const wchar_t* tl[3] = {L"System", L"Light", L"Dark"};
+                FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(0, g_themeMode) * S(80), box.Y + S(3), S(78), S(28)), S(6));
                 for (int i = 0; i < 3; i++) {
                     RectF b(box.X + S(3) + i * S(80), box.Y + S(3), S(78), S(28));
                     add(SK_THEME, i, b);
                     bool on = g_themeMode == i;
-                    if (on) FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), b, S(6));
-                    else if (isHover(SK_THEME, i)) FillRound(g, T.subtle, b, S(6));
+                    if (!on && isHover(SK_THEME, i)) FillRound(g, T.subtle, b, S(6));
                     Text(g, tl[i], on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
                 }
             }
@@ -3443,12 +3530,12 @@ static void PaintSettings(HDC hdc) {
             titleDesc(r, L"Style", T.dark || true ? L"Glass needs Windows 11 22H2 or newer; older versions use Solid" : L"", S(200));
             RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
             FillRound(g, T.subtle, box, S(8));
+            FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(1, g_style) * S(87), box.Y + S(3), S(85), S(28)), S(6));
             for (int i = 0; i < 2; i++) {
                 RectF b(box.X + S(3) + i * S(87), box.Y + S(3), S(85), S(28));
                 add(SK_STYLE, i, b);
                 bool on = g_style == i;
-                if (on) FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), b, S(6));
-                else if (isHover(SK_STYLE, i)) FillRound(g, T.subtle, b, S(6));
+                if (!on && isHover(SK_STYLE, i)) FillRound(g, T.subtle, b, S(6));
                 Text(g, i == 0 ? L"Solid" : L"Glass", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
             }
             {   // accent: Windows, or your own colour
@@ -3457,12 +3544,12 @@ static void PaintSettings(HDC hdc) {
                 titleDesc(r, L"Accent color", ad, S(200));
                 RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
                 FillRound(g, T.subtle, box, S(8));
+                FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(2, g_accentId) * S(87), box.Y + S(3), S(85), S(28)), S(6));
                 for (int i = 0; i < 2; i++) {
                     RectF b(box.X + S(3) + i * S(87), box.Y + S(3), S(85), S(28));
                     add(SK_ACCMODE, i, b);
                     bool on = g_accentId == i;
-                    if (on) FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), b, S(6));
-                    else if (isHover(SK_ACCMODE, i)) FillRound(g, T.subtle, b, S(6));
+                    if (!on && isHover(SK_ACCMODE, i)) FillRound(g, T.subtle, b, S(6));
                     Text(g, i == 0 ? L"Windows" : L"Custom", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
                 }
             }
@@ -3616,6 +3703,7 @@ static void PaintSettings(HDC hdc) {
             FillRound(g, T.t3, RectF(g_setW - S(7), ty, S(3), th), S(1.5f));
         }
     }
+    FadeApply(g_fadeSet, bits, g_setW, g_setH);
     BitBlt(hdc, 0, 0, g_setW, g_setH, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, old);
     DeleteObject(dib);
@@ -3660,6 +3748,9 @@ static void SettingsDelayAt(float x) {
 
 static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_TIMER:
+        if (wp == 77) { KillTimer(h, 77); InvalidateRect(h, nullptr, FALSE); return 0; }   // sliding pill frame
+        break;
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) { PairHide(); return 0; }
         g_setW = LOWORD(lp); g_setH = HIWORD(lp); SetPageScroll(g_setScroll); InvalidateRect(h, nullptr, FALSE); return 0;
@@ -3692,6 +3783,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         switch (it.kind) {
         case SK_NAV: g_setPage = it.id; g_setScroll = 0; g_sddOpen = -1; break;
         case SK_THEME:
+            if (g_themeMode == it.id) break;
+            StartFade();
             g_themeMode = it.id; SaveSettings();
             ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); UpdateTrayIcon(); SettingsChanged();
             break;
@@ -3728,9 +3821,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DestroyWindow(g_hwnd); return 0;
             }
             break;
-        case SK_STYLE: g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); break;
+        case SK_STYLE: if (g_style == it.id) break; StartFade(); g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); break;
         case SK_SWATCH: break;
-        case SK_ACCMODE: g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); SettingsChanged(); break;
+        case SK_ACCMODE: if (g_accentId == it.id) break; StartFade(); g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); SettingsChanged(); break;
         case SK_COLOR: g_sDragColor = it.id + 1; SetCapture(h); SettingsColorAt(x); return 0;
         case SK_HK: g_capture = it.id; UnregisterHotkeys(); break;
         case SK_STEP: g_step = it.id; SaveSettings(); break;
@@ -3934,6 +4027,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_FADE) {
+            if (g_visible) InvalidateRect(h, nullptr, FALSE);
+            if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+            if (!g_fadeFly.on && !g_fadeSet.on) KillTimer(h, TIMER_FADE);
+            return 0;
+        }
         if (wp == TIMER_AUDIODEBOUNCE) {
             KillTimer(h, TIMER_AUDIODEBOUNCE);
             if (g_dragEl >= 0) { SetTimer(h, TIMER_AUDIODEBOUNCE, 300, nullptr); return 0; }
@@ -3961,7 +4060,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             CloseIdentify();
         } else if (wp == TIMER_SCREENOFF) {
             KillTimer(h, TIMER_SCREENOFF);
-            PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);   // all displays off; any input wakes them
+            BlackoutStart();
             return 0;
         } else if (wp == TIMER_CALRETRY) {
             KillTimer(h, TIMER_CALRETRY);
@@ -4190,7 +4289,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_POWERBROADCAST:
         if (wp == PBT_APMRESUMEAUTOMATIC) { g_restoreAllNext = true; BrightRequest(true, false); PostMessageW(h, WM_APP_AUDIOCHANGED, 0, 0); }
         return TRUE;
-    case WM_DESTROY: PostQuitMessage(0); return 0;
+    case WM_DESTROY: BlackoutEnd(); PostQuitMessage(0); return 0;   // never leave the screens dark
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
