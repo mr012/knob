@@ -25,6 +25,7 @@
 #include <endpointvolume.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
+#include <devicetopology.h>
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
@@ -43,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.26.0"
-#define APP_VERNUM  ((1 << 16) | (26 << 8) | 0)
+#define APP_VERSION L"1.27.0"
+#define APP_VERNUM  ((1 << 16) | (27 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -82,6 +83,11 @@ static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open Knob"};
 static const wchar_t* HK_KEYS[HK_COUNT] = {L"open"};
 static const HotKey HK_DEFAULT[HK_COUNT] = {{0, 0, false}};   // no shortcut until the user picks one
 static bool g_noSave = false, g_restartAfterExit = false;
+static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
+static std::wstring g_callDev;       // output for calls (empty = same as main)
+static bool g_autoSwitch = true;     // switch to headphones when they connect
+static std::wstring g_autoPrev, g_autoTarget;   // output to go back to when they disconnect
+static std::set<std::wstring> g_prevOutIds; static bool g_prevOutKnown = false;
 // update check (GitHub releases)
 enum { UPD_NONE, UPD_AVAILABLE, UPD_DOWNLOADING, UPD_FAILED };
 static int g_updState = UPD_NONE;
@@ -139,9 +145,12 @@ static const PROPERTYKEY PK_FormFactor = {{0x1da5d803, 0xd492, 0x4edd, {0x8c, 0x
 
 // ---------------------------------------------------------------- models
 enum DevKind { DK_SPEAKER, DK_HEADPHONES, DK_MIC, DK_DISPLAY };
+enum DevIcon { DI_SPEAKER, DI_LAPTOP, DI_DISPLAY, DI_HEADPHONES, DI_EARBUDS, DI_USB, DI_VIRTUAL, DI_MIC };
 struct Endpoint {
-    std::wstring id, name, detail;
-    int kind = DK_SPEAKER;
+    std::wstring id, name, detail;   // name/detail as shown: recognisable name, then how it's connected
+    std::wstring rawName, rawIface;  // what Windows calls it
+    int kind = DK_SPEAKER, icon = DI_SPEAKER;
+    bool bt = false;
     bool isDefault = false;
     IAudioEndpointVolume* vol = nullptr;
     float level = 0;
@@ -292,6 +301,9 @@ static void LoadSettings() {
     g_osd = GetPrivateProfileIntW(L"main", L"osd", 1, g_iniPath.c_str()) != 0;
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
     g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
+    g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
+    g_autoSwitch = GetPrivateProfileIntW(L"main", L"autoswitch", 1, g_iniPath.c_str()) != 0;
+    { wchar_t cb[512] = {}; GetPrivateProfileStringW(L"main", L"calldev", L"", cb, 512, g_iniPath.c_str()); g_callDev = cb; }
     {   // sections stored as key=value lists
         auto readSection = [&](const wchar_t* sec, auto fn) {
             std::vector<wchar_t> b(32768);
@@ -346,6 +358,9 @@ static void SaveSettings() {
     for (auto& id : g_mirrorSaved) { if (!s.empty()) s += L'|'; s += id; }
     WritePrivateProfileStringW(L"main", L"mirrorsaved", s.c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"multi", g_multi ? L"1" : L"0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"theme", std::to_wstring(g_themeMode).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"calldev", g_callDev.c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"keepawake", g_keepAwake ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"tab", std::to_wstring(g_tab).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"style", std::to_wstring(g_style).c_str(), g_iniPath.c_str());
@@ -445,6 +460,97 @@ static void FreeEndpoints(std::vector<Endpoint>& v) {
     v.clear();
 }
 
+// ---- what kind of device is this, and what should we call it?
+static std::wstring Lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
+static bool HasWord(const std::wstring& low, const wchar_t* w) {   // whole-word-ish match
+    size_t L = wcslen(w);
+    for (size_t p = low.find(w); p != std::wstring::npos; p = low.find(w, p + 1)) {
+        bool a = p == 0 || !iswalnum(low[p - 1]), b = p + L >= low.size() || !iswalnum(low[p + L]);
+        if (a && b) return true;
+    }
+    return false;
+}
+static bool LooksLikeEarbuds(const std::wstring& name) {
+    std::wstring l = Lower(name);
+    for (auto w : {L"buds", L"airpods", L"earpods", L"earbuds", L"freebuds", L"pods", L"tws", L"ear"}) if (HasWord(l, w)) return true;
+    for (auto w : {L"buds ", L"wf-", L"galaxy buds", L"pixel buds", L"jabra elite", L"nothing ear", L"ear (", L"liberty"}) if (l.find(w) != std::wstring::npos) return true;
+    return l.size() > 4 && l.compare(l.size() - 4, 4, L"buds") == 0;
+}
+static bool IsGenericName(const std::wstring& n) {
+    std::wstring l = Lower(n);
+    for (auto w : {L"speakers", L"speaker", L"headphones", L"headphone", L"headset", L"speakers/headphones", L"headset earphone", L"digital output",
+                   L"line out", L"spdif out", L"s/pdif", L"microphone", L"microphone array", L"headset microphone", L"line in", L"hands-free", L"stereo mix", L"external microphone"})
+        if (l == w) return true;
+    return false;
+}
+static bool IsCodecName(const std::wstring& n) {   // chip / driver names that mean nothing to people
+    std::wstring l = Lower(n);
+    for (auto w : {L"realtek", L"high definition audio", L"intel", L"smart sound", L"amd", L"conexant", L"idt", L"cirrus", L"synaptics", L"audio device", L"soundwire", L"sound blaster", L"nvidia", L"microsoft"})
+        if (l.find(w) != std::wstring::npos) return true;
+    return false;
+}
+static std::wstring CleanBtName(std::wstring n) {   // "Buds Pro 2 Hands-Free AG Audio" -> "Buds Pro 2"
+    for (auto w : {L" Hands-Free AG Audio", L" Hands-Free", L" Stereo", L" Headset", L" Avrcp Transport"}) {
+        size_t p = n.find(w); if (p != std::wstring::npos && p > 0) n = n.substr(0, p);
+    }
+    return n;
+}
+static bool IsLaptop() {
+    static int v = -1;
+    if (v < 0) { SYSTEM_POWER_STATUS ps; v = GetSystemPowerStatus(&ps) && ps.BatteryFlag != 128 && ps.BatteryFlag != 255 ? 1 : 0; }
+    return v == 1;
+}
+static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the endpoint: hdaudio / usb / bthenum / root ...
+    std::wstring r;
+    IDeviceTopology* t = nullptr;
+    if (SUCCEEDED(dev->Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr, (void**)&t)) && t) {
+        IConnector* c = nullptr;
+        if (SUCCEEDED(t->GetConnector(0, &c)) && c) {
+            LPWSTR id = nullptr;
+            if (SUCCEEDED(c->GetDeviceIdConnectedTo(&id)) && id) { r = Lower(id); CoTaskMemFree(id); }
+            c->Release();
+        }
+        t->Release();
+    }
+    return r;
+}
+static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& path) {
+    std::wstring nm = e.rawName, ifc = e.rawIface, both = Lower(nm + L" " + ifc);
+    bool bt = path.find(L"bth") != std::wstring::npos;
+    bool usb = path.find(L"usb") != std::wstring::npos;
+    bool virt = path.find(L"root#") != std::wstring::npos || path.find(L"\\root") != std::wstring::npos;
+    for (auto w : {L"vb-audio", L"voicemeeter", L"virtual", L"steam streaming", L"nvidia broadcast", L"cable input", L"cable output"}) if (both.find(w) != std::wstring::npos) virt = true;
+    if (bt) virt = false;
+    bool headset = ff == 3 || ff == 5;
+    e.bt = bt;
+    std::wstring name = nm, conn = ifc;
+    if (IsGenericName(nm) && !ifc.empty() && !IsCodecName(ifc)) name = bt ? CleanBtName(ifc) : ifc;
+    if (capture) {
+        e.icon = (bt || headset) ? DI_HEADPHONES : DI_MIC;
+        if (bt) conn = L"Bluetooth";
+        else if (usb) conn = L"USB";
+        else if (virt) { conn = L"Virtual"; e.icon = DI_VIRTUAL; }
+        else if (ff == 4 || IsGenericName(nm)) {   // built-in or jack
+            if (headset) { name = L"Headset microphone"; conn = L"3.5 mm jack"; }
+            else if (Lower(nm).find(L"array") != std::wstring::npos || IsLaptop()) { name = IsLaptop() ? L"Laptop microphone" : L"Microphone"; conn = L"Built-in"; }
+            else conn = L"Built-in";
+        }
+    } else if (ff == 9) { e.icon = DI_DISPLAY; conn = L"HDMI / DP"; if (IsGenericName(nm) || IsCodecName(nm)) name = ifc.empty() ? L"Display audio" : ifc; }
+    else if (ff == 0) { e.icon = DI_DISPLAY; conn = L"Wireless display"; }
+    else if (virt) { e.icon = DI_VIRTUAL; conn = L"Virtual"; }
+    else if (bt) { e.icon = (LooksLikeEarbuds(name) ? DI_EARBUDS : headset ? DI_HEADPHONES : DI_SPEAKER); conn = L"Bluetooth"; }
+    else if (usb) { e.icon = headset ? (LooksLikeEarbuds(name) ? DI_EARBUDS : DI_HEADPHONES) : DI_USB; conn = L"USB"; }
+    else if (headset) { e.icon = DI_HEADPHONES; conn = L"3.5 mm jack"; if (IsCodecName(name) || IsGenericName(name)) name = L"Headphones"; }
+    else if (ff == 8) { e.icon = DI_SPEAKER; conn = L"Optical"; }
+    else if (ff == 2) { e.icon = DI_SPEAKER; conn = L"Line out"; }
+    else if (ff == 1 || IsGenericName(nm)) {
+        if (IsLaptop()) { e.icon = DI_LAPTOP; name = L"Laptop speakers"; } else { e.icon = DI_SPEAKER; name = L"Speakers"; }
+        conn = L"Built-in";
+    }
+    if (conn == name) conn.clear();
+    e.name = name.empty() ? nm : name;
+    e.detail = conn;
+}
 static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     FreeEndpoints(v);
     if (!g_enum) return;
@@ -466,13 +572,14 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         if (SUCCEEDED(dev->GetId(&id))) { e.id = id; CoTaskMemFree(id); }
         e.kind = flow == eCapture ? DK_MIC : DK_SPEAKER;
         IPropertyStore* ps = nullptr;
+        UINT ff = 10;
         if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) {
             e.name = PropStr(ps, PK_DeviceDesc);
             e.detail = PropStr(ps, PK_IfaceName);
             if (e.name.empty()) e.name = PropStr(ps, PK_FriendlyName);
             PROPVARIANT pv; PropVariantInit(&pv);
             if (SUCCEEDED(ps->GetValue(PK_FormFactor, &pv)) && (pv.vt == VT_UI4 || pv.vt == VT_I4)) {
-                UINT ff = pv.ulVal;
+                ff = pv.ulVal;
                 if (ff == 3 || ff == 5) e.kind = DK_HEADPHONES;          // Headphones, Headset
                 else if (ff == 9) e.kind = DK_DISPLAY;                   // DigitalAudioDisplayDevice (HDMI/DP)
                 else if (ff == 4) e.kind = DK_MIC;
@@ -481,6 +588,8 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
             ps->Release();
         }
         if (e.name.empty()) e.name = L"Audio device";
+        e.rawName = e.name; e.rawIface = e.detail;
+        Classify(e, flow == eCapture, ff, ConnectedPath(dev));
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
         if (e.vol) { e.vol->GetMasterVolumeLevelScalar(&e.level); e.vol->GetMute(&e.mute); if (g_volCb) e.vol->RegisterControlChangeNotify(g_volCb); }
@@ -499,10 +608,25 @@ static void SetDefaultDevice(const std::wstring& id) {
     if (SUCCEEDED(CoCreateInstance(CLSID_PolicyConfigClient, nullptr, CLSCTX_ALL, IID_IPolicyConfig, (void**)&pc)) && pc) {
         pc->SetDefaultEndpoint(id.c_str(), eConsole);
         pc->SetDefaultEndpoint(id.c_str(), eMultimedia);
-        pc->SetDefaultEndpoint(id.c_str(), eCommunications);
+        if (g_callDev.empty()) pc->SetDefaultEndpoint(id.c_str(), eCommunications);   // calls follow, unless a call device is set
         pc->Release();
     }
 }
+static void SetCallDevice(const std::wstring& id) {   // empty = same as the main output
+    g_callDev = id;
+    std::wstring target = id;
+    if (target.empty()) { for (auto& o : g_out) if (o.isDefault) target = o.id; }
+    IPolicyConfig* pc = nullptr;
+    if (!target.empty() && SUCCEEDED(CoCreateInstance(CLSID_PolicyConfigClient, nullptr, CLSCTX_ALL, IID_IPolicyConfig, (void**)&pc)) && pc) {
+        pc->SetDefaultEndpoint(target.c_str(), eCommunications); pc->Release();
+    }
+}
+// Windows' own audio settings, reached from Knob
+static const wchar_t* AUDIO_KEY = L"Software\\Microsoft\\Multimedia\\Audio";
+static DWORD AudioRegGet(const wchar_t* name, DWORD def) { DWORD v = def, sz = sizeof(v); RegGetValueW(HKEY_CURRENT_USER, AUDIO_KEY, name, RRF_RT_REG_DWORD, nullptr, &v, &sz); return v; }
+static void AudioRegSet(const wchar_t* name, DWORD v) { RegSetKeyValueW(HKEY_CURRENT_USER, AUDIO_KEY, name, REG_DWORD, &v, sizeof(v)); }
+static bool MonoOn() { return AudioRegGet(L"AccessibilityMonoMixState", 0) != 0; }
+static int Ducking() { return (int)std::min<DWORD>(3, AudioRegGet(L"UserDuckingPreference", 1)); }   // 0 mute, 1 -80%, 2 -50%, 3 nothing
 
 static bool OutSelected(int i) { return g_out[i].isDefault || g_mirror.count(g_out[i].id) > 0; }
 static int SelectedOutCount() { int n = 0; for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) n++; return n; }
@@ -1216,6 +1340,7 @@ static Color WindowsAccent(bool dark) {
 static void LoadTheme() {
     DWORD v = 0, sz = sizeof(v);
     T.dark = !(RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v);
+    if (g_themeMode == 1) T.dark = false; else if (g_themeMode == 2) T.dark = true;   // Appearance > Theme
     v = 0; sz = sizeof(v);
     T.taskbarLight = RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS && v;
     T.accent = g_accentId == 0 ? WindowsAccent(T.dark) : CustomAccent(T.dark, g_accentHue, g_accentSat);
@@ -1531,7 +1656,6 @@ static Hit HitTest(float x, float y) {
     if (y < PaneTop() || y >= PaneBottom()) return h;
     for (int i = 0; i < (int)g_els.size(); i++) {
         El& e = g_els[i];
-        if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(MultiRect(e), x, y)) { h.h = H_MULTI; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
@@ -1909,6 +2033,32 @@ static void DrawSwitch(Graphics& g, float x, float cy, bool on, float k = 1.f) {
     g.FillEllipse(&kb, kx, cy - S(6 * k), S(12 * k), S(12 * k));
 }
 
+static void DrawDevIcon(Graphics& g, int icon, float cx, float cy, Color c) {   // 20-unit line icons, same family as the UI
+    float k = S(16) / 20.f, ox = cx - 10 * k, oy = cy - 10 * k;
+    Pen p(c, std::max(1.f, 1.45f * k)); p.SetStartCap(LineCapRound); p.SetEndCap(LineCapRound); p.SetLineJoin(LineJoinRound);
+    SolidBrush b(c);
+    auto X = [&](float x) { return ox + x * k; }; auto Y = [&](float y) { return oy + y * k; };
+    auto line = [&](float a, float bb, float cc, float d) { g.DrawLine(&p, X(a), Y(bb), X(cc), Y(d)); };
+    auto rrect = [&](float x, float y, float w, float h, float r) { GraphicsPath gp; AddRound(gp, RectF(X(x), Y(y), w * k, h * k), r * k); g.DrawPath(&p, &gp); };
+    auto circ = [&](float x, float y, float r) { g.DrawEllipse(&p, X(x - r), Y(y - r), 2 * r * k, 2 * r * k); };
+    auto poly = [&](std::initializer_list<float> pts) { std::vector<PointF> v; auto it = pts.begin(); while (it != pts.end()) { float a = *it++; float bb = *it++; v.push_back(PointF(X(a), Y(bb))); } g.DrawLines(&p, v.data(), (INT)v.size()); };
+    switch (icon) {
+    case DI_LAPTOP: rrect(4, 4.5f, 12, 8, 1.2f); line(2.5f, 15.5f, 17.5f, 15.5f); break;
+    case DI_DISPLAY: rrect(2.5f, 3.5f, 15, 10, 1.5f); line(7, 16.5f, 13, 16.5f); line(10, 13.5f, 10, 16.5f); break;
+    case DI_HEADPHONES:
+        line(3.5f, 13, 3.5f, 10); line(16.5f, 10, 16.5f, 13);
+        g.DrawArc(&p, X(3.5f), Y(3.5f), 13 * k, 13 * k, 180.f, 180.f);
+        rrect(3, 11.5f, 3, 5, 1.2f); rrect(14, 11.5f, 3, 5, 1.2f); break;
+    case DI_EARBUDS:
+        circ(6.5f, 7, 2.6f); rrect(5.3f, 9.2f, 2.4f, 6.8f, 1.2f);
+        circ(13.5f, 7, 2.6f); rrect(12.3f, 9.2f, 2.4f, 6.8f, 1.2f); break;
+    case DI_USB:
+        line(10, 3, 10, 14); poly({8, 5, 10, 3, 12, 5}); poly({10, 11.5f, 6.5f, 9.5f, 6.5f, 7.5f}); poly({10, 10, 13.5f, 8, 13.5f, 6.5f}); circ(10, 15.8f, 1.6f); break;
+    case DI_VIRTUAL: poly({2.5f, 10, 4.7f, 10, 6.7f, 5, 9.7f, 15, 12.7f, 7, 14.5f, 10, 17.5f, 10}); break;
+    default:   // speaker box
+        rrect(5, 2.5f, 10, 15, 2); circ(10, 11.5f, 3); g.FillEllipse(&b, X(9.1f), Y(5.1f), 1.8f * k, 1.8f * k); break;
+    }
+}
 static wchar_t KindGlyph(int k) { return k == DK_HEADPHONES ? G_HEADPHONE : k == DK_MIC ? G_MIC : k == DK_DISPLAY ? G_TV : G_SPEAKERS; }
 
 static void DrawEl(Graphics& g, int index) {
@@ -1917,12 +2067,12 @@ static void DrawEl(Graphics& g, int index) {
     bool hovEl = g_hover.el == index;
     if (e.k == E_H3) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
-        if (e.text == L"OUTPUT") {   // same toggle as Settings, smaller, with its label on the left
+        if (e.text == L"OUTPUT") {   // status only; the switch lives in Settings > Sound
             RectF m = MultiRect(e);
-            float sw = S(32), sx = m.X + m.Width - S(6) - sw, cy = m.Y + m.Height / 2;
-            if (g_hover.h == H_MULTI) FillRound(g, T.hover, m, S(6));
-            Text(g, L"Play together", g_fSmall, g_multi ? T.t1 : T.t2, RectF(m.X, m.Y, sx - S(8) - m.X, m.Height), StringAlignmentFar);
-            DrawSwitch(g, sx, cy, g_multi, 0.8f);
+            const wchar_t* st = g_multi ? L"Play together \u00B7 On" : L"Play together \u00B7 Off";
+            float tw = TextW(g, st, g_fSmall), tx = m.X + m.Width - S(8) - tw, cy = m.Y + m.Height / 2;
+            Text(g, st, g_fSmall, g_multi ? T.t2 : T.t3, RectF(tx, m.Y, tw + S(4), m.Height));
+            if (g_multi) { SolidBrush dot(T.accent); g.FillEllipse(&dot, tx - S(11), cy - S(3), S(6), S(6)); }
         }
         return;
     }
@@ -1958,15 +2108,16 @@ static void DrawEl(Graphics& g, int index) {
             else { FillRound(g, T.badge, RectF(lx - S(11), cy1 - S(11), S(22), S(22)), S(7)); Glyph(g, a.system ? G_RINGER : G_APPS, g_fIconS, T.t1, lx, cy1); }
             muteG = muted ? G_MUTE : G_VOLUME;
         } else {
-            wchar_t lg = G_VOLUME;
+            wchar_t lg = G_VOLUME; int devIcon = -1;
             if (e.k == E_MASTER) { name = L"Master volume"; muteG = muted ? G_MUTE : G_VOLUME; }
             else {
                 Endpoint& d = (e.k == E_OUT ? g_out : g_in)[e.idx];
-                name = d.name; detail = d.detail; lg = KindGlyph(d.kind);
+                name = d.name; detail = d.detail; lg = KindGlyph(d.kind); devIcon = d.icon;
                 muteG = e.k == E_IN ? (muted ? G_MICOFF : G_MIC) : (muted ? G_MUTE : G_VOLUME);
             }
             FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(14), cy1 - S(14), S(28), S(28)), S(9));   // rounded-square badge
-            Glyph(g, lg, g_fIconS, sel ? T.onAccent : T.t1, lx, cy1);
+            if (devIcon >= 0 && devIcon != DI_MIC) DrawDevIcon(g, devIcon, lx, cy1, sel ? T.onAccent : T.t1);
+            else Glyph(g, lg, g_fIconS, sel ? T.onAccent : T.t1, lx, cy1);
         }
         float nx = e.r.X + S(8) + S(28) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
         if (e.k == E_OUT && HasDelayChip(e.idx)) {
@@ -2552,6 +2703,27 @@ static void ToggleOutput(int i) {
     UpdateTrayTip();
 }
 
+static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
+    std::set<std::wstring> now; for (auto& o : g_out) now.insert(o.id);
+    if (g_prevOutKnown && g_autoSwitch) {
+        for (auto& o : g_out) if (!g_prevOutIds.count(o.id) && (o.icon == DI_HEADPHONES || o.icon == DI_EARBUDS)) {
+            if (g_multi) g_mirror.insert(o.id);   // Play together: add it to the group
+            else if (!o.isDefault) {
+                for (auto& d : g_out) if (d.isDefault) g_autoPrev = d.id;
+                g_autoTarget = o.id;
+                SetDefaultDevice(o.id);
+                LoadEndpoints(eRender, g_out);
+            }
+            break;
+        }
+        if (!g_autoTarget.empty() && !now.count(g_autoTarget)) {   // they disconnected
+            if (!g_multi && now.count(g_autoPrev)) { SetDefaultDevice(g_autoPrev); LoadEndpoints(eRender, g_out); }
+            g_autoTarget.clear(); g_autoPrev.clear();
+        }
+    }
+    g_prevOutIds.clear(); for (auto& o : g_out) g_prevOutIds.insert(o.id);
+    g_prevOutKnown = true;
+}
 static void SetMulti(bool on) {
     if (on == g_multi) return;
     g_multi = on;
@@ -2754,7 +2926,8 @@ static void StartUpdate() {
 enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_APPEAR, SP_ABOUT, SP_COUNT };
 static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Appearance", L"About"};
 static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
-enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR };
+enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT };
+static int g_sddOpen = -1;   // open Settings dropdown: 1 call device, 2 during calls
 struct SItem { int kind; int id; RectF r; };
 enum { WM_APP_STARTEDIT = WM_APP + 20 };
 
@@ -2916,6 +3089,19 @@ static void PaintSettings(HDC hdc) {
             } else Text(g, t, &fBody, T.t1, RectF(r.X + S(18), r.Y, r.Width - right - S(24), r.Height));
         };
         auto section = [&](const wchar_t* t) { y += S(14); Text(g, t, &fBody600, T.t1, RectF(x0 + S(4), y, cw, S(22))); y += S(30); };
+        // dropdowns styled like the rest of Knob; the open list is drawn last so it sits on top
+        RectF ddPopBtn; std::vector<std::wstring> ddPopOpts; int ddPopCur = -1, ddPopId = -1;
+        auto ddCard = [&](int id, const wchar_t* t, const wchar_t* d, const std::vector<std::wstring>& opts, int cur) {
+            RectF r = cardRect(cardH(d, S(250))); FillRound(g, card, r, S(6));
+            titleDesc(r, t, d, S(250));
+            RectF b(r.X + r.Width - S(18) - S(220), r.Y + r.Height / 2 - S(16), S(220), S(32));
+            add(SK_DDBTN, id, b);
+            bool open = g_sddOpen == id;
+            FillRound(g, open || isHover(SK_DDBTN, id) ? T.subtle3 : T.subtle2, b, S(6));
+            Text(g, cur >= 0 && cur < (int)opts.size() ? opts[cur].c_str() : L"", &fDesc, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
+            Glyph(g, open ? 0xE70E : 0xE70D, g_fIconS, T.t2, b.X + b.Width - S(18), b.Y + b.Height / 2);
+            if (open) { ddPopBtn = b; ddPopOpts = opts; ddPopCur = cur; ddPopId = id; }
+        };
         auto switchCard = [&](int id, const wchar_t* t, const wchar_t* d, bool on) {
             RectF r = cardRect(cardH(d, S(90)));
             add(SK_SWITCH, id, r);
@@ -2976,6 +3162,21 @@ static void PaintSettings(HDC hdc) {
               button(SK_BUTTON, 1, RectF(r.X + r.Width - S(18) - S(110), r.Y + S(10), S(110), S(32)), L"Exit"); }
             break;
         case SP_APPEAR: {
+            {   // Theme: follow Windows, or force light / dark
+                RectF r = cardRect(cardH(L"Follow Windows, or always light or dark", S(260))); FillRound(g, card, r, S(6));
+                titleDesc(r, L"Theme", L"Follow Windows, or always light or dark", S(260));
+                RectF box(r.X + r.Width - S(18) - S(246), r.Y + r.Height / 2 - S(17), S(246), S(34));
+                FillRound(g, T.subtle, box, S(8));
+                const wchar_t* tl[3] = {L"System", L"Light", L"Dark"};
+                for (int i = 0; i < 3; i++) {
+                    RectF b(box.X + S(3) + i * S(80), box.Y + S(3), S(78), S(28));
+                    add(SK_THEME, i, b);
+                    bool on = g_themeMode == i;
+                    if (on) FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), b, S(6));
+                    else if (isHover(SK_THEME, i)) FillRound(g, T.subtle, b, S(6));
+                    Text(g, tl[i], on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
+                }
+            }
             RectF r = cardRect(cardH(L"Glass needs Windows 11 22H2 or newer; older versions use Solid", S(200))); FillRound(g, card, r, S(6));
             titleDesc(r, L"Style", T.dark || true ? L"Glass needs Windows 11 22H2 or newer; older versions use Solid" : L"", S(200));
             RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
@@ -3040,13 +3241,16 @@ static void PaintSettings(HDC hdc) {
             break;
         }
         case SP_SOUND:
-            y -= S(8);
-            para(L"When several outputs are selected, the main (Windows default) output plays normally and Knob copies its sound to the others. Bluetooth adds its own delay, so delay the faster outputs until they line up.", S(12));
+            switchCard(10, L"Play together", L"Play on several outputs at once. Off: clicking an output in the Sound tab switches to it", g_multi);
+            if (g_multi) {
+            section(L"Sync");
+            y -= S(4);
+            para(L"The main (Windows default) output plays normally and Knob copies its sound to the others. Bluetooth adds its own delay, so delay the faster outputs until they line up.", S(12));
             {
                 bool can = g_router && !g_calibrating;
                 std::wstring d = !g_calStatus.empty() ? g_calStatus
                     : (g_router ? L"Plays a short chirp on each output and listens with your microphone. Pause music and keep the room quiet."
-                                : L"Turn on Play together in the Sound tab and pick two or more outputs to use it");
+                                : L"Pick two or more outputs in the Sound tab to use it");
                 RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
                 titleDesc(r, L"Auto sync", d.c_str(), S(170));
                 button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)),
@@ -3070,6 +3274,16 @@ static void PaintSettings(HDC hdc) {
                     Text(g, t, g_fSmall600, T.t1, RectF(r.X + r.Width - S(78), r.Y + S(60), S(60), S(28)), StringAlignmentFar);
                 }
             }
+            }   // Play together
+            section(L"More sound options");
+            {
+                std::vector<std::wstring> opts = {L"Same as main output"}; int cur = 0;
+                for (auto& o : g_out) { opts.push_back(o.name); if (!g_callDev.empty() && o.id == g_callDev) cur = (int)opts.size() - 1; }
+                ddCard(1, L"Device for calls", L"For apps that follow Windows' call device, like Teams and Skype; everything else keeps the main output", opts, cur);
+            }
+            switchCard(11, L"Switch to headphones when they connect", L"And back to the previous output when they disconnect", g_autoSwitch);
+            switchCard(12, L"Mono audio", L"Both ears hear everything \u2014 handy with one earbud", MonoOn());
+            ddCard(2, L"During calls", L"How much Windows turns other sounds down", {L"Mute everything else", L"Reduce by 80%", L"Reduce by 50%", L"Do nothing"}, Ducking());
             break;
         case SP_DISPLAY:
             switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
@@ -3116,6 +3330,20 @@ static void PaintSettings(HDC hdc) {
               button(SK_BUTTON, 2, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)), L"Reset settings"); }
             break;
         }
+        }
+        if (ddPopId >= 0) {   // open dropdown list, on top of everything
+            float ih = S(32), ph = ih * ddPopOpts.size() + S(8);
+            RectF pop(ddPopBtn.X, ddPopBtn.Y + ddPopBtn.Height + S(4), ddPopBtn.Width, ph);
+            if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
+            FillRound(g, Color(60, 0, 0, 0), RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height), S(8));
+            FillRound(g, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
+            for (int i = 0; i < (int)ddPopOpts.size(); i++) {
+                RectF it(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih);
+                add(SK_DDOPT, ddPopId * 100 + i, it);
+                if (i == ddPopCur) { FillRound(g, T.subtle, it, S(5)); FillRound(g, T.accent, RectF(it.X, it.Y + S(9), S(3), S(14)), S(1.5f)); }
+                else if (isHover(SK_DDOPT, ddPopId * 100 + i)) FillRound(g, T.subtle2, it, S(5));
+                Text(g, ddPopOpts[i].c_str(), &fDesc, T.t1, RectF(it.X + S(12), it.Y, it.Width - S(16), it.Height));
+            }
         }
         g_setContentH = y + g_setScroll + S(24);
         g.ResetClip();
@@ -3194,11 +3422,28 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         int hi = SettingsHit(x, y);
         if (g_capture >= 0 && (hi < 0 || g_sItems[hi].kind != SK_HK)) { g_capture = -1; RegisterHotkeys(); }
         if (g_edit && (hi < 0 || g_sItems[hi].kind != SK_PRENAME)) CommitRename(true);
+        if (g_sddOpen >= 0 && (hi < 0 || (g_sItems[hi].kind != SK_DDBTN && g_sItems[hi].kind != SK_DDOPT))) {   // click outside an open list closes it
+            g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
+        }
         if (hi < 0) { InvalidateRect(h, nullptr, FALSE); return 0; }
         SItem it = g_sItems[hi];
         switch (it.kind) {
-        case SK_NAV: g_setPage = it.id; g_setScroll = 0; break;
+        case SK_NAV: g_setPage = it.id; g_setScroll = 0; g_sddOpen = -1; break;
+        case SK_THEME:
+            g_themeMode = it.id; SaveSettings();
+            ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); UpdateTrayIcon(); SettingsChanged();
+            break;
+        case SK_DDBTN: g_sddOpen = g_sddOpen == it.id ? -1 : it.id; InvalidateRect(h, nullptr, FALSE); return 0;
+        case SK_DDOPT: {
+            int dd = it.id / 100, k = it.id % 100;
+            if (dd == 1) { std::wstring id; if (k > 0 && k - 1 < (int)g_out.size()) id = g_out[k - 1].id; SetCallDevice(id); SaveSettings(); }
+            if (dd == 2) AudioRegSet(L"UserDuckingPreference", (DWORD)k);
+            g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
+        }
         case SK_SWITCH:
+            if (it.id == 10) { SetMulti(!g_multi); SettingsChanged(); }
+            else if (it.id == 11) g_autoSwitch = !g_autoSwitch;
+            else if (it.id == 12) AudioRegSet(L"AccessibilityMonoMixState", MonoOn() ? 0 : 1);
             if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
             else if (it.id == 3) g_restoreBright = !g_restoreBright;
@@ -3432,6 +3677,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_dragEl >= 0) { SetTimer(h, TIMER_AUDIODEBOUNCE, 300, nullptr); return 0; }
             LoadEndpoints(eRender, g_out);
             LoadEndpoints(eCapture, g_in);
+            AutoSwitchCheck();
             if (g_visible && g_tab == T_APPS) LoadApps();
             RestartRouter();
             UpdateTrayTip();
@@ -3773,6 +4019,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
 
     LoadEndpoints(eRender, g_out);
     LoadEndpoints(eCapture, g_in);
+    AutoSwitchCheck();   // remember what's connected now, so only new headphones trigger a switch
     RestartRouter();
     TrayAdd();
     UpdateTrayTip();
