@@ -43,8 +43,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.25.0"
-#define APP_VERNUM  ((1 << 16) | (25 << 8) | 0)
+#define APP_VERSION L"1.26.0"
+#define APP_VERNUM  ((1 << 16) | (26 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1699,15 +1699,17 @@ static void RegisterHotkeys() {
 }
 
 // ---------------------------------------------------------------- tray
+static HICON MakeGlyphIcon(Color c, int sz);
 static HICON MakeTrayIcon() {
     UINT dpi = GetDpiForSystem();
-    int sz = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    return MakeGlyphIcon(T.taskbarLight ? Color(255, 28, 28, 28) : Color(255, 255, 255, 255), GetSystemMetricsForDpi(SM_CXSMICON, dpi));
+}
+static HICON MakeGlyphIcon(Color c, int sz) {   // the mixer mark, one colour (tray and Settings title bar)
     Bitmap bmp(sz, sz, PixelFormat32bppARGB);
     {
         Graphics g(&bmp);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
         g.Clear(Color(0, 0, 0, 0));
-        Color c = T.taskbarLight ? Color(255, 28, 28, 28) : Color(255, 255, 255, 255);
         float s = sz / 16.f;
         Pen line(c, 1.3f * s); line.SetStartCap(LineCapRound); line.SetEndCap(LineCapRound);
         SolidBrush br(c);
@@ -3303,7 +3305,7 @@ static void OpenSettings(int page, bool newProfile) {
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
         RECT r = {0, 0, (LONG)S(820), (LONG)S(600)};
-        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;   // fixed size
+        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;   // fixed size, close button only
         AdjustWindowRectExForDpi(&r, style, FALSE, 0, dx);
         int w = r.right - r.left, hgt = r.bottom - r.top;
         int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2, y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - hgt) / 2;
@@ -3315,6 +3317,11 @@ static void OpenSettings(int page, bool newProfile) {
         g_set = CreateWindowExW(0, L"KnobSettings", L"Knob Settings", style, x, y, w, hgt, nullptr, nullptr, g_inst, nullptr);
         if (!g_set) return;
         ApplySettingsStyle();
+        // title bar shows the plain mixer mark in the text colour, like the panel's footer
+        static HICON titleIcon = nullptr;
+        if (titleIcon) DestroyIcon(titleIcon);
+        titleIcon = MakeGlyphIcon(g_setTheme.dark ? Color(255, 255, 255, 255) : Color(255, 28, 28, 28), GetSystemMetricsForDpi(SM_CXSMICON, dx));
+        SendMessageW(g_set, WM_SETICON, ICON_SMALL, (LPARAM)titleIcon);
     }
     g_setPage = page; g_setScroll = 0;
     ShowWindow(g_set, IsIconic(g_set) ? SW_RESTORE : SW_SHOW);
