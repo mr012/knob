@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.30.0"
-#define APP_VERNUM  ((1 << 16) | (30 << 8) | 0)
+#define APP_VERSION L"1.31.0"
+#define APP_VERNUM  ((1 << 16) | (31 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1511,7 +1511,7 @@ static void LoadTheme() {
     T.subtle2 = d ? Color(23, 255, 255, 255) : Color(15, 0, 0, 0);
     T.subtle3 = d ? Color(31, 255, 255, 255) : Color(23, 0, 0, 0);
     if (gl) {
-        T.surface = d ? Color(36, 24, 24, 24) : Color(40, 250, 250, 250);   // light wash; the acrylic tint does the rest
+        T.surface = d ? Color(40, 16, 16, 16) : Color(40, 250, 250, 250);   // light wash; the acrylic tint does the rest
         T.tabsBg = d ? Color(15, 255, 255, 255) : Color(10, 0, 0, 0);
         T.tabSel = d ? Color(33, 255, 255, 255) : Color(217, 255, 255, 255);
         T.badge = d ? Color(26, 255, 255, 255) : Color(15, 0, 0, 0);
@@ -2842,7 +2842,7 @@ static void ApplyStyle() {
     bool want = g_style == 1 && TransparencyOn();
     int none = 1; DwmSetWindowAttribute(g_hwnd, 38, &none, sizeof(none));   // no system backdrop; we blur ourselves
     // tint is AABBGGRR: dark ~45% #1C1C1C, light ~55% #F3F3F3
-    DWORD tint = T.dark ? 0x731C1C1C : 0x8CF3F3F3;
+    DWORD tint = T.dark ? 0xB8141414 : 0xA8F3F3F3;   // dark: ~72% #141414 so bright wallpapers can't wash it out; light: ~66%
     T.glass = want && SetAccent(g_hwnd, 4 /*ACCENT_ENABLE_ACRYLICBLURBEHIND*/, tint);
     if (!T.glass) SetAccent(g_hwnd, 0, 0);
     MARGINS m = T.glass ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
