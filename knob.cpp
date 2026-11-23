@@ -35,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
+#include <ctime>
 #include <map>
 #include <set>
 #include <string>
@@ -44,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.38.1"
+#define APP_VERSION L"1.39.0"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -76,17 +77,19 @@ static int SI();
 
 // global shortcuts
 // a short, fixed list of actions (no macros). None has keys until the user picks some.
-enum HkAction { HK_OPEN, HK_TABSOUND, HK_TABAPPS, HK_TABDISPLAY, HK_NEXTOUT, HK_VOLUP, HK_VOLDOWN, HK_MUTE, HK_MIC, HK_APPMUTE,
-                HK_BRIUP, HK_BRIDOWN, HK_NEXTPROF, HK_SCREENOFF, HK_SYNC, HK_COUNT };
+// The list in Settings is in this order; "Switch to" and "Apply profile" name a speaker or profile and can be added more than once.
+enum HkAction { HK_OPEN, HK_TABSOUND, HK_TABAPPS, HK_TABDISPLAY, HK_SWITCHTO, HK_NEXTOUT, HK_VOLUP, HK_VOLDOWN, HK_MUTE, HK_MIC, HK_APPMUTE,
+                HK_BRIUP, HK_BRIDOWN, HK_APPLYPROF, HK_SCREENOFF, HK_SYNC, HK_NEXTPROF, HK_COUNT };
+static const int HK_OFFERED = HK_NEXTPROF;   // actions offered under "Add a shortcut" (Next display profile only survives from older settings)
 struct HotKey { UINT mods; UINT vk; bool ok; };
-static HotKey g_hk[HK_COUNT];
-static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open or close Knob", L"Open on Sound", L"Open on Apps", L"Open on Display", L"Next speaker",
+struct Shortcut { int act; std::wstring param; HotKey k; };
+static std::vector<Shortcut> g_sc;   // one row each in Settings; nothing is set until the user adds it
+static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open or close Knob", L"Open on Sound", L"Open on Apps", L"Open on Display", L"Switch to", L"Next speaker",
     L"Volume up", L"Volume down", L"Mute or unmute", L"Mute microphone", L"Mute the app in front", L"Brightness up", L"Brightness down",
-    L"Next display profile", L"Turn off displays", L"Run Auto sync"};
-static const wchar_t* HK_KEYS[HK_COUNT] = {L"open", L"tabsound", L"tabapps", L"tabdisplay", L"nextout", L"volup", L"voldown", L"mute", L"mic",
-    L"appmute", L"briup", L"bridown", L"nextprof", L"screenoff", L"sync"};
-static const HotKey HK_DEFAULT[HK_COUNT] = {};   // no shortcut until the user picks one
-static bool HkShown(int) { return false; }   // a shortcut has a row only once it has keys (or is waiting for them); delete removes the row
+    L"Apply profile", L"Turn off displays", L"Run Auto sync", L"Next display profile"};
+static const wchar_t* HK_KEYS[HK_COUNT] = {L"open", L"tabsound", L"tabapps", L"tabdisplay", L"switchto", L"nextout", L"volup", L"voldown", L"mute", L"mic",
+    L"appmute", L"briup", L"bridown", L"applyprof", L"screenoff", L"sync", L"nextprof"};
+static int HkParamKind(int a) { return a == HK_SWITCHTO ? 1 : a == HK_APPLYPROF ? 2 : 0; }   // 1 a speaker, 2 a profile
 static bool g_noSave = false, g_restartAfterExit = false;
 static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
 static int g_openOn = 0;             // where the panel opens: 0 main display (like Windows' own flyouts), 1 the screen with the mouse
@@ -115,6 +118,8 @@ static bool g_restoreAllNext = false;                               // after res
 struct NightCfg { bool on = false; int str = 40; };
 static std::map<std::wstring, NightCfg> g_night;   // monitor name -> night light
 static int g_nightAuto = 0;                        // 0 whenever it's switched on, 1 evenings only (7 pm - 7 am)
+static double g_geoLat = 999, g_geoLon = 999; static long long g_geoWhen = 0;   // rough location for "Sunset to sunrise" (2 decimals)
+static int g_newSeen = 0;   // "NEW" tags in Settings: a bit per setting, cleared once you've used it
 
 static int g_dpi = 96;
 static float g_scale = 1.f;
@@ -181,6 +186,8 @@ struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
 
 static IMMDeviceEnumerator* g_enum;
+static bool g_demo = false;
+static std::wstring g_demoDefault;   // demo: which speaker "Windows" plays on   // --demo: the design's sample devices, apps and screens (for side-by-side checks)
 static std::vector<Endpoint> g_out, g_in;
 static std::vector<AppGroup> g_apps;
 static std::map<std::wstring, ProcInfo> g_procCache;
@@ -317,7 +324,10 @@ static void LoadSettings() {
     g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
     g_openOn = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"openon", 0, g_iniPath.c_str())));
     g_autoSwitch = GetPrivateProfileIntW(L"main", L"autoswitch", 1, g_iniPath.c_str()) != 0;
-    g_nightAuto = GetPrivateProfileIntW(L"main", L"nightauto", 0, g_iniPath.c_str()) ? 1 : 0;
+    g_nightAuto = std::min(2, (int)GetPrivateProfileIntW(L"main", L"nightauto", 0, g_iniPath.c_str()));
+    g_newSeen = (int)GetPrivateProfileIntW(L"main", L"newseen", 0, g_iniPath.c_str());
+    { wchar_t b[64]; GetPrivateProfileStringW(L"main", L"geo", L"", b, 64, g_iniPath.c_str()); double la, lo; long long w;
+      if (swscanf(b, L"%lf,%lf,%lld", &la, &lo, &w) == 3) { g_geoLat = la; g_geoLon = lo; g_geoWhen = w; } }
     { wchar_t cb[512] = {}; GetPrivateProfileStringW(L"main", L"calldev", L"", cb, 512, g_iniPath.c_str()); g_callDev = cb; }
     {   // sections stored as key=value lists
         auto readSection = [&](const wchar_t* sec, auto fn) {
@@ -337,13 +347,28 @@ static void LoadSettings() {
     g_step = (int)GetPrivateProfileIntW(L"main", L"step", 5, g_iniPath.c_str());
     if (g_step != 2 && g_step != 5 && g_step != 10) g_step = 5;
     bool oldDefaults = GetPrivateProfileIntW(L"main", L"settingsver", 1, g_iniPath.c_str()) < 2;
-    for (int i = 0; i < HK_COUNT; i++) {
-        wchar_t b[64];
-        g_hk[i] = HK_DEFAULT[i];
-        if (GetPrivateProfileStringW(L"hotkeys", HK_KEYS[i], L"", b, 64, g_iniPath.c_str()) && b[0]) {
-            unsigned mods = 0, vk = 0;
-            if (swscanf(b, L"%u,%u", &mods, &vk) == 2) { g_hk[i].mods = mods; g_hk[i].vk = vk; }
-            if (oldDefaults && mods == (MOD_CONTROL | MOD_ALT) && vk == 'L') { g_hk[i].mods = 0; g_hk[i].vk = 0; }   // drop the old built-in Ctrl+Alt+L
+    g_sc.clear();
+    int nsc = (int)GetPrivateProfileIntW(L"shortcuts", L"count", -1, g_iniPath.c_str());
+    if (nsc >= 0) {
+        for (int i = 0; i < nsc && i < 64; i++) {
+            wchar_t b[512];
+            if (!GetPrivateProfileStringW(L"shortcuts", (L"s" + std::to_wstring(i)).c_str(), L"", b, 512, g_iniPath.c_str())) continue;
+            std::wstring s = b; Shortcut x{-1, L"", {0, 0, false}};
+            size_t p1 = s.find(L'|'), p2 = p1 == std::wstring::npos ? p1 : s.find(L'|', p1 + 1), p3 = p2 == std::wstring::npos ? p2 : s.find(L'|', p2 + 1);
+            if (p3 == std::wstring::npos) continue;
+            std::wstring key = s.substr(0, p1);
+            for (int a = 0; a < HK_COUNT; a++) if (key == HK_KEYS[a]) x.act = a;
+            if (x.act < 0) continue;
+            x.k.mods = (UINT)_wtoi(s.substr(p1 + 1, p2 - p1 - 1).c_str()); x.k.vk = (UINT)_wtoi(s.substr(p2 + 1, p3 - p2 - 1).c_str());
+            x.param = s.substr(p3 + 1);
+            g_sc.push_back(x);
+        }
+    } else {   // settings from before 1.39: one fixed key per action
+        for (int a = 0; a < HK_COUNT; a++) {
+            wchar_t b[64]; unsigned mods = 0, vk = 0;
+            if (!GetPrivateProfileStringW(L"hotkeys", HK_KEYS[a], L"", b, 64, g_iniPath.c_str()) || !b[0] || swscanf(b, L"%u,%u", &mods, &vk) != 2 || !vk) continue;
+            if (oldDefaults && mods == (MOD_CONTROL | MOD_ALT) && vk == 'L') continue;   // the old built-in Ctrl+Alt+L
+            g_sc.push_back({a, L"", {mods, vk, false}});
         }
     }
     int np = (int)GetPrivateProfileIntW(L"profiles", L"count", -1, g_iniPath.c_str());
@@ -378,7 +403,9 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"theme", std::to_wstring(g_themeMode).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"openon", std::to_wstring(g_openOn).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
-    WritePrivateProfileStringW(L"main", L"nightauto", g_nightAuto ? L"1" : L"0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"nightauto", std::to_wstring(g_nightAuto).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"newseen", std::to_wstring(g_newSeen).c_str(), g_iniPath.c_str());
+    if (g_geoLat < 900) { wchar_t b[64]; swprintf(b, 64, L"%.2f,%.2f,%lld", g_geoLat, g_geoLon, g_geoWhen); WritePrivateProfileStringW(L"main", L"geo", b, g_iniPath.c_str()); }
     { std::wstring n; for (auto& kv : g_night) { n += kv.first + L"=" + (kv.second.on ? L"1," : L"0,") + std::to_wstring(kv.second.str); n.push_back(0); } n.push_back(0);
       WritePrivateProfileSectionW(L"nightlight", n.c_str(), g_iniPath.c_str()); }
     WritePrivateProfileStringW(L"main", L"calldev", g_callDev.c_str(), g_iniPath.c_str());
@@ -399,8 +426,12 @@ static void SaveSettings() {
         WritePrivateProfileSectionW(L"lastdisplay", l.c_str(), g_iniPath.c_str());
     }
     WritePrivateProfileStringW(L"main", L"step", std::to_wstring(g_step).c_str(), g_iniPath.c_str());
-    for (int i = 0; i < HK_COUNT; i++)
-        WritePrivateProfileStringW(L"hotkeys", HK_KEYS[i], (std::to_wstring(g_hk[i].mods) + L"," + std::to_wstring(g_hk[i].vk)).c_str(), g_iniPath.c_str());
+    WritePrivateProfileSectionW(L"hotkeys", nullptr, g_iniPath.c_str());     // the old format
+    WritePrivateProfileSectionW(L"shortcuts", L"\0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"shortcuts", L"count", std::to_wstring(g_sc.size()).c_str(), g_iniPath.c_str());
+    for (size_t i = 0; i < g_sc.size(); i++)
+        WritePrivateProfileStringW(L"shortcuts", (L"s" + std::to_wstring(i)).c_str(),
+            (std::wstring(HK_KEYS[g_sc[i].act]) + L"|" + std::to_wstring(g_sc[i].k.mods) + L"|" + std::to_wstring(g_sc[i].k.vk) + L"|" + g_sc[i].param).c_str(), g_iniPath.c_str());
     WritePrivateProfileSectionW(L"profiles", L"\0", g_iniPath.c_str());   // rewrite the whole section
     WritePrivateProfileStringW(L"profiles", L"count", std::to_wstring(g_prof.size()).c_str(), g_iniPath.c_str());
     for (int p = 0; p < (int)g_prof.size(); p++) {
@@ -583,8 +614,22 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
     if (!ifc.empty() && Lower(ifc) != Lower(nm)) { e.name = ifc; e.detail = nm; }
     else { e.name = nm; e.detail = L""; }
 }
+static void DemoEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
+    struct D { const wchar_t *n, *d; int kind, icon; bool bt; int lvl; bool def; };
+    static const D out[] = {{L"Realtek(R) Audio", L"Speakers", DK_SPEAKER, DI_LAPTOP, false, 17, true}, {L"Arctis Nova 5", L"Headphones", DK_HEADPHONES, DI_HEADPHONES, false, 100, false},
+        {L"realme Brick Speaker", L"Speakers", DK_SPEAKER, DI_SPEAKER, true, 60, false}, {L"Nothing CMF", L"CMF Buds Pro 2", DK_HEADPHONES, DI_EARBUDS, true, 70, false},
+        {L"27E2N1100", L"NVIDIA High Definition Audio", DK_DISPLAY, DI_DISPLAY, false, 50, false}, {L"CABLE Input", L"VB-Audio Virtual Cable", DK_SPEAKER, DI_VIRTUAL, false, 100, false}};
+    static const D in[] = {{L"Realtek(R) Audio", L"Microphone Array", DK_MIC, DI_MIC, false, 100, true}, {L"Arctis Nova 5", L"Headset Microphone", DK_HEADPHONES, DI_HEADPHONES, false, 85, false}};
+    bool o = flow == eRender; const D* L = o ? out : in; int n = o ? 6 : 2;
+    for (int i = 0; i < n; i++) { Endpoint e; e.id = (o ? L"demo-out-" : L"demo-in-") + std::to_wstring(i); e.name = L[i].n; e.detail = L[i].d; e.kind = L[i].kind; e.icon = L[i].icon;
+        e.bt = L[i].bt; e.level = L[i].lvl / 100.f; e.isDefault = L[i].def; v.push_back(e); }
+    static bool once = false;
+    if (o && !once) { once = true; g_mirror = {L"demo-out-1"}; g_delay[L"demo-out-1"] = -10; g_delay[L"demo-out-2"] = -200; }   // the design's state: two speakers together, synced
+    if (o && !g_demoDefault.empty()) for (auto& e : v) e.isDefault = e.id == g_demoDefault;
+}
 static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     FreeEndpoints(v);
+    if (g_demo) { DemoEndpoints(flow, v); return; }
     if (!g_enum) return;
     std::wstring defId;
     IMMDevice* d = nullptr;
@@ -638,6 +683,7 @@ static void RefreshEndpointLevels(std::vector<Endpoint>& v) {
 }
 
 static void SetDefaultDevice(const std::wstring& id) {
+    if (g_demo) { g_demoDefault = id; return; }
     IPolicyConfig* pc = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_PolicyConfigClient, nullptr, CLSCTX_ALL, IID_IPolicyConfig, (void**)&pc)) && pc) {
         pc->SetDefaultEndpoint(id.c_str(), eConsole);
@@ -744,6 +790,14 @@ static void RestartAppRouters();
 static std::vector<std::wstring> AppRoutes(const AppGroup& a);   // every speaker an app plays on (empty = with everything else)
 static void LoadApps() {
     FreeApps();
+    if (g_demo) {
+        struct D { const wchar_t* n; int lvl; bool sys; } L[] = {{L"Brave", 100, false}, {L"Discord", 72, false}, {L"Spotify", 85, false}, {L"System sounds", 60, true}};
+        DWORD pid = 9000;
+        for (auto& d : L) { AppGroup a; a.key = d.sys ? L"*system" : ToLower(d.n); a.name = d.n; a.system = d.sys; a.level = d.lvl / 100.f; if (!d.sys) a.pids.push_back(pid++); g_apps.push_back(a); }
+        g_apps[1].outId = L"demo-out-1"; g_apps[2].outId = L"demo-out-0";   // Discord on the headphones, Spotify on the laptop and the Brick
+        AppExtra x; x.pid = g_apps[2].pids[0]; x.primary = L"demo-out-0"; x.ids = {L"demo-out-2"}; g_appExtra[g_apps[2].key] = x;
+        return;
+    }
     if (!g_enum) return;
     std::map<std::wstring, size_t> idx;
     DWORD self = GetCurrentProcessId();
@@ -826,6 +880,7 @@ static void LoadApps() {
 }
 
 static bool AppPlaying(const AppGroup& a) {
+    if (g_demo) return a.name == L"Brave" || a.name == L"Spotify";
     auto it = g_live.find(a.key);
     return it != g_live.end() && GetTickCount() - it->second.lastActive < 800;
 }
@@ -1021,6 +1076,7 @@ static int DelayFor(const std::wstring& id) {   // how far a speaker is held bac
     auto it = g_delay.find(id); return it == g_delay.end() ? 0 : it->second;
 }
 static void RestartAppRouters() {
+    if (g_demo) return;
     for (auto* r : g_appRouters) InterlockedExchange(&r->stop, 1);
     for (auto* r : g_appRouters) { if (r->thread) { WaitForSingleObject(r->thread, 3000); CloseHandle(r->thread); } delete r; }
     g_appRouters.clear();
@@ -1095,6 +1151,7 @@ static void OneSpeaker() {   // back to a single speaker: every app and Windows 
     UpdateTrayTip();
 }
 static void RestartMirror() {
+    if (g_demo) return;
     if (g_calibrating) { g_routerPending = true; return; }   // auto sync is using the router; restart when it finishes
     StopRouter();
     int di = DefaultOut();
@@ -1117,7 +1174,13 @@ struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstrin
 static int g_calPass = 0;
 static bool g_calApps = false;   // this run also measures speakers only apps play on: no main-speaker switch, delays may go below 0   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
-static bool g_calShow = false;   // the panel's Auto sync card (while measuring, then the result)
+static bool g_calShow = false;   // the panel's Auto sync card: ask, then measuring, then the result
+static bool g_calAsk = false;    // showing "Pause music and keep the room quiet" before it starts
+static volatile LONG g_calCancel = 0;
+static int g_calK = 0;           // which speaker is chirping now
+static std::vector<std::wstring> g_calIds, g_calNames;
+static std::map<std::wstring, int> g_calHeard;   // speaker -> what the microphone measured (ms), this run
+static std::map<std::wstring, int> g_delayMeasured;   // what Auto sync set, so a tweak can be reset
 static const UINT32 CAL_RATE = 48000;
 
 static const GUID KNOB_IID_IAudioClient2 = {0x726778cd, 0xf60a, 0x4eda, {0x82, 0xde, 0xe4, 0x76, 0x10, 0xcd, 0x78, 0xaa}};
@@ -1241,12 +1304,15 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
         int ok = 0;
         int worst = 0; std::wstring worstId, worstName;   // most negative delay = slowest speaker
         for (int k = 0; k < (int)ts->size(); k++) {
+            if (g_calCancel) { res->status = L"Stopped"; res->delays.clear(); ok = 0; break; }
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 33, k, 0);   // the panel shows which speaker is chirping
             CalTarget& t = (*ts)[k];
             double off = 0; int r = CalRound(outDev, micDev, k, chirp, off);
             if (r == 0) {
                 double oSecond = 0;   // measure again and average when the two agree
                 if (CalRound(outDev, micDev, k, chirp, oSecond) == 0 && fabs(oSecond - off) < 15) off = (off + oSecond) / 2;
                 int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 34, k, (LPARAM)(INT_PTR)lround(fabs(off)));
                 if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
                 if (nd < -10 && g_calPass) notes += t.name + L" couldn't be lined up fully. ";
                 nd = g_calApps ? std::max(-500, std::min(500, nd)) : std::max(0, std::min(500, nd));   // app copies: keep "faster than main" too
@@ -1256,6 +1322,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
             else if (r == 3) notes += L"Couldn't use " + t.name + L". ";
             else notes += L"Couldn't hear " + t.name + L". ";
         }
+        if (res->status == L"Stopped") break;
         if (res->status.empty() && worst < -10 && !g_calPass && !g_calApps) {   // let Knob make the slowest speaker the main output, then sync again
             res->swapTo = worstId; res->swapName = worstName; res->delays.clear();
             res->status = L"Syncing\u2026 keep the room quiet";   // the slowest speaker quietly becomes the one Windows plays on, then a second pass
@@ -1301,7 +1368,10 @@ static void StartAutoSync() {
         ts->push_back({t.id, name, t.delayMs});
     }
     InterlockedExchange(&g_calibrating, 1);
+    InterlockedExchange(&g_calCancel, 0);
     g_calStatus = L"Listening… keep the room quiet";
+    g_calIds.clear(); g_calNames.clear(); g_calK = 0; if (!g_calPass) g_calHeard.clear();
+    for (auto& t : *ts) { g_calIds.push_back(t.id); g_calNames.push_back(t.name); }
     HANDLE h = CreateThread(nullptr, 0, CalibrateProc, ts, 0, nullptr);
     if (h) CloseHandle(h); else { delete ts; InterlockedExchange(&g_calibrating, 0); g_calStatus = L"Couldn't start"; }
 }
@@ -1715,9 +1785,52 @@ static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else sh
 
 // night light: a warm tint through the screen's gamma ramp; strength 0-100
 static std::set<std::wstring> g_gammaSet;          // GDI sources Knob has tinted (put back on exit)
+// "Sunset to sunrise": where you are comes from your internet address (looked up once a week, only with that schedule on)
+static bool HttpGet(const std::wstring& url, std::string& out, const std::wstring& saveTo, DWORD* status);
+static DWORD WINAPI GeoProc(void*) {
+    std::string js;
+    if (HttpGet(L"https://ipapi.co/json/", js, L"", nullptr)) {
+        auto num = [&](const char* k) { size_t p = js.find(std::string("\"") + k + "\""); if (p == std::string::npos) return 999.0; p = js.find(':', p); return p == std::string::npos ? 999.0 : atof(js.c_str() + p + 1); };
+        double la = num("latitude"), lo = num("longitude");
+        if (la > -90 && la < 90 && lo > -180 && lo < 180) { g_geoLat = la; g_geoLon = lo; g_geoWhen = (long long)time(nullptr); PostMessageW(g_hwnd, WM_APP + 31, 0, 0); }
+    }
+    return 0;
+}
+static void GeoRefresh() {
+    static DWORD last = 0;
+    if (g_nightAuto != 2 || (g_geoLat < 900 && time(nullptr) - g_geoWhen < 7 * 86400)) return;
+    if (last && GetTickCount() - last < 3600 * 1000) return;   // at most once an hour when it fails
+    last = GetTickCount();
+    HANDLE t = CreateThread(nullptr, 0, GeoProc, nullptr, 0, nullptr); if (t) CloseHandle(t);
+}
+static int SunMinutes(bool rise) {   // local minutes after midnight of sunrise or sunset today; -1 none (polar day/night)
+    SYSTEMTIME st; GetLocalTime(&st);
+    static const int cum[12] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    int N = cum[st.wMonth - 1] + st.wDay + ((st.wMonth > 2 && st.wYear % 4 == 0) ? 1 : 0);
+    const double D = 3.14159265358979 / 180;
+    double lngH = g_geoLon / 15, t = N + ((rise ? 6 : 18) - lngH) / 24, M = 0.9856 * t - 3.289;
+    double L = fmod(M + 1.916 * sin(M * D) + 0.020 * sin(2 * M * D) + 282.634 + 720, 360.0);
+    double RA = fmod(atan(0.91764 * tan(L * D)) / D + 720, 360.0);
+    RA += floor(L / 90) * 90 - floor(RA / 90) * 90; RA /= 15;
+    double sinDec = 0.39782 * sin(L * D), cosDec = cos(asin(sinDec));
+    double cosH = (cos(90.833 * D) - sinDec * sin(g_geoLat * D)) / (cosDec * cos(g_geoLat * D));
+    if (cosH > 1 || cosH < -1) return -1;
+    double H = (rise ? 360 - acos(cosH) / D : acos(cosH) / D) / 15;
+    double UT = fmod(H + RA - 0.06571 * t - 6.622 - lngH + 48, 24.0);
+    SYSTEMTIME u; GetSystemTime(&u);
+    FILETIME fl, fu; SystemTimeToFileTime(&st, &fl); SystemTimeToFileTime(&u, &fu);
+    ULARGE_INTEGER ql, qu; ql.LowPart = fl.dwLowDateTime; ql.HighPart = fl.dwHighDateTime; qu.LowPart = fu.dwLowDateTime; qu.HighPart = fu.dwHighDateTime;
+    double off = ((long long)ql.QuadPart - (long long)qu.QuadPart) / 600000000.0;   // minutes ahead of UTC
+    return (int)fmod(UT * 60 + off + 2880, 1440.0);
+}
 static bool NightActive(const std::wstring& name) {
     auto it = g_night.find(name); if (it == g_night.end() || !it->second.on || it->second.str <= 0) return false;
-    if (g_nightAuto == 1) { SYSTEMTIME t; GetLocalTime(&t); return t.wHour >= 19 || t.wHour < 7; }
+    SYSTEMTIME t; GetLocalTime(&t); int now = t.wHour * 60 + t.wMinute;
+    if (g_nightAuto == 2 && g_geoLat < 900) {   // sunset to sunrise
+        int rise = SunMinutes(true), set = SunMinutes(false);
+        if (rise >= 0 && set >= 0) return set > rise ? (now >= set || now < rise) : (now >= set && now < rise);
+    }
+    if (g_nightAuto >= 1) return t.wHour >= 19 || t.wHour < 7;   // evenings (and sunset to sunrise until the location is known)
     return true;
 }
 static bool SetGamma(const std::wstring& gdi, int str) {
@@ -1781,6 +1894,7 @@ struct Theme {
     bool dark = true, taskbarLight = false, glass = false;   // glass = Glass style is active (Windows 11 acrylic available)
     Color surface, t1, t2, t3, track, thumb, subtle, subtle2, subtle3, accent, onAccent;
     Color tabsBg, tabSel, badge, master, hover, ddBtn, ddBtnHover, valBg, rail, popup;
+    Color selRow[2];   // selected row, at rest and hovered
 } T;
 
 static Color WithAlpha(Color c, int a) { return Color((BYTE)a, c.GetR(), c.GetG(), c.GetB()); }
@@ -1829,8 +1943,8 @@ static void LoadTheme() {
     T.subtle = d ? Color(15, 255, 255, 255) : Color(9, 0, 0, 0);
     T.subtle2 = d ? Color(23, 255, 255, 255) : Color(15, 0, 0, 0);
     T.subtle3 = d ? Color(31, 255, 255, 255) : Color(23, 0, 0, 0);
-    if (gl) {
-        T.surface = d ? Color(40, 16, 16, 16) : Color(40, 250, 250, 250);   // light wash; the acrylic tint does the rest
+    {   // the same elements in both styles (as in the design); Solid only swaps the surface
+        T.surface = gl ? (d ? Color(40, 16, 16, 16) : Color(40, 250, 250, 250)) : (d ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243));
         T.tabsBg = d ? Color(15, 255, 255, 255) : Color(10, 0, 0, 0);
         T.tabSel = d ? Color(33, 255, 255, 255) : Color(217, 255, 255, 255);
         T.badge = d ? Color(26, 255, 255, 255) : Color(15, 0, 0, 0);
@@ -1841,17 +1955,18 @@ static void LoadTheme() {
         T.valBg = d ? Color(18, 255, 255, 255) : Color(13, 0, 0, 0);
         T.rail = d ? Color(41, 255, 255, 255) : Color(36, 0, 0, 0);
         T.popup = d ? Color(240, 40, 40, 40) : Color(245, 249, 249, 249);
-    } else {
-        T.surface = d ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243);
-        T.tabsBg = T.subtle; T.tabSel = d ? T.subtle3 : Color(255, 255, 255, 255);
-        T.badge = T.subtle2; T.master = T.subtle; T.hover = T.subtle;
-        T.ddBtn = T.subtle2; T.ddBtnHover = T.subtle3; T.valBg = Color(0, 0, 0, 0); T.rail = T.track;
-        T.popup = d ? Color(255, 44, 44, 44) : Color(255, 249, 249, 249);
+        auto mixW = [&](float wa, float wb, Color b) {   // color-mix(accent wa%, b) the way the design's CSS does it
+            float ab = b.GetA() / 255.f, al = wa + wb * ab, k = wa / al;
+            return Color((BYTE)lroundf(al * 255), (BYTE)lroundf(T.accent.GetR() * k + b.GetR() * (1 - k)), (BYTE)lroundf(T.accent.GetG() * k + b.GetG() * (1 - k)), (BYTE)lroundf(T.accent.GetB() * k + b.GetB() * (1 - k)));
+        };
+        T.selRow[0] = d ? mixW(.07f, .93f, Color(15, 255, 255, 255)) : mixW(.08f, .92f, Color(102, 255, 255, 255));
+        T.selRow[1] = d ? mixW(.10f, .90f, Color(23, 255, 255, 255)) : mixW(.11f, .89f, Color(115, 255, 255, 255));
+        if (!gl) T.popup = d ? Color(255, 44, 44, 44) : Color(255, 249, 249, 249);
     }
 }
 
 static FontFamily *g_famText, *g_famSemi, *g_famIcon;
-static Font *g_fName, *g_fName600, *g_fSmall, *g_fSmall600, *g_fH3, *g_fTab, *g_fTab600, *g_fIcon, *g_fIconS, *g_fNum;
+static Font *g_fName, *g_fName600, *g_fSmall, *g_fSmall600, *g_fH3, *g_fTab, *g_fTab600, *g_fIcon, *g_fIconS, *g_fNum, *g_f11, *g_f11s;
 
 static FontFamily* PickFamily(std::initializer_list<const wchar_t*> names) {
     for (auto n : names) { FontFamily* f = new FontFamily(n); if (f->IsAvailable()) return f; delete f; }
@@ -1863,7 +1978,7 @@ static void InitFonts() {
         g_famSemi = PickFamily({L"Segoe UI Semibold", L"Segoe UI Variable Text", L"Segoe UI", L"Tahoma"});
         g_famIcon = PickFamily({L"Segoe Fluent Icons", L"Segoe MDL2 Assets"});
     }
-    for (Font** f : {&g_fName, &g_fName600, &g_fSmall, &g_fSmall600, &g_fH3, &g_fTab, &g_fTab600, &g_fIcon, &g_fIconS, &g_fNum}) { delete *f; *f = nullptr; }
+    for (Font** f : {&g_fName, &g_fName600, &g_fSmall, &g_fSmall600, &g_fH3, &g_fTab, &g_fTab600, &g_fIcon, &g_fIconS, &g_fNum, &g_f11, &g_f11s}) { delete *f; *f = nullptr; }
     g_fName = new Font(g_famText, S(13), FontStyleRegular, UnitPixel);
     g_fName600 = new Font(g_famSemi, S(13), FontStyleRegular, UnitPixel);
     g_fSmall = new Font(g_famText, S(11.5f), FontStyleRegular, UnitPixel);
@@ -1874,6 +1989,8 @@ static void InitFonts() {
     g_fIcon = new Font(g_famIcon, S(18), FontStyleRegular, UnitPixel);
     g_fIconS = new Font(g_famIcon, S(16), FontStyleRegular, UnitPixel);
     g_fNum = new Font(g_famSemi, S(10), FontStyleRegular, UnitPixel);
+    g_f11 = new Font(g_famText, S(11), FontStyleRegular, UnitPixel);    // value pills, chips
+    g_f11s = new Font(g_famSemi, S(11), FontStyleRegular, UnitPixel);   // refresh rate, delay
 }
 
 // Segoe Fluent Icons / MDL2 glyphs
@@ -1887,10 +2004,10 @@ enum : wchar_t {
 // ---------------------------------------------------------------- layout model
 enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
-static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
+static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 78, ROWGAP = 3;
 static std::vector<El> g_els;
 static int g_W = 0, g_H = 0;
 static float g_contentH = 0;
@@ -1907,10 +2024,10 @@ static int SI() { return g_view == 1 ? 3 : g_tab; }
 static float PaneTop() { return S(TABH); }
 static float PaneBottom() { return g_H - S(FTR); }
 static float PaneX() { return S(12); }
-static float PaneW() { return g_W - S(24); }
+static float PaneW() { return g_W - S(34); }   // rows are 346 wide: the pane keeps a 10 px gutter for its scrollbar, as in the design
 
 [[maybe_unused]] static float ProfileRowHeight(float w);
-static const float APPLINE = 20;
+static const float APPLINE = 22;
 static const int SP_SOUND_PAGE = 1;   // Settings › Sound (where the routing lives)
 static bool OutHasApps(int i) {   // some app is sent to this speaker on its own
     for (auto& a : g_apps) { if (a.system) continue; auto r = AppRoutes(a); if (std::find(r.begin(), r.end(), g_out[i].id) != r.end()) return true; }
@@ -1920,19 +2037,20 @@ static void Layout() {
     g_els.clear();
     float x = PaneX(), w = PaneW();
     float y = PaneTop() + S(6) - g_scroll[SI()];
-    bool first = true;
-    auto h3 = [&](const wchar_t* t) { y += first ? S(10) : S(18); g_els.push_back({E_H3, -1, RectF(x + S(10), y, w - S(20), S(14)), t}); y += S(14) + S(8); first = false; };
-    auto row = [&](ElKind k, int i) { g_els.push_back({k, i, RectF(x, y, w, S(ROWH)), L""}); y += S(ROWH) + S(ROWGAP); first = false; };
+    bool prevRow = false;
+    // section label: 18 above, 8 below (the design's h3); h is taller where buttons sit beside it
+    auto h3 = [&](const wchar_t* t, float h = 13) { y += S(18); g_els.push_back({E_H3, -1, RectF(x + S(10), y, w - S(16), S(h)), t}); y += S(h) + S(8); prevRow = false; };
+    auto row = [&](ElKind k, int i) { if (prevRow) y += S(ROWGAP); g_els.push_back({k, i, RectF(x, y, w, S(ROWH)), L""}); y += S(ROWH); prevRow = true; };
     if (g_view == 1) {
         h3(L"KEYBOARD SHORTCUTS");
-        for (int i = 0; i < HK_COUNT; i++) { g_els.push_back({E_HK, i, RectF(x, y, w, S(44)), L""}); y += S(44) + S(2); }
+        for (int i = 0; i < (int)g_sc.size(); i++) { g_els.push_back({E_HK, i, RectF(x, y, w, S(44)), L""}); y += S(44) + S(2); }
         h3(L"OPTIONS");
         g_els.push_back({E_OSDROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
         g_els.push_back({E_STEPROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
         g_els.push_back({E_RESETROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
         g_els.push_back({E_NOTE, -1, RectF(x + S(10), y + S(4), w - S(20), S(34)), L"Click a shortcut, then press the new keys. Esc cancels, Backspace clears it."}); y += S(40);
     } else if (g_tab == T_SOUND) {
-        h3(L"OUTPUT");
+        h3(L"OUTPUT", 24);
         for (int i = 0; i < (int)g_out.size(); i++) {
             row(E_OUT, i);
             if (OutHasApps(i)) { g_els.back().r.Height += S(APPLINE); y += S(APPLINE); }   // a line of app icons under the name
@@ -1941,12 +2059,12 @@ static void Layout() {
         for (int i = 0; i < (int)g_in.size(); i++) row(E_IN, i);
     } else if (g_tab == T_APPS) {
         row(E_MASTER, 0);
-        h3(L"APPS");
+        h3(L"APPS", 18);
         for (int i = 0; i < (int)g_apps.size(); i++) row(E_APP, i);
         if (g_apps.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y, w, S(24)), L"No apps are using sound right now"}); y += S(30); }
     } else {
-        y += S(10);
-        g_els.push_back({E_DTOP, 0, RectF(x, y, w, S(40)), L""}); y += S(40);   // profile list + turn off displays
+        y += S(14);
+        g_els.push_back({E_DTOP, 0, RectF(x, y, w, S(32)), L""}); y += S(32);   // profile list + turn off displays
         h3(L"DISPLAYS");
         if (!g_dispStatus.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y, w - S(20), S(20)), g_dispStatus}); y += S(24); }
         if (g_mons.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y + S(6), w, S(24)), g_monsLoaded ? L"No displays found" : L"Looking for displays…"}); y += S(36); }
@@ -1959,7 +2077,7 @@ static void Layout() {
             if (dimRow) { g_els.push_back({E_MONDIM, i, RectF(x, y, w, S(36)), L""}); y += S(36); }   // only at 0%: go darker than the monitor can
             if (g_mons[i].hasCon) { g_els.push_back({E_MONC, i, RectF(x, y, w, S(36)), L""}); y += S(36); }
             if (g_night.count(g_mons[i].name) && g_night[g_mons[i].name].on) { g_els.push_back({E_MONNL, i, RectF(x, y, w, S(36)), L""}); y += S(36); }   // night light strength
-            g_els.push_back({E_MONO, i, RectF(x, y + S(2), w, S(36)), L""}); y += S(40);
+            g_els.push_back({E_MONO, i, RectF(x, y, w, S(36)), L""}); y += S(36);
             y += S(2);
         }
     }
@@ -1972,13 +2090,15 @@ static void ClampScroll() {
     g_scroll[SI()] = std::max(0.f, std::min(g_scroll[SI()], mx));
 }
 
-// row geometry (row padding 6 6 4 8; identity line 30; control line 36)
-static float RowCy1(const El& e) { return e.r.Y + S(21); }
-static float RowCy2(const El& e) { return e.r.Y + e.r.Height - S(ROWH - 54); }
-static RectF CtlMute(const El& e, float cy) { return RectF(e.r.X + S(6), cy - S(16), S(32), S(32)); }
-static RectF CtlSlider(const El& e, float cy) { float l = e.r.X + S(48), r = e.r.X + e.r.Width - S(6) - S(40) - S(10); return RectF(l, cy - S(16), r - l, S(32)); }
-static RectF CtlVal(const El& e, float cy) { return RectF(e.r.X + e.r.Width - S(6) - S(40), cy - S(10), S(40), S(20)); }
+// row geometry, as in the design: padding 7 8 5 10; name line 30; control line 36
 static bool IsRowKind(ElKind k) { return k == E_OUT || k == E_IN || k == E_MASTER || k == E_APP; }
+static float RowCy1(const El& e) { return e.r.Y + S(22); }
+static float RowCy2(const El& e) { return e.r.Y + e.r.Height - S(23); }
+static float CtlPadL(const El& e) { return IsRowKind(e.k) ? S(8) : S(6); }    // rows sit 2 px further in than the display lines
+static float CtlPadR(const El& e) { return IsRowKind(e.k) ? S(8) : S(6); }
+static RectF CtlMute(const El& e, float cy) { return RectF(e.r.X + CtlPadL(e), cy - S(16), S(32), S(32)); }
+static RectF CtlVal(const El& e, float cy) { return RectF(e.r.X + e.r.Width - CtlPadR(e) - S(40), cy - S(10), S(40), S(20)); }
+static RectF CtlSlider(const El& e, float cy) { float l = e.r.X + CtlPadL(e) + S(42), r = CtlVal(e, cy).X - S(12); return RectF(l, cy - S(16), r - l, S(32)); }
 static float SliderCy(const El& e) { return IsRowKind(e.k) ? RowCy2(e) : e.r.Y + e.r.Height / 2; }
 
 static RectF TabRect(int i) {
@@ -1992,32 +2112,49 @@ static RectF MicAllRect() { RectF r = RefreshRect(); return RectF(r.X - S(10) - 
 static int g_delayOpen = -1;     // output whose sync-delay popup is open
 static bool g_dragDelay = false;
 static std::map<int, float> g_appChipW;   // measured when drawn: the chip is as wide as its label, up to a limit
-static RectF AppOutChip(const El& e) { auto it = g_appChipW.find(e.idx); float w = it != g_appChipW.end() ? it->second : S(150); return RectF(e.r.X + e.r.Width - S(6) - w, e.r.Y + S(8), w, S(26)); }
+static RectF AppOutChip(const El& e) { auto it = g_appChipW.find(e.idx); float w = it != g_appChipW.end() ? it->second : S(122); return RectF(e.r.X + e.r.Width - S(8) - w, e.r.Y + S(22) - S(13), w, S(26)); }
 static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return true; return !g_appExtra.empty(); }
-static bool AppRouted(int i) { return i >= 0 && i < (int)g_apps.size() && !AppRoutes(g_apps[i]).empty(); }
-static RectF AppIconRect(const El& e) { float lx = e.r.X + S(8) + S(16), cy = e.r.Y + S(21); return RectF(lx - S(16), cy - S(16), S(32), S(32)); }
-static RectF AppDdAnchor(const El& e) { return AppRouted(e.idx) ? AppOutChip(e) : AppIconRect(e); }   // the list opens from the chip, or from the icon
-static RectF AutoSyncRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64) - S(6) - S(78), e.r.Y + e.r.Height / 2 - S(12), S(78), S(24)); }
-static RectF OneRect(const El& e) { RectF a = AutoSyncRect(e); return RectF(a.X - S(6) - S(104), a.Y, S(104), S(24)); }
-static RectF RoutingRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64), e.r.Y - S(5), S(62), e.r.Height + S(10)); }
-static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
+[[maybe_unused]] static bool AppRouted(int i) { return i >= 0 && i < (int)g_apps.size() && !AppRoutes(g_apps[i]).empty(); }
+static RectF AppIconRect(const El& e) { float lx = e.r.X + S(10) + S(16), cy = e.r.Y + S(22); return RectF(lx - S(16), cy - S(16), S(32), S(32)); }
+static RectF AppDdAnchor(const El& e) { return g_apps[e.idx].system ? AppIconRect(e) : AppOutChip(e); }   // the list opens from the chip
+static bool NeedsSync();
+static float MeasureW(const wchar_t* s, Font* f) {   // text width outside of painting (hit testing)
+    static Bitmap* bm = nullptr; static Graphics* mg = nullptr;
+    if (!mg) { bm = new Bitmap(4, 4, PixelFormat32bppPARGB); mg = new Graphics(bm); mg->SetTextRenderingHint(TextRenderingHintAntiAliasGridFit); }
+    RectF out; mg->MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width;
+}
+// Sound header, right to left: Auto sync · Routing · "N speakers ×"   (the design's h3row)
+static bool ShowSyncBtns() { return SpeakersInUse() > 1; }
+static RectF AutoSyncRect(const El& e) { float w = S(11) + MeasureW(L"Auto sync", g_f11s) + S(11); return RectF(e.r.X + e.r.Width - w, e.r.Y + e.r.Height / 2 - S(12), w, S(24)); }
+static RectF RoutingRect(const El& e) {
+    float w = S(4) + MeasureW(L"Routing", g_fSmall) + S(4), right = ShowSyncBtns() ? AutoSyncRect(e).X - S(8) : e.r.X + e.r.Width;
+    if (ShowSyncBtns() && NeedsSync()) right -= S(8) + S(11) + MeasureW(L"Not synced", g_f11);
+    return RectF(right - w, e.r.Y + e.r.Height / 2 - S(9), w, S(18));
+}
+static std::wstring OneLabel() { return std::to_wstring(SpeakersInUse()) + L" speakers"; }
+static RectF OneRect(const El& e) { float w = S(10) + MeasureW(OneLabel().c_str(), g_f11) + S(6) + S(11) + S(9); RectF r = RoutingRect(e); return RectF(r.X - S(8) - w, e.r.Y + e.r.Height / 2 - S(12), w, S(24)); }
+static RectF ResetOutRect(const El& e) { float w = S(4) + MeasureW(L"Reset outputs", g_fSmall) + S(4); return RectF(e.r.X + e.r.Width - w, e.r.Y + e.r.Height / 2 - S(9), w, S(18)); }
 static std::wstring OutLabel(const Endpoint& o) {   // the device's name; add its type when two devices share a name
     int same = 0; for (auto& x : g_out) if (x.name == o.name) same++;
     return same > 1 && !o.detail.empty() ? o.name + L" \u00b7 " + o.detail : o.name;
 }
 static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return OutLabel(o); return L"Default output"; }
-static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(92), e.r.Y + S(8), S(92), S(26)); }
+static float g_delayChipW = 88;
+static RectF DelayChip(const El& e) { float w = g_delayChipW; return RectF(e.r.X + e.r.Width - S(8) - w, e.r.Y + S(22) - S(13), w, S(26)); }
 static bool DelayAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_OUT && e.idx == g_delayOpen) { chip = DelayChip(e); return true; } return false; }
-static RectF DelayPopup(const RectF& chip) {
-    float w = S(256), h = S(150);
-    float y = chip.Y + chip.Height + S(6);
-    if (y + h > PaneBottom() - S(4)) y = chip.Y - S(6) - h;
-    return RectF(chip.X + chip.Width - w, y, w, h);
+static std::wstring DelayNote(int i, bool* bold = nullptr);
+static float DelayNoteLines();
+static RectF DelayPopup(const RectF& chip) {   // the design's "bstep" popup: 256 wide, under the chip
+    float w = S(256), h = S(12) + S(17) + S(8) + S(34) + S(8) + DelayNoteLines() * S(17.25f) + S(10) + S(24) + S(12);
+    float y = chip.Y + S(30);
+    if (y + h > PaneBottom() - S(4)) y = chip.Y - S(4) - h;
+    return RectF(std::max(PaneX(), chip.X + chip.Width - w), y, w, h);
 }
 static RectF DelaySlider(const RectF& pop) { return RectF(pop.X + S(16), pop.Y + S(36), pop.Width - S(32), S(28)); }
-static RectF DlMinus(const RectF& pop) { return RectF(pop.X + S(14), pop.Y + S(38), S(36), S(34)); }
-static RectF DlPlus(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(36), pop.Y + S(38), S(36), S(34)); }
-static RectF DlSync(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(150), pop.Y + pop.Height - S(12) - S(30), S(150), S(30)); }
+static RectF DlMinus(const RectF& pop) { return RectF(pop.X + S(14), pop.Y + S(37), S(34), S(34)); }
+static RectF DlPlus(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(34), pop.Y + S(37), S(34), S(34)); }
+static RectF DlSync(const RectF& pop) { float w = S(22) + MeasureW(L"Run Auto sync again", g_f11s); return RectF(pop.X + pop.Width - S(14) - w, pop.Y + pop.Height - S(12) - S(24), w, S(24)); }
+static RectF DlReset(const RectF& pop) { RectF s = DlSync(pop); float w = S(22) + MeasureW(L"Reset", g_f11s); return RectF(s.X - S(6) - w, s.Y, w, S(24)); }
 static bool InUse(int i) { auto u = UsedSpeakers(); return i >= 0 && i < (int)g_out.size() && std::find(u.begin(), u.end(), g_out[i].id) != u.end(); }
 static int DelayOf(int i) { return ShownDelay(g_out[i].id); }   // how long this speaker waits; the slowest shows 0
 static bool HasDelayChip(int i) { return SpeakersInUse() > 1 && InUse(i) && (DelayOf(i) > 0 || g_delayOpen == i); }
@@ -2072,21 +2209,26 @@ static RectF ResetBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(1
 
 // ---- Display tab controls and their lists (in-panel popups, styled like the panel)
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
-static RectF DTopOff(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(146), e.r.Y + S(4), S(146), S(32)); }
-static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(6), e.r.Y + S(4), o.X - S(8) - e.r.X - S(6), S(32)); }
+static RectF DTopOff(const El& e) { float w = S(12) + S(14) + S(6) + MeasureW(L"Turn off displays", g_fSmall) + S(12); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y, w, S(32)); }
+static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(10), e.r.Y, o.X - S(8) - e.r.X - S(10), S(32)); }
 static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
 // header pills, right to left: night light, HDR (screens that can), refresh rate
-static RectF MoonPill(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(30), e.r.Y + e.r.Height / 2 - S(11), S(30), S(22)); }
+static float MeasureW(const wchar_t* s, Font* f);
+static RectF MoonPill(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(30), e.r.Y + e.r.Height / 2 - S(10), S(30), S(20)); }
 static RectF HdrPill(const El& e) { RectF m = MoonPill(e); return RectF(m.X - S(6) - S(42), m.Y, S(42), m.Height); }
-static RectF RateBtn(const El& e) { RectF l = g_mons[e.idx].hdrOk ? HdrPill(e) : MoonPill(e); return RectF(l.X - S(6) - S(72), l.Y, S(72), l.Height); }
+static RectF RateBtn(const El& e) {
+    RectF l = g_mons[e.idx].hdrOk ? HdrPill(e) : MoonPill(e);
+    std::wstring t = std::to_wstring(g_mons[e.idx].rate) + L" Hz"; float w = S(9) + MeasureW(t.c_str(), g_f11s) + S(22);
+    return RectF(l.X - S(6) - w, e.r.Y + e.r.Height / 2 - S(11), w, S(22));
+}
 // bottom row, full width: orientation · input · extend / duplicate
 static bool HasInputs(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].inputs.empty(); }
 static bool HasMode(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].internal && g_mons.size() > 1; }
 static RectF MonoBtn(const El& e, int which) {   // 0 orientation, 1 input, 2 extend/duplicate; empty if not shown
-    float wts[3] = {1.2f, HasInputs(e.idx) ? 0.85f : 0, HasMode(e.idx) ? 1.25f : 0};
+    float wts[3] = {1.24f, HasInputs(e.idx) ? 0.88f : 0, HasMode(e.idx) ? 1.04f : 0};   // the widths the design ends up with
     if (!wts[which]) return RectF();
     int n = (wts[1] > 0) + (wts[2] > 0) + 1;
-    float gap = S(8), avail = e.r.Width - S(12) - gap * (n - 1), sum = wts[0] + wts[1] + wts[2], x = e.r.X + S(6);
+    float gap = S(8), avail = e.r.Width - S(14) - gap * (n - 1), sum = wts[0] + wts[1] + wts[2], x = e.r.X + S(8);
     for (int k = 0; k < which; k++) if (wts[k]) x += avail * wts[k] / sum + gap;
     return RectF(x, e.r.Y + S(2), avail * wts[which] / sum, S(32));
 }
@@ -2101,7 +2243,7 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
     if (g_ddKind == 3) {
         g_ddProfMap.clear();
         for (int i = 0; i < (int)g_prof.size(); i++) if (!g_prof[i].v.empty()) { o.push_back(g_prof[i].name); g_ddProfMap.push_back(i); if (ProfileActive(i)) cur = (int)o.size() - 1; }
-        o.push_back(L"+ Save current as new profile"); g_ddProfMap.push_back(-1);
+        o.push_back(L"Save current as new profile"); g_ddProfMap.push_back(-1);
         o.push_back(L"Manage profiles\u2026"); g_ddProfMap.push_back(-2);
         return o;
     }
@@ -2109,7 +2251,6 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
         if (g_ddOpen < 0 || g_ddOpen >= (int)g_apps.size()) return o;
         o.push_back(L"Default speaker");
         for (size_t i = 0; i < g_out.size(); i++) o.push_back(OutLabel(g_out[i]));
-        o.push_back(L"Open routing\u2026");
         return o;
     }
     if (g_ddOpen < 0 || g_ddOpen >= (int)g_mons.size()) return o;
@@ -2118,7 +2259,7 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
         g_ddModeMap = {-1}; o.push_back(L"Extend"); cur = 0;
         for (int k = 0; k < (int)g_mons.size(); k++) {
             if (k == g_ddOpen) continue;
-            o.push_back(L"Duplicate " + std::to_wstring(k + 1) + L" \u00b7 " + g_mons[k].name); g_ddModeMap.push_back(k);
+            o.push_back(g_mons[k].name); g_ddModeMap.push_back(k);
             if (m.cloneOf == k || (g_mons[k].cloneOf >= 0 && g_mons[k].cloneOf == m.cloneOf && m.cloneOf >= 0)) cur = (int)o.size() - 1;
         }
         return o;
@@ -2141,18 +2282,36 @@ static bool DropdownRect(RectF& btn) {
     }
     return false;
 }
+static float DdExtraBefore(int i) {   // a line (and a "Duplicate" heading) inside some lists, as in the design
+    if (g_ddKind == 5 && i == 1) return S(9) + S(19);
+    if (g_ddKind == 4 && i == 1) return S(9);
+    if (g_ddKind == 3 && i < (int)g_ddProfMap.size() && g_ddProfMap[i] == -1 && i > 0) return S(9);
+    return 0;
+}
+static float MeasureW(const wchar_t* s, Font* f);
 static RectF DropdownPopup(const RectF& btn) {
-    int cur; int n = (int)DropdownOptions(cur).size();
-    float h = S(4) * 2 + S(32) * n + S(2) * std::max(0, n - 1);
-    float w = std::max(btn.Width, g_ddKind == 3 ? S(240) : g_ddKind == 4 || g_ddKind == 5 ? S(230) : S(150));
-    float x = g_ddKind == 3 ? btn.X : btn.X + btn.Width - w;   // small buttons open towards the left
-    if (g_ddKind == 4 && !AppRouted(g_ddOpen)) x = btn.X;          // from the app's icon: open to the right
+    int cur; auto opts = DropdownOptions(cur); int n = (int)opts.size();
+    float h = S(4) * 2 + S(32) * n; for (int i = 0; i < n; i++) h += DdExtraBefore(i);
+    float content = 0;   // as wide as the longest item ("max-content"), never narrower than its button
+    for (int i = 0; i < n; i++) content = std::max(content, MeasureW(opts[i].c_str(), g_fName) + S(24) + (g_ddKind == 5 && i > 0 ? S(26) : 0) + (g_ddKind == 3 && g_ddProfMap[i] == -1 ? S(19) : 0));
+    content += S(8);
+    float w = g_ddKind == 1 ? S(110) : g_ddKind == 4 ? S(244) : g_ddKind == 3 ? std::max(S(230), content) : std::max(btn.Width, content);
+    w = std::min(w, PaneW());
+    bool right = g_ddKind == 1 || g_ddKind == 4 || g_ddKind == 5;   // lists that hang from the right edge of their button
+    float x = right ? btn.X + btn.Width - w : btn.X;
     x = std::max(PaneX(), std::min(x, PaneX() + PaneW() - w));
-    float y = btn.Y + btn.Height + S(4);
-    if (y + h > PaneBottom() - S(4)) y = btn.Y - S(4) - h;
+    float below = btn.Y + btn.Height + S(4), above = btn.Y - S(4) - h;
+    bool up = g_ddKind == 0 || g_ddKind == 2 || g_ddKind == 5;   // the bottom row of a screen opens upwards
+    if (g_ddKind == 4) up = (btn.Y - PaneTop()) > (PaneBottom() - btn.Y - btn.Height);   // the side with more room
+    float y = up ? above : below;
+    if (up && y < PaneTop() + S(4)) y = below;
+    if (!up && y + h > PaneBottom() - S(4)) y = above >= PaneTop() + S(4) ? above : std::max(PaneTop() + S(4), PaneBottom() - S(4) - h);
     return RectF(x, y, w, h);
 }
-static RectF DropdownOption(const RectF& pop, int i) { return RectF(pop.X + S(4), pop.Y + S(4) + i * (S(32) + S(2)), pop.Width - S(8), S(32)); }
+static RectF DropdownOption(const RectF& pop, int i) {
+    float y = pop.Y + S(4); for (int k = 0; k <= i; k++) y += DdExtraBefore(k);
+    return RectF(pop.X + S(4), y + i * S(32), pop.Width - S(8), S(32));
+}
 
 // ---- settings menu (in-panel popup above the gear)
 enum MenuId { M_AWAKE = 1, M_STARTUP, M_SOUND, M_DISPLAY, M_EXIT, M_SOLID, M_GLASS, M_SHORTCUTS, M_RESTORE, M_ACC0 = 20 };
@@ -2196,7 +2355,7 @@ static void BuildMenu() {
 }
 
 static RectF CalCard();
-static RectF CalDoneBtn();
+static RectF CalBtn(int which);   // 0 Cancel / Stop, 1 Start / Done
 static Hit HitTest(float x, float y) {
     Hit h;
     if (g_menuOpen) {
@@ -2208,14 +2367,14 @@ static Hit HitTest(float x, float y) {
         }
     }
     if (g_calShow && g_tab == T_SOUND && g_view == 0 && InRect(CalCard(), x, y)) {
-        h.h = !g_calibrating && InRect(CalDoneBtn(), x, y) ? H_CALDONE : H_MENUBG;
+        h.h = InRect(CalBtn(0), x, y) ? H_CALCANCEL : InRect(CalBtn(1), x, y) ? (g_calAsk ? H_CALSTART : H_CALDONE) : H_MENUBG;
         return h;
     }
     RectF dchip;
     if (g_delayOpen >= 0 && DelayAnchor(dchip)) {
         RectF pop = DelayPopup(dchip);
         if (InRect(pop, x, y)) {
-            h.h = InRect(DlMinus(pop), x, y) ? H_DLMINUS : InRect(DlPlus(pop), x, y) ? H_DLPLUS : InRect(DlSync(pop), x, y) ? H_DLSYNC : H_MENUBG;
+            h.h = InRect(DlMinus(pop), x, y) ? H_DLMINUS : InRect(DlPlus(pop), x, y) ? H_DLPLUS : InRect(DlSync(pop), x, y) ? H_DLSYNC : InRect(DlReset(pop), x, y) ? H_DLRESET : H_MENUBG;
             return h;
         }
     }
@@ -2248,15 +2407,15 @@ static Hit HitTest(float x, float y) {
         El& e = g_els[i];
         if (e.k == E_H3 && e.text == L"APPS" && AppRouteReady() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(RoutingRect(e), x, y)) { h.h = H_ROUTING; h.el = i; return h; }
-        if (e.k == E_H3 && e.text == L"OUTPUT" && SpeakersInUse() > 1 && InRect(OneRect(e), x, y)) { h.h = H_ONESPK; h.el = i; return h; }
-        if (e.k == E_H3 && e.text == L"OUTPUT" && SpeakersInUse() > 1 && InRect(AutoSyncRect(e), x, y)) { h.h = H_AUTOSYNC; h.el = i; return h; }
+        if (e.k == E_H3 && e.text == L"OUTPUT" && ShowSyncBtns() && InRect(OneRect(e), x, y)) { h.h = H_ONESPK; h.el = i; return h; }
+        if (e.k == E_H3 && e.text == L"OUTPUT" && ShowSyncBtns() && InRect(AutoSyncRect(e), x, y)) { h.h = H_AUTOSYNC; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
             float cy2 = RowCy2(e);
             RectF sl = CtlSlider(e, cy2); sl.X -= S(10); sl.Width += S(20);
             if (e.k == E_OUT && HasDelayChip(e.idx) && InRect(DelayChip(e), x, y)) h.h = H_DELAYCHIP;
-            else if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady() && ((AppRouted(e.idx) && InRect(AppOutChip(e), x, y)) || InRect(AppIconRect(e), x, y))) h.h = H_APPOUT;
+            else if (e.k == E_APP && !g_apps[e.idx].system && (AppRouteReady() || g_demo) && InRect(AppOutChip(e), x, y)) h.h = H_APPOUT;
             else if (InRect(CtlMute(e, cy2), x, y)) h.h = H_MUTE;
             else if (InRect(RectF(sl.X, cy2 - S(18), sl.Width, S(36)), x, y)) h.h = H_SLIDER;
             else h.h = (e.k == E_OUT || e.k == E_IN) ? H_ROW : H_NONE;
@@ -2423,13 +2582,19 @@ static std::wstring ComboName(const HotKey& h) {
     return s + KeyName(h.vk);
 }
 static bool HkRepeats(int a) { return a == HK_VOLUP || a == HK_VOLDOWN || a == HK_BRIUP || a == HK_BRIDOWN; }
-static void UnregisterHotkeys() { for (int i = 0; i < HK_COUNT; i++) UnregisterHotKey(g_hwnd, 100 + i); }
+static int g_scRegistered = 0;
+static void UnregisterHotkeys() { for (int i = 0; i < g_scRegistered; i++) UnregisterHotKey(g_hwnd, 100 + i); g_scRegistered = 0; }
+static bool HkSameKeys(int i) {   // another row has the same keys
+    for (int j = 0; j < (int)g_sc.size(); j++) if (j != i && g_sc[i].k.vk && g_sc[j].k.vk == g_sc[i].k.vk && g_sc[j].k.mods == g_sc[i].k.mods) return true;
+    return false;
+}
 static void RegisterHotkeys() {
     UnregisterHotkeys();
-    for (int i = 0; i < HK_COUNT; i++) {
-        g_hk[i].ok = false;
-        if (g_hk[i].vk) g_hk[i].ok = RegisterHotKey(g_hwnd, 100 + i, g_hk[i].mods | (HkRepeats(i) ? 0 : MOD_NOREPEAT), g_hk[i].vk) != 0;
+    for (int i = 0; i < (int)g_sc.size() && i < 200; i++) {
+        HotKey& k = g_sc[i].k; k.ok = false;
+        if (k.vk) k.ok = RegisterHotKey(g_hwnd, 100 + i, k.mods | (HkRepeats(g_sc[i].act) ? 0 : MOD_NOREPEAT), k.vk) != 0;
     }
+    g_scRegistered = (int)std::min<size_t>(g_sc.size(), 200);
 }
 
 // ---------------------------------------------------------------- tray
@@ -2561,7 +2726,7 @@ static void Text(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r, Strin
     SolidBrush b(c);
     g.DrawString(s, -1, f, r, &sf, &b);
 }
-static int TextLines(Graphics& g, const wchar_t* s, Font* f, float w) {   // wrapped line count
+[[maybe_unused]] static int TextLines(Graphics& g, const wchar_t* s, Font* f, float w) {   // wrapped line count
     StringFormat sf; RectF out; INT chars = 0, lines = 0;
     g.MeasureString(s, -1, f, RectF(0, 0, w, 10000), &sf, &out, &chars, &lines);
     return std::max(1, (int)lines);
@@ -2575,7 +2740,212 @@ static void TextWrap(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r) {
 }
 static void PillText(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r, StringAlignment h = StringAlignmentNear) { Text(g, s, f, c, RectF(r.X, r.Y - S(1), r.Width, r.Height), h); }
 static float TextW(Graphics& g, const wchar_t* s, Font* f) { RectF out; g.MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width; }
+// ---------------------------------------------------------------- line icons
+// The same 20-unit SVG icon set as the Knob UI design, parsed once and drawn with GDI+,
+// so the app looks like the design and doesn't depend on which icon font Windows has.
+static const struct { const char* n; const char* s; } ICONS[] = {
+    {"sunLow", "<circle cx=\"10\" cy=\"10\" r=\"3\"/><path d=\"M10 4.5v.5M10 15v.5M4.5 10h.5M15 10h.5M6.1 6.1l.4.4M13.5 13.5l.4.4M6.1 13.9l.4-.4M13.5 6.5l.4-.4\"/>"},
+    {"moon", "<path d=\"M15.5 12.5A6.5 6.5 0 0 1 7.5 4.5a6.5 6.5 0 1 0 8 8z\"/>"},
+    {"speaker", "<path d=\"M3 7.5h2.5L9.5 4v12l-4-3.5H3z\"/><path d=\"M12.5 7.5a3.5 3.5 0 0 1 0 5\"/><path d=\"M14.8 5.2a6.8 6.8 0 0 1 0 9.6\"/>"},
+    {"speakerOff", "<path d=\"M3 7.5h2.5L9.5 4v12l-4-3.5H3z\"/><path d=\"M13 8l4 4M17 8l-4 4\"/>"},
+    {"headphones", "<path d=\"M3.5 13.5V10a6.5 6.5 0 0 1 13 0v3.5\"/><path d=\"M3.5 12.5h2v4h-1a1 1 0 0 1-1-1zM16.5 12.5h-2v4h1a1 1 0 0 0 1-1z\"/>"},
+    {"mic", "<rect x=\"7.5\" y=\"2.5\" width=\"5\" height=\"9\" rx=\"2.5\"/><path d=\"M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5\"/>"},
+    {"micOff", "<rect x=\"7.5\" y=\"2.5\" width=\"5\" height=\"9\" rx=\"2.5\"/><path d=\"M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5M3 3l14 14\"/>"},
+    {"sun", "<circle cx=\"10\" cy=\"10\" r=\"3\"/><path d=\"M10 2.5v1.5M10 16v1.5M2.5 10H4M16 10h1.5M4.7 4.7l1 1M14.3 14.3l1 1M4.7 15.3l1-1M14.3 5.7l1-1\"/>"},
+    {"contrast", "<circle cx=\"10\" cy=\"10\" r=\"6.5\"/><path d=\"M10 3.5a6.5 6.5 0 0 1 0 13z\" fill=\"currentColor\"/>"},
+    {"rotate", "<path d=\"M4 10a6 6 0 1 0 1.8-4.3\"/><path d=\"M4.5 3v3.5H8\"/>"},
+    {"monitor", "<rect x=\"2.5\" y=\"3.5\" width=\"15\" height=\"10\" rx=\"1.5\"/><path d=\"M7 16.5h6M10 13.5v3\"/>"},
+    {"apps", "<rect x=\"3\" y=\"3\" width=\"5.5\" height=\"5.5\" rx=\"1.2\"/><rect x=\"11.5\" y=\"3\" width=\"5.5\" height=\"5.5\" rx=\"1.2\"/><rect x=\"3\" y=\"11.5\" width=\"5.5\" height=\"5.5\" rx=\"1.2\"/><rect x=\"11.5\" y=\"11.5\" width=\"5.5\" height=\"5.5\" rx=\"1.2\"/>"},
+    {"chevron", "<path d=\"M6 8l4 4 4-4\"/>"},
+    {"gear", "<circle cx=\"10\" cy=\"10\" r=\"2.5\"/><path d=\"M8.6 2.6h2.8l.4 2 1.4.8 1.9-.7 1.4 2.4-1.5 1.3v1.6l1.5 1.3-1.4 2.4-1.9-.7-1.4.8-.4 2H8.6l-.4-2-1.4-.8-1.9.7-1.4-2.4L5 10.8V9.2L3.5 7.9l1.4-2.4 1.9.7 1.4-.8z\"/>"},
+    {"bell", "<path d=\"M5.5 13.5v-4a4.5 4.5 0 0 1 9 0v4l1.5 1.5h-12z\"/><path d=\"M8.5 17h3\"/>"},
+    {"eye", "<path d=\"M2 10s3-5.5 8-5.5S18 10 18 10s-3 5.5-8 5.5S2 10 2 10z\"/><circle cx=\"10\" cy=\"10\" r=\"2.2\"/>"},
+    {"power", "<path d=\"M10 2.5v6.5\"/><path d=\"M14.5 5.2a6.5 6.5 0 1 1-9 0\"/>"},
+    {"open", "<path d=\"M11 3.5h5.5V9M16.5 3.5L9.5 10.5\"/><path d=\"M14 12v3.5a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1H8\"/>"},
+    {"exit", "<path d=\"M5 5l10 10M15 5L5 15\"/>"},
+    {"timer", "<circle cx=\"10\" cy=\"11\" r=\"6\"/><path d=\"M10 8v3l2 1.5M8 2.5h4\"/>"},
+    {"plus", "<path d=\"M10 4v12M4 10h12\"/>"},
+    {"check", "<path d=\"M4 10.5l3.5 3.5L16 6\"/>"},
+    {"save", "<path d=\"M4 4h9l3 3v9H4z\"/><path d=\"M7 4v4h5V4M7 16v-5h6v5\"/>"},
+    {"pencil", "<path d=\"M13.5 4.5l2 2L8 14l-3 1 1-3z\"/>"},
+    {"trash", "<path d=\"M4.5 6h11M8 6V4h4v2M6 6l.8 10h6.4L14 6\"/>"},
+    {"keyboard", "<rect x=\"2.5\" y=\"5\" width=\"15\" height=\"10\" rx=\"1.5\"/><path d=\"M5.5 8h1M8.5 8h1M11.5 8h1M14 8h.5M6 12h8\"/>"},
+    {"palette", "<path d=\"M10 3a7 7 0 1 0 0 14c1 0 1.5-.8 1.2-1.6-.4-1 .2-1.9 1.3-1.9H14a3 3 0 0 0 3-3C17 6 14 3 10 3z\"/><circle cx=\"6.5\" cy=\"9.5\" r=\"1\"/><circle cx=\"9\" cy=\"6.5\" r=\"1\"/><circle cx=\"12.5\" cy=\"7\" r=\"1\"/>"},
+    {"info", "<circle cx=\"10\" cy=\"10\" r=\"7\"/><path d=\"M10 9v4.5M10 6.5v.2\"/>"},
+    {"refresh", "<path d=\"M16 10a6 6 0 1 1-1.8-4.3\"/><path d=\"M16 3.5V7h-3.5\"/>"},
+    {"identify", "<rect x=\"2.5\" y=\"3.5\" width=\"15\" height=\"10\" rx=\"1.5\"/><path d=\"M9 6.8l1.2-.8v5\"/><path d=\"M7 16.5h6\"/>"},
+    {"laptop", "<rect x=\"4\" y=\"4.5\" width=\"12\" height=\"8\" rx=\"1.2\"/><path d=\"M2.5 15.5h15\"/>"},
+    {"earbuds", "<path d=\"M6.5 4.5A2.5 2.5 0 0 1 9 7v1a2.5 2.5 0 0 1-2 2.45V15a1 1 0 0 1-2 0V9.2A2.5 2.5 0 0 1 4 7a2.5 2.5 0 0 1 2.5-2.5z\"/><path d=\"M13.5 4.5A2.5 2.5 0 0 0 11 7v1a2.5 2.5 0 0 0 2 2.45V15a1 1 0 0 0 2 0V9.2A2.5 2.5 0 0 0 16 7a2.5 2.5 0 0 0-2.5-2.5z\"/>"},
+    {"speakerBox", "<rect x=\"5\" y=\"2.5\" width=\"10\" height=\"15\" rx=\"2\"/><circle cx=\"10\" cy=\"11.5\" r=\"3\"/><circle cx=\"10\" cy=\"6\" r=\".9\" fill=\"currentColor\" stroke=\"none\"/>"},
+    {"usb", "<path d=\"M10 3v11\"/><path d=\"M8 5l2-2 2 2\"/><path d=\"M10 11.5L6.5 9.5V7.5M10 10l3.5-2V6.5\"/><circle cx=\"10\" cy=\"15.8\" r=\"1.6\"/>"},
+    {"wave", "<path d=\"M2.5 10h2.2l2-5 3 10 3-8 1.8 3h3\"/>"},
+    {"bt", "<path d=\"M7 7l6 6-3 3V4l3 3-6 6\"/>"},
+    {"mixer", "<path d=\"M5 3v14M10 3v14M15 3v14\"/><circle cx=\"5\" cy=\"12\" r=\"1.8\" fill=\"currentColor\" stroke=\"none\"/><circle cx=\"10\" cy=\"7\" r=\"1.8\" fill=\"currentColor\" stroke=\"none\"/><circle cx=\"15\" cy=\"10.5\" r=\"1.8\" fill=\"currentColor\" stroke=\"none\"/>"},
+};
+static const struct { const char* n; const char* s; } ICONS_EXTRA[] = {
+    {"back", "<path d=\"M12 5l-5 5 5 5\"/>"},
+    {"chevRight", "<path d=\"M8 6l4 4-4 4\"/>"},
+    {"chevUp", "<path d=\"M6 12l4-4 4 4\"/>"},
+};
+struct IcoPart { GraphicsPath* path; bool fill, stroke; };
+static std::map<std::string, std::vector<IcoPart>> g_icoCache;
+static std::string IcoAttr(const std::string& tag, const char* name) {
+    std::string key = std::string(" ") + name + "=\"";
+    size_t a = tag.find(key); if (a == std::string::npos) return "";
+    a += key.size(); size_t b = tag.find('"', a);
+    return b == std::string::npos ? "" : tag.substr(a, b - a);
+}
+static float IcoNum(const std::string& s, size_t& i, bool* ok = nullptr) {   // SVG number: "1.2", "-.8", ".4.4" is two numbers
+    while (i < s.size() && (s[i] == ' ' || s[i] == ',')) i++;
+    size_t st = i; bool dot = false;
+    if (i < s.size() && (s[i] == '-' || s[i] == '+')) i++;
+    while (i < s.size() && (isdigit((unsigned char)s[i]) || (s[i] == '.' && !dot))) { if (s[i] == '.') dot = true; i++; }
+    if (ok) *ok = i > st;
+    return i > st ? (float)atof(s.substr(st, i - st).c_str()) : 0.f;
+}
+static void IcoArc(GraphicsPath& p, float x1, float y1, float rx, float ry, int fa, int fs, float x2, float y2) {
+    if (rx <= 0 || ry <= 0 || (x1 == x2 && y1 == y2)) { p.AddLine(x1, y1, x2, y2); return; }
+    double xp = (x1 - x2) / 2.0, yp = (y1 - y2) / 2.0;
+    double lam = xp * xp / (rx * rx) + yp * yp / (ry * ry);
+    if (lam > 1) { rx = (float)(rx * sqrt(lam)); ry = (float)(ry * sqrt(lam)); }
+    double num = (double)rx * rx * ry * ry - (double)rx * rx * yp * yp - (double)ry * ry * xp * xp;
+    double den = (double)rx * rx * yp * yp + (double)ry * ry * xp * xp;
+    double co = (fa != fs ? 1 : -1) * sqrt(std::max(0.0, num / den));
+    double cxp = co * rx * yp / ry, cyp = -co * ry * xp / rx;
+    double cx = cxp + (x1 + x2) / 2.0, cy = cyp + (y1 + y2) / 2.0;
+    double t1 = atan2((yp - cyp) / ry, (xp - cxp) / rx), t2 = atan2((-yp - cyp) / ry, (-xp - cxp) / rx);
+    double dt = t2 - t1;
+    if (fs && dt < 0) dt += 2 * 3.14159265358979; else if (!fs && dt > 0) dt -= 2 * 3.14159265358979;
+    p.AddArc((REAL)(cx - rx), (REAL)(cy - ry), 2 * rx, 2 * ry, (REAL)(t1 * 180 / 3.14159265358979), (REAL)(dt * 180 / 3.14159265358979));
+}
+static GraphicsPath* IcoParsePath(const std::string& d) {
+    GraphicsPath* p = new GraphicsPath();
+    float cx = 0, cy = 0, sx = 0, sy = 0, lcx = 0, lcy = 0; char cmd = 0; size_t i = 0; bool open = false;
+    auto lineTo = [&](float x, float y) { p->AddLine(cx, cy, x, y); cx = x; cy = y; open = true; };
+    while (i < d.size()) {
+        while (i < d.size() && (d[i] == ' ' || d[i] == ',')) i++;
+        if (i >= d.size()) break;
+        if (isalpha((unsigned char)d[i])) cmd = d[i++];
+        bool rel = islower((unsigned char)cmd) != 0; char C = (char)toupper((unsigned char)cmd);
+        if (C == 'Z') { p->CloseFigure(); cx = sx; cy = sy; open = false; continue; }
+        bool ok = true;
+        if (C == 'M') {
+            float x = IcoNum(d, i, &ok), y = IcoNum(d, i); if (!ok) break;
+            if (rel) { x += cx; y += cy; }
+            p->StartFigure(); cx = sx = x; cy = sy = y; open = false;
+            cmd = rel ? 'l' : 'L';   // extra pairs after a move are lines
+        } else if (C == 'L') { float x = IcoNum(d, i, &ok), y = IcoNum(d, i); if (!ok) break; if (rel) { x += cx; y += cy; } lineTo(x, y); }
+        else if (C == 'H') { float x = IcoNum(d, i, &ok); if (!ok) break; lineTo(rel ? cx + x : x, cy); }
+        else if (C == 'V') { float y = IcoNum(d, i, &ok); if (!ok) break; lineTo(cx, rel ? cy + y : y); }
+        else if (C == 'C') {
+            float v[6]; for (float& x : v) { x = IcoNum(d, i, &ok); if (!ok) break; } if (!ok) break;
+            if (rel) for (int k = 0; k < 6; k++) v[k] += k % 2 ? cy : cx;
+            p->AddBezier(cx, cy, v[0], v[1], v[2], v[3], v[4], v[5]); lcx = v[2]; lcy = v[3]; cx = v[4]; cy = v[5]; open = true; continue;
+        } else if (C == 'S') {   // smooth curve: first control point mirrors the previous one
+            float v[4]; for (float& x : v) { x = IcoNum(d, i, &ok); if (!ok) break; } if (!ok) break;
+            if (rel) for (int k = 0; k < 4; k++) v[k] += k % 2 ? cy : cx;
+            float c1x = 2 * cx - lcx, c1y = 2 * cy - lcy;
+            p->AddBezier(cx, cy, c1x, c1y, v[0], v[1], v[2], v[3]); lcx = v[0]; lcy = v[1]; cx = v[2]; cy = v[3]; open = true; continue;
+        } else if (C == 'A') {
+            float rx = IcoNum(d, i, &ok); if (!ok) break; float ry = IcoNum(d, i); IcoNum(d, i);
+            int fa = (int)IcoNum(d, i), fs = (int)IcoNum(d, i); float x = IcoNum(d, i), y = IcoNum(d, i);
+            if (rel) { x += cx; y += cy; }
+            IcoArc(*p, cx, cy, rx, ry, fa, fs, x, y); cx = x; cy = y; open = true;
+        } else { i++; }
+        lcx = cx; lcy = cy;
+    }
+    (void)open;
+    return p;
+}
+static const std::vector<IcoPart>& IcoGet(const char* name) {
+    auto it = g_icoCache.find(name);
+    if (it != g_icoCache.end()) return it->second;
+    const char* src = nullptr;
+    for (auto& x : ICONS) if (!strcmp(x.n, name)) src = x.s;
+    for (auto& x : ICONS_EXTRA) if (!strcmp(x.n, name)) src = x.s;
+    std::vector<IcoPart> parts;
+    std::string s = src ? src : "";
+    size_t a = 0;
+    while ((a = s.find('<', a)) != std::string::npos) {
+        size_t b = s.find('>', a); if (b == std::string::npos) break;
+        std::string tag = s.substr(a, b - a + 1); a = b + 1;
+        IcoPart pt{nullptr, IcoAttr(tag, "fill") == "currentColor", IcoAttr(tag, "stroke") != "none"};
+        if (!tag.compare(0, 5, "<path")) pt.path = IcoParsePath(IcoAttr(tag, "d"));
+        else if (!tag.compare(0, 7, "<circle")) {
+            float x = (float)atof(IcoAttr(tag, "cx").c_str()), y = (float)atof(IcoAttr(tag, "cy").c_str()), r = (float)atof(IcoAttr(tag, "r").c_str());
+            pt.path = new GraphicsPath(); pt.path->AddEllipse(x - r, y - r, 2 * r, 2 * r);
+        } else if (!tag.compare(0, 5, "<rect")) {
+            float x = (float)atof(IcoAttr(tag, "x").c_str()), y = (float)atof(IcoAttr(tag, "y").c_str());
+            float w = (float)atof(IcoAttr(tag, "width").c_str()), h = (float)atof(IcoAttr(tag, "height").c_str()), r = (float)atof(IcoAttr(tag, "rx").c_str());
+            pt.path = new GraphicsPath();
+            if (r <= 0) pt.path->AddRectangle(RectF(x, y, w, h));
+            else { float d2 = 2 * r; pt.path->AddArc(x, y, d2, d2, 180, 90); pt.path->AddArc(x + w - d2, y, d2, d2, 270, 90);
+                   pt.path->AddArc(x + w - d2, y + h - d2, d2, d2, 0, 90); pt.path->AddArc(x, y + h - d2, d2, d2, 90, 90); pt.path->CloseFigure(); }
+        }
+        if (pt.path) parts.push_back(pt);
+    }
+    return g_icoCache[name] = parts;
+}
+// draws a design icon centred on (cx, cy); size in pixels (already scaled), like the design's ic(name, size)
+static void IconVec(Graphics& g, const char* name, float size, Color c, float cx, float cy, float rot) {
+    const auto& parts = IcoGet(name);
+    float k = size / 20.f;
+    Matrix m; m.Translate(cx, cy); if (rot) m.Rotate(rot); m.Scale(k, k); m.Translate(-10, -10);   // points go to pixels first, so curves stay smooth
+    Pen pen(c, 1.5f * k); pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
+    SolidBrush br(c);
+    for (auto& p : parts) {
+        GraphicsPath* q = p.path->Clone(); q->Transform(&m);
+        if (p.fill) g.FillPath(&br, q);
+        if (p.stroke) g.DrawPath(&pen, q);
+        delete q;
+    }
+}
+// Icons are drawn 4x larger and averaged down, so thin strokes look the same as in a browser; results are cached.
+static std::map<std::string, Bitmap*> g_icoBmp;
+static void Icon(Graphics& g, const char* name, float size, Color c, float cx, float cy, float rot = 0) {
+    int box = (int)ceilf(size) + 4; const int SS = 4;
+    char key[160]; snprintf(key, sizeof key, "%s|%.2f|%08x|%.0f", name, size, (unsigned)c.GetValue(), rot);
+    Bitmap*& bm = g_icoBmp[key];
+    if (!bm) {
+        if (g_icoBmp.size() > 600) { for (auto& x : g_icoBmp) if (x.second && x.second != bm) delete x.second; g_icoBmp.clear(); return Icon(g, name, size, c, cx, cy, rot); }
+        Bitmap big(box * SS, box * SS, PixelFormat32bppPARGB);
+        { Graphics bg(&big); bg.Clear(Color(0, 0, 0, 0)); bg.SetSmoothingMode(SmoothingModeAntiAlias); bg.SetPixelOffsetMode(PixelOffsetModeHalf);
+          IconVec(bg, name, size * SS, Color(255, c.GetR(), c.GetG(), c.GetB()), box * SS / 2.f, box * SS / 2.f, rot); }
+        bm = new Bitmap(box, box, PixelFormat32bppPARGB);
+        BitmapData sd, dd; Rect rs(0, 0, box * SS, box * SS), rd(0, 0, box, box);
+        big.LockBits(&rs, ImageLockModeRead, PixelFormat32bppPARGB, &sd); bm->LockBits(&rd, ImageLockModeWrite, PixelFormat32bppPARGB, &dd);
+        for (int y = 0; y < box; y++) for (int x = 0; x < box; x++) {
+            unsigned a = 0, r = 0, gg = 0, b = 0;
+            for (int j = 0; j < SS; j++) { const BYTE* p = (const BYTE*)sd.Scan0 + (y * SS + j) * sd.Stride + x * SS * 4;
+                for (int i = 0; i < SS; i++, p += 4) { b += p[0]; gg += p[1]; r += p[2]; a += p[3]; } }
+            const unsigned n = SS * SS, al = c.GetA();
+            BYTE* q = (BYTE*)dd.Scan0 + y * dd.Stride + x * 4;
+            q[0] = (BYTE)(b / n * al / 255); q[1] = (BYTE)(gg / n * al / 255); q[2] = (BYTE)(r / n * al / 255); q[3] = (BYTE)(a / n * al / 255);
+        }
+        big.UnlockBits(&sd); bm->UnlockBits(&dd);
+    }
+    float x = floorf(cx - box / 2.f + 0.5f), y = floorf(cy - box / 2.f + 0.5f);
+    InterpolationMode im = g.GetInterpolationMode(); PixelOffsetMode po = g.GetPixelOffsetMode();
+    g.SetInterpolationMode(InterpolationModeNearestNeighbor); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    g.DrawImage(bm, x, y, (REAL)box, (REAL)box);
+    g.SetInterpolationMode(im); g.SetPixelOffsetMode(po);
+}
+static const char* GlyphIcon(wchar_t ch) {   // the old Segoe glyph codes, mapped onto the design's icons
+    switch (ch) {
+    case 0xE767: return "speaker"; case 0xE74F: return "speakerOff"; case 0xE720: return "mic"; case 0xEC54: return "micOff";
+    case 0xE7F5: return "speakerBox"; case 0xE7F6: return "headphones"; case 0xE7F4: return "monitor"; case 0xE706: return "sun";
+    case 0xE793: return "contrast"; case 0xE7AD: return "rotate"; case 0xE71D: return "apps"; case 0xE70D: return "chevron";
+    case 0xE70E: return "chevUp"; case 0xE713: return "gear"; case 0xEA8F: return "bell"; case 0xE9E9: return "mixer";
+    case 0xE72C: return "refresh"; case 0xE890: return "eye"; case 0xE7E8: return "power"; case 0xE711: return "exit";
+    case 0xE8A7: return "open"; case 0xE916: return "timer"; case 0xE74E: return "save"; case 0xE708: return "moon";
+    case 0xEC8A: return "sunLow"; case 0xE73E: return "check"; case 0xE710: return "plus"; case 0xE76C: return "chevRight";
+    case 0xE72B: return "back"; case 0xE70F: return "pencil"; case 0xE74D: return "trash"; case 0xE765: return "keyboard";
+    case 0xE790: return "palette"; case 0xE946: return "info";
+    }
+    return nullptr;
+}
 static void Glyph(Graphics& g, wchar_t ch, Font* f, Color c, float cx, float cy) {
+    if (const char* n = GlyphIcon(ch)) { Icon(g, n, f->GetSize(), c, cx, cy); return; }
     wchar_t s[2] = {ch, 0};
     Text(g, s, f, c, RectF(cx - S(16), cy - S(16), S(32), S(32)), StringAlignmentCenter);
 }
@@ -2597,12 +2967,12 @@ static void Shadow(Graphics& g, RectF r, float rad) {
     }
 }
 
-static void DrawSlider(Graphics& g, RectF r, float v, bool dim, int state /*0 rest,1 hover,2 drag*/) {
+static void DrawSlider(Graphics& g, RectF r, float v, bool dim, int state /*0 rest,1 hover,2 drag*/, bool win11 = false) {   // win11: the Settings window's slider
     v = std::max(0.f, std::min(1.f, v));
     float cy = r.Y + r.Height / 2;
     float fx = r.X + r.Width * v;
     Color ac = dim ? T.t3 : T.accent;
-    if (T.glass) {   // thin rail + white handle with a soft accent halo
+    if (!win11) {   // thin rail + white handle with a soft accent halo
         float th = S(3);
         FillRound(g, T.rail, RectF(r.X, cy - th / 2, r.Width, th), th / 2);
         if (fx > r.X + 1) FillRound(g, ac, RectF(r.X, cy - th / 2, fx - r.X, th), th / 2);
@@ -2628,7 +2998,7 @@ static void DrawSlider(Graphics& g, RectF r, float v, bool dim, int state /*0 re
 }
 static void DrawValue(Graphics& g, RectF r, int v) {
     wchar_t pct[8]; swprintf(pct, 8, L"%d", v);
-    if (T.glass) { FillRound(g, T.valBg, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), S(8)); PillText(g, pct, g_fSmall, T.t2, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), StringAlignmentCenter); }
+    if (true) { FillRound(g, T.valBg, r, S(8)); PillText(g, pct, g_f11, T.t2, r, StringAlignmentCenter); }
     else Text(g, pct, g_fSmall, T.t2, RectF(r.X, r.Y, r.Width - S(4), r.Height), StringAlignmentFar);
 }
 static void DrawIconBtn(Graphics& g, RectF r, wchar_t glyph, Color c, bool hover) {
@@ -2644,34 +3014,16 @@ static void DrawSwitch(Graphics& g, float x, float cy, bool on, float k = 1.f) {
     g.FillEllipse(&kb, kx, cy - S(6 * k), S(12 * k), S(12 * k));
 }
 
-static void DrawDevIcon(Graphics& g, int icon, float cx, float cy, Color c) {   // 20-unit line icons, same family as the UI
-    float k = S(18) / 20.f, ox = cx - 10 * k, oy = cy - 10 * k;
-    Pen p(c, std::max(1.f, 1.45f * k)); p.SetStartCap(LineCapRound); p.SetEndCap(LineCapRound); p.SetLineJoin(LineJoinRound);
-    SolidBrush b(c);
-    auto X = [&](float x) { return ox + x * k; }; auto Y = [&](float y) { return oy + y * k; };
-    auto line = [&](float a, float bb, float cc, float d) { g.DrawLine(&p, X(a), Y(bb), X(cc), Y(d)); };
-    auto rrect = [&](float x, float y, float w, float h, float r) { GraphicsPath gp; AddRound(gp, RectF(X(x), Y(y), w * k, h * k), r * k); g.DrawPath(&p, &gp); };
-    auto circ = [&](float x, float y, float r) { g.DrawEllipse(&p, X(x - r), Y(y - r), 2 * r * k, 2 * r * k); };
-    auto poly = [&](std::initializer_list<float> pts) { std::vector<PointF> v; auto it = pts.begin(); while (it != pts.end()) { float a = *it++; float bb = *it++; v.push_back(PointF(X(a), Y(bb))); } g.DrawLines(&p, v.data(), (INT)v.size()); };
-    switch (icon) {
-    case DI_LAPTOP: rrect(4, 4.5f, 12, 8, 1.2f); line(2.5f, 15.5f, 17.5f, 15.5f); break;
-    case DI_DISPLAY: rrect(2.5f, 3.5f, 15, 10, 1.5f); line(7, 16.5f, 13, 16.5f); line(10, 13.5f, 10, 16.5f); break;
-    case DI_HEADPHONES:
-        line(3.5f, 13, 3.5f, 10); line(16.5f, 10, 16.5f, 13);
-        g.DrawArc(&p, X(3.5f), Y(3.5f), 13 * k, 13 * k, 180.f, 180.f);
-        rrect(3, 11.5f, 3, 5, 1.2f); rrect(14, 11.5f, 3, 5, 1.2f); break;
-    case DI_EARBUDS:
-        circ(6.5f, 7, 2.6f); rrect(5.3f, 9.2f, 2.4f, 6.8f, 1.2f);
-        circ(13.5f, 7, 2.6f); rrect(12.3f, 9.2f, 2.4f, 6.8f, 1.2f); break;
-    case DI_USB:
-        line(10, 3, 10, 14); poly({8, 5, 10, 3, 12, 5}); poly({10, 11.5f, 6.5f, 9.5f, 6.5f, 7.5f}); poly({10, 10, 13.5f, 8, 13.5f, 6.5f}); circ(10, 15.8f, 1.6f); break;
-    case DI_VIRTUAL: poly({2.5f, 10, 4.7f, 10, 6.7f, 5, 9.7f, 15, 12.7f, 7, 14.5f, 10, 17.5f, 10}); break;
-    default:   // speaker box
-        rrect(5, 2.5f, 10, 15, 2); circ(10, 11.5f, 3); g.FillEllipse(&b, X(9.1f), Y(5.1f), 1.8f * k, 1.8f * k); break;
-    }
+static const char* DevIconName(int icon) {
+    switch (icon) { case DI_LAPTOP: return "laptop"; case DI_DISPLAY: return "monitor"; case DI_HEADPHONES: return "headphones"; case DI_EARBUDS: return "earbuds";
+    case DI_USB: return "usb"; case DI_VIRTUAL: return "wave"; case DI_MIC: return "mic"; default: return "speakerBox"; }
 }
+static void DrawDevIcon(Graphics& g, int icon, float cx, float cy, Color c, float size = 18) { Icon(g, DevIconName(icon), S(size), c, cx, cy); }
 static wchar_t KindGlyph(int k) { return k == DK_HEADPHONES ? G_HEADPHONE : k == DK_MIC ? G_MIC : k == DK_DISPLAY ? G_TV : G_SPEAKERS; }
 
+enum { TIMER_POP = 12 };
+static bool g_animating = false;
+static void KickAnim() { if (g_hwnd) SetTimer(g_hwnd, TIMER_POP, 15, nullptr); }
 static void DrawEl(Graphics& g, int index) {
     El& e = g_els[index];
     if (e.r.Y + e.r.Height < PaneTop() || e.r.Y > PaneBottom()) return;
@@ -2679,22 +3031,28 @@ static void DrawEl(Graphics& g, int index) {
     if (e.k == E_H3) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
         if (e.text == L"APPS") {   // put every app back with everything else; always there so nothing jumps, faded when there's nothing to reset
-            RectF r = ResetOutRect(e); bool can = AnyAppRouted();
-            Text(g, L"Reset outputs", g_fSmall600, g_hover.h == H_RESETOUT ? T.t1 : can ? T.accent : T.t3, RectF(r.X, r.Y, r.Width - S(6), r.Height), StringAlignmentFar);
+            RectF r = ResetOutRect(e); bool can = AnyAppRouted(), hov = g_hover.h == H_RESETOUT && can;
+            if (hov) FillRound(g, T.subtle, r, S(6));
+            Text(g, L"Reset outputs", g_fSmall, can ? T.accent : WithAlpha(T.accent, 89), r, StringAlignmentCenter);
         }
-        if (e.text == L"OUTPUT") {   // how many speakers play, and the way to Settings › Sound
+        if (e.text == L"OUTPUT") {   // how many speakers play, the way to Settings › Sound, and Auto sync
             RectF rr = RoutingRect(e);
-            Text(g, L"Routing", g_fSmall600, g_hover.h == H_ROUTING ? T.t1 : T.accent, RectF(rr.X, rr.Y, rr.Width - S(6), rr.Height), StringAlignmentFar);
-            int n = SpeakersInUse();
-            if (n > 1) {   // "3 speakers ×": click to go back to one speaker
-                RectF op = OneRect(e); bool hov = g_hover.h == H_ONESPK;
-                FillRound(g, hov ? T.ddBtnHover : T.ddBtn, op, op.Height / 2);
-                std::wstring st = std::to_wstring(n) + L" speakers";
-                PillText(g, st.c_str(), g_fSmall, T.t1, RectF(op.X + S(10), op.Y, op.Width - S(30), op.Height));
-                Glyph(g, G_CLOSE, g_fIconS, hov ? T.t1 : T.t2, op.X + op.Width - S(14), op.Y + op.Height / 2);
+            if (g_hover.h == H_ROUTING) FillRound(g, T.subtle, rr, S(6));
+            Text(g, L"Routing", g_fSmall, T.accent, rr, StringAlignmentCenter);
+            if (ShowSyncBtns()) {
+                RectF op = OneRect(e); bool hov = g_hover.h == H_ONESPK;   // "3 speakers ×": click to go back to one speaker
+                FillRound(g, hov ? T.subtle3 : T.subtle2, op, op.Height / 2);
+                PillText(g, OneLabel().c_str(), g_f11, T.t1, RectF(op.X + S(10), op.Y, op.Width - S(10), op.Height));
+                Icon(g, "exit", S(11), WithAlpha(T.t1, 179), op.X + op.Width - S(9) - S(5.5f), op.Y + op.Height / 2);
                 RectF ar = AutoSyncRect(e); bool ah = g_hover.h == H_AUTOSYNC, need = NeedsSync();   // filled when a speaker was never measured
-                FillRound(g, need ? (ah ? WithAlpha(T.accent, 220) : T.accent) : (ah ? T.ddBtnHover : T.ddBtn), ar, ar.Height / 2);
-                PillText(g, g_calibrating ? L"Syncing\u2026" : L"Auto sync", g_fSmall600, need ? T.onAccent : T.t1, ar, StringAlignmentCenter);
+                if (need) {   // "● Not synced" in the accent, just before the button
+                    float nx0 = ar.X - S(8) - (S(11) + MeasureW(L"Not synced", g_f11));
+                    DWORD t = GetTickCount() % 1400; float al = 0.55f + 0.45f * cosf(t / 1400.f * 6.2832f);
+                    SolidBrush db(WithAlpha(T.accent, (int)(255 * al))); g.FillEllipse(&db, nx0, op.Y + op.Height / 2 - S(3), S(6), S(6));
+                    PillText(g, L"Not synced", g_f11, T.accent, RectF(nx0 + S(11), ar.Y, ar.X - nx0, ar.Height));
+                }
+                FillRound(g, need ? (ah ? WithAlpha(T.accent, 220) : T.accent) : (ah ? T.subtle3 : T.subtle2), ar, ar.Height / 2);
+                PillText(g, g_calibrating ? L"Syncing\u2026" : L"Auto sync", g_f11s, need ? T.onAccent : T.t1, ar, StringAlignmentCenter);
             }
         }
         return;
@@ -2709,26 +3067,29 @@ static void DrawEl(Graphics& g, int index) {
         bool playing = e.k == E_APP && AppPlaying(g_apps[e.idx]) && !g_apps[e.idx].mute;
         bool pickable = e.k == E_OUT || e.k == E_IN;
         bool rowHover = hovEl && g_hover.h == H_ROW;
-        // full-row, flat highlights
-        if (e.k == E_MASTER) FillRound(g, T.master, e.r, S(10));
-        else if (sel) {
-            if (T.glass && !T.dark) FillRound(g, Color(90, 255, 255, 255), e.r, S(10));
-            FillRound(g, rowHover ? T.subtle2 : T.subtle, e.r, S(10));   // neutral lift, then a light accent wash
-            int a = T.glass ? (T.dark ? (rowHover ? 22 : 16) : (rowHover ? 20 : 14)) : (rowHover ? 18 : 13);
-            FillRound(g, WithAlpha(T.accent, a), e.r, S(10));
-        } else if (playing) FillRound(g, WithAlpha(T.accent, T.glass ? 14 : 11), e.r, S(10));
-        else if (pickable && rowHover) FillRound(g, T.hover, e.r, S(10));
+        float rr = S(12);
+        // full-row, flat highlights (the design: selected = a light accent wash, playing = a faint one)
+        if (e.k == E_MASTER) FillRound(g, T.master, e.r, rr);
+        else if (sel) FillRound(g, T.selRow[rowHover ? 1 : 0], e.r, rr);
+        else if (playing) FillRound(g, WithAlpha(T.accent, 10), e.r, rr);
+        else if (pickable && rowHover) FillRound(g, T.hover, e.r, rr);
 
-        float cy1 = RowCy1(e), cy2 = RowCy2(e), lx = e.r.X + S(8) + S(16);
+        float cy1 = RowCy1(e), cy2 = RowCy2(e), lx = e.r.X + S(10) + S(16);
         std::wstring name, detail; wchar_t muteG = G_VOLUME;
-        bool muted = ElMuted(e);
+        bool muted = ElMuted(e), calDetail = false;
         if (e.k == E_APP) {
             AppGroup& a = g_apps[e.idx];
             name = a.name;
             Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
             float isz = S(24);
-            if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(lx - isz / 2, cy1 - isz / 2, isz, isz)); }
-            else { FillRound(g, T.badge, RectF(lx - S(12), cy1 - S(12), S(24), S(24)), S(7)); Glyph(g, a.system ? G_RINGER : G_APPS, g_fIconS, T.t1, lx, cy1); }
+            if (a.system) { FillRound(g, T.badge, RectF(lx - S(11), cy1 - S(11), S(22), S(22)), S(10)); Icon(g, "bell", S(14), T.t1, lx, cy1); }
+            else if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(lx - isz / 2, cy1 - isz / 2, isz, isz)); }
+            else {   // no icon: a tile with the app's first letter, like the design
+                static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
+                unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
+                RectF tr(lx - S(12), cy1 - S(12), S(24), S(24)); FillRound(g, Hex(tint[hsh % 6]), tr, S(7));
+                std::wstring l = a.name.substr(0, 1); Text(g, l.c_str(), g_fSmall600, Color(255, 255, 255, 255), tr, StringAlignmentCenter);
+            }
             muteG = muted ? G_MUTE : G_VOLUME;
         } else {
             wchar_t lg = G_VOLUME; int devIcon = -1; bool devBt = false;
@@ -2738,68 +3099,78 @@ static void DrawEl(Graphics& g, int index) {
                 name = d.name; detail = d.detail; lg = KindGlyph(d.kind); devIcon = d.icon; devBt = d.bt;
                 muteG = e.k == E_IN ? (muted ? G_MICOFF : G_MIC) : (muted ? G_MUTE : G_VOLUME);
             }
+            if (e.k == E_OUT && g_calibrating) {   // Auto sync: which speaker is chirping, and what each one measured
+                const std::wstring& oid = g_out[e.idx].id;
+                int pos = (int)(std::find(g_calIds.begin(), g_calIds.end(), oid) - g_calIds.begin());
+                if (pos < (int)g_calIds.size() && pos == g_calK && !g_calHeard.count(oid)) {
+                    detail = L"Chirp\u2026"; calDetail = true;
+                    float t = (GetTickCount() % 900) / 900.f, grow = S(4) + t * S(4);
+                    Pen rp(WithAlpha(T.accent, (int)(255 * (1 - t))), S(2)); GraphicsPath gp; AddRound(gp, RectF(lx - S(16) - grow, cy1 - S(16) - grow, S(32) + 2 * grow, S(32) + 2 * grow), S(13)); g.DrawPath(&rp, &gp);
+                    g_animating = true; KickAnim();
+                } else if (g_calHeard.count(oid)) { detail = L"\u2713 " + std::to_wstring(g_calHeard[oid]) + L" ms"; calDetail = true; }
+            }
             FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
             if (devIcon >= 0 && devIcon != DI_MIC) DrawDevIcon(g, devIcon, lx, cy1, sel ? T.onAccent : T.t1);
             else Glyph(g, lg, g_fIcon, sel ? T.onAccent : T.t1, lx, cy1);
             if (devBt) {   // Bluetooth: one clear blue circle on the corner of the icon
                 float bx = lx + S(13.5f), by = cy1 + S(13.5f), br = S(8.5f);
                 SolidBrush bb(Color(255, 31, 111, 235)); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
-                float k = S(11) / 20.f, ox = bx - 10 * k, oy = by - 10 * k;
-                Pen bp(Color(255, 255, 255, 255), std::max(1.f, 2.f * k)); bp.SetLineJoin(LineJoinRound); bp.SetStartCap(LineCapRound); bp.SetEndCap(LineCapRound);
-                PointF pts[6] = {PointF(ox + 7 * k, oy + 7 * k), PointF(ox + 13 * k, oy + 13 * k), PointF(ox + 10 * k, oy + 16 * k),
-                                 PointF(ox + 10 * k, oy + 4 * k), PointF(ox + 13 * k, oy + 7 * k), PointF(ox + 7 * k, oy + 13 * k)};
-                g.DrawLines(&bp, pts, 6);
+                Icon(g, "bt", S(11), Color(255, 255, 255, 255), bx, by);
             }
         }
-        float nx = e.r.X + S(8) + S(32) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
-        if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady() && AppRouted(e.idx)) {   // only when the app plays somewhere of its own
+        float nx = e.r.X + S(52), maxW = e.r.X + e.r.Width - S(8) - nx;
+        if (e.k == E_APP && !g_apps[e.idx].system) {   // where it plays: always shown, like Windows' volume mixer
             auto routes = AppRoutes(g_apps[e.idx]);
-            std::wstring lbl = OutName(routes[0]) + (routes.size() > 1 ? L" + " + std::to_wstring(routes.size() - 1) : L"");
-            g_appChipW[e.idx] = std::max(S(96), std::min(S(170), S(32) + TextW(g, lbl.c_str(), g_fSmall) + S(8)));
+            bool on = !routes.empty();
+            std::wstring lbl = on ? OutName(routes[0]) + (routes.size() > 1 ? L" + " + std::to_wstring(routes.size() - 1) : L"") : L"Default speaker";
+            g_appChipW[e.idx] = std::min(S(170), S(9) + S(13) + S(7) + TextW(g, lbl.c_str(), g_f11) + S(11));
             RectF c = AppOutChip(e);
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_APPOUT, open = g_ddOpen == e.idx && g_ddKind == 4;
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
-            Glyph(g, G_VOLUME, g_fIconS, T.accent, c.X + S(17), c.Y + c.Height / 2);
-            PillText(g, lbl.c_str(), g_fSmall, T.t1, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(6), c.Height));
-        }
-        if (e.k == E_APP && hovEl && g_hover.h == H_APPOUT && !AppRouted(e.idx)) {   // hovering the icon: hint that it opens the speaker list
-            RectF ir = AppIconRect(e); Pen hp(WithAlpha(T.accent, 160), S(1.5f)); GraphicsPath gp; AddRound(gp, ir, S(9)); g.DrawPath(&hp, &gp);
+            FillRound(g, hov || open ? T.subtle2 : T.subtle, c, c.Height / 2);
+            Icon(g, "speaker", S(13), on ? T.accent : (hov ? T.t1 : T.t3), c.X + S(9) + S(6.5f), c.Y + c.Height / 2);
+            PillText(g, lbl.c_str(), g_f11, on || hov ? T.t1 : T.t3, RectF(c.X + S(29), c.Y, c.Width - S(29) - S(9), c.Height));
         }
         if (e.k == E_OUT && OutHasApps(e.idx)) {   // which apps play here: icons only, each covering a fifth of the next
-            float ix = nx, iy = cy1 + S(12), isz = S(16);
+            float ix = nx, iy = cy1 + S(15), isz = S(18);
             std::vector<AppGroup*> here;
             for (auto& a : g_apps) { if (a.system) continue; auto r = AppRoutes(a); if (std::find(r.begin(), r.end(), g_out[e.idx].id) != r.end()) here.push_back(&a); }
             for (int k = (int)here.size() - 1; k >= 0; k--) {   // right to left, so each icon sits on top of the one after it
-                RectF ir(ix + k * (isz - S(3)), iy, isz, isz);
-                FillRound(g, Color(T.dark ? 110 : 55, 0, 0, 0), RectF(ir.X + S(1.5f), ir.Y + S(0.5f), ir.Width, ir.Height), S(4));   // small shadow
+                RectF ir(ix + k * (isz - S(4)), iy, isz, isz);
+                FillRound(g, Color(T.dark ? 100 : 56, 0, 0, 0), RectF(ir.X + S(1.5f), ir.Y, ir.Width, ir.Height), S(5));   // small shadow
                 Gdiplus::Bitmap* icn = here[k]->path.empty() ? nullptr : GetProcInfo(here[k]->path).icon;
                 if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, ir); }
-                else { FillRound(g, T.badge, ir, S(4)); std::wstring l = here[k]->name.substr(0, 1); Text(g, l.c_str(), g_fSmall600, T.t1, ir, StringAlignmentCenter); }
+                else {
+                    static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
+                    unsigned hsh = 0; for (wchar_t ch : here[k]->name) hsh = hsh * 31 + ch;
+                    FillRound(g, Hex(tint[hsh % 6]), ir, S(5)); std::wstring l = here[k]->name.substr(0, 1); Text(g, l.c_str(), g_fNum, Color(255, 255, 255, 255), ir, StringAlignmentCenter);
+                }
             }
         }
         if (e.k == E_OUT && HasDelayChip(e.idx)) {
+            wchar_t t[32]; swprintf(t, 32, L"+%d ms", DelayOf(e.idx));
+            g_delayChipW = S(9) + S(14) + S(7) + TextW(g, t, g_f11s) + S(11);
             RectF c = DelayChip(e);
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_DELAYCHIP, open = g_delayOpen == e.idx;
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);   // neutral pill; only the icon and time in the accent
-            wchar_t t[32]; swprintf(t, 32, L"+%d ms", DelayOf(e.idx));
-            Glyph(g, 0xE916, g_fIconS, T.accent, c.X + S(17), c.Y + c.Height / 2);   // stopwatch
-            PillText(g, t, g_fSmall600, T.accent, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(8), c.Height));
+            FillRound(g, hov || open ? T.subtle3 : T.subtle2, c, c.Height / 2);   // neutral pill; only the icon and time in the accent
+            Icon(g, "timer", S(14), T.accent, c.X + S(9) + S(7), c.Y + c.Height / 2);
+            PillText(g, t, g_f11s, T.accent, RectF(c.X + S(30), c.Y, c.Width - S(30), c.Height));
         }
         Font* nf = e.k == E_MASTER ? g_fName600 : g_fName;
-        float nw = std::min(TextW(g, name.c_str(), nf), maxW * 0.7f);
+        float nw = std::min(TextW(g, name.c_str(), nf), maxW * (detail.empty() ? 1.f : 0.7f));
         Text(g, name.c_str(), nf, T.t1, RectF(nx, cy1 - S(10), nw + S(2), S(20)));
-        float after = nx + nw + S(8);
-        if (!detail.empty()) Text(g, detail.c_str(), g_fSmall, T.t3, RectF(after, cy1 - S(9), std::max(0.f, maxW - nw - S(8)), S(18)));
+        float after = nx + nw + S(10);
+        if (!detail.empty()) Text(g, detail.c_str(), g_fSmall, calDetail ? T.accent : T.t3, RectF(after, cy1 - S(9), std::max(0.f, maxW - nw - S(10)), S(18)));
         if (playing) {   // live bars driven by the app's real peak level
             float lvl = std::min(1.f, g_live[g_apps[e.idx].key].smooth * 4.f);
             DWORD t = GetTickCount();
+            float bx = nx + nw - S(2) + S(8);
             for (int b = 0; b < 3; b++) {
                 float wob = 0.5f + 0.5f * sinf(t / (110.f + b * 35.f) + b * 2.1f);
                 float amp = 0.45f + 0.55f * lvl;
                 float hgt = S(3) + (S(10) - S(3)) * (0.15f + 0.85f * wob * amp);
-                FillRound(g, T.accent, RectF(after + b * S(4.5f), cy1 + S(5) - hgt, S(2.5f), hgt), S(1));
+                FillRound(g, T.accent, RectF(bx + b * S(4.5f), cy1 + S(5) - hgt, S(2.5f), hgt), S(1));
             }
         }
         RectF mr = CtlMute(e, cy2);
@@ -2819,7 +3190,7 @@ static void DrawEl(Graphics& g, int index) {
             bool hov = g_hover.h == H_PROFILE && g_hover.idx == c;
             bool active = !save && ProfileActive(c), empty = !save && ProfileEmpty(c);
             FillRound(g, hov || (save && g_saveOpen) ? T.ddBtnHover : T.ddBtn, r, S(16));
-            if (active) FillRound(g, WithAlpha(T.accent, T.glass ? 46 : 40), r, S(16));
+            if (active) FillRound(g, WithAlpha(T.accent, true ? 46 : 40), r, S(16));
             if (save) {
                 float tw = TextW(g, L"Save", g_fSmall), sx = r.X + (r.Width - (S(14) + S(6) + tw)) / 2;
                 Glyph(g, 0xE74E, g_fIconS, T.t1, sx + S(7), r.Y + r.Height / 2);
@@ -2833,13 +3204,14 @@ static void DrawEl(Graphics& g, int index) {
     }
     if (e.k == E_HK) {
         float cy = e.r.Y + e.r.Height / 2;
-        Text(g, HK_NAMES[e.idx], g_fName, T.t1, RectF(e.r.X + S(10), cy - S(10), e.r.Width - S(200), S(20)));
+        Text(g, HK_NAMES[g_sc[e.idx].act], g_fName, T.t1, RectF(e.r.X + S(10), cy - S(10), e.r.Width - S(200), S(20)));
         RectF c = HkChip(e);
         bool hov = hovEl && g_hover.h == H_HKCHIP, cap = g_capture == e.idx;
         FillRound(g, cap ? WithAlpha(T.accent, 46) : hov ? T.ddBtnHover : T.ddBtn, c, S(8));
-        std::wstring t = cap ? L"Press keys\u2026" : ComboName(g_hk[e.idx]);
-        Color tc = cap ? T.t1 : (!g_hk[e.idx].vk ? T.t3 : (!g_hk[e.idx].ok ? Color(255, 232, 72, 72) : T.t1));
-        if (!cap && g_hk[e.idx].vk && !g_hk[e.idx].ok) t += L"  (in use)";
+        HotKey& hk = g_sc[e.idx].k;
+        std::wstring t = cap ? L"Press keys\u2026" : ComboName(hk);
+        Color tc = cap ? T.t1 : (!hk.vk ? T.t3 : (!hk.ok ? Color(255, 232, 72, 72) : T.t1));
+        if (!cap && hk.vk && !hk.ok) t += L"  (in use)";
         Text(g, t.c_str(), g_fSmall, tc, RectF(c.X + S(8), c.Y, c.Width - S(16), c.Height), StringAlignmentCenter);
         return;
     }
@@ -2867,46 +3239,43 @@ static void DrawEl(Graphics& g, int index) {
     if (e.k == E_DTOP) {
         RectF pb = DTopProfile(e), ob = DTopOff(e);
         bool open = g_ddOpen >= 0 && g_ddKind == 3;
-        FillRound(g, open || (hovEl && g_hover.h == H_PROFDD) ? T.ddBtnHover : T.ddBtn, pb, S(T.glass ? 9 : 6));
+        FillRound(g, open || (hovEl && g_hover.h == H_PROFDD) ? T.ddBtnHover : T.ddBtn, pb, S(9));
         int act = -1; for (int i = 0; i < (int)g_prof.size(); i++) if (ProfileActive(i)) { act = i; break; }
-        Glyph(g, 0xE74E, g_fIconS, T.t2, pb.X + S(18), pb.Y + pb.Height / 2);
-        PillText(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(34), pb.Y, pb.Width - S(60), pb.Height));
-        float gx = pb.X + pb.Width - S(18), gy = pb.Y + pb.Height / 2;
-        if (open) { g.TranslateTransform(gx, gy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
-        else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, gy);
-        FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.ddBtnHover : T.ddBtn, ob, S(T.glass ? 9 : 6));
-        float tw = TextW(g, L"Turn off displays", g_fSmall), sx = ob.X + (ob.Width - (S(14) + S(6) + tw)) / 2;
-        Glyph(g, 0xE7E8, g_fIconS, T.t1, sx + S(7), ob.Y + ob.Height / 2);   // power
-        PillText(g, L"Turn off displays", g_fSmall, T.t1, RectF(sx + S(20), ob.Y, tw + S(4), ob.Height));
+        Icon(g, "save", S(13), T.t2, pb.X + S(11) + S(6.5f), pb.Y + pb.Height / 2);
+        PillText(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(32), pb.Y, pb.Width - S(60), pb.Height));
+        Icon(g, "chevron", S(14), T.t1, pb.X + pb.Width - S(19), pb.Y + pb.Height / 2, open ? 180.f : 0.f);
+        FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.subtle3 : T.subtle2, ob, S(8));
+        Icon(g, "power", S(14), hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, ob.X + S(12) + S(7), ob.Y + ob.Height / 2);
+        PillText(g, L"Turn off displays", g_fSmall, hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, RectF(ob.X + S(32), ob.Y, ob.Width - S(32), ob.Height));
         return;
     }
     MonUI& m = g_mons[e.idx];
-    float cy = e.r.Y + e.r.Height / 2, lx = e.r.X + S(8) + S(14);
+    float cy = e.r.Y + e.r.Height / 2, lx = e.r.X + S(8) + S(16);
     if (e.k == E_MONHEAD) {
         RectF nb(lx - S(10), cy - S(7.5f), S(20), S(15));
-        GraphicsPath p; AddRound(p, nb, S(3));
+        GraphicsPath p; AddRound(p, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(3.5f));
         Pen pen(T.t1, S(1.5f)); g.DrawPath(&pen, &p);
         wchar_t num[4]; swprintf(num, 4, L"%d", e.idx + 1);
         Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter);
-        float nx = e.r.X + S(8) + S(28) + S(10);
+        float nx = e.r.X + S(50);
         auto pill = [&](RectF r, bool on, bool hov) {   // small outlined pill; filled with the accent when on
             if (on) FillRound(g, T.accent, r, r.Height / 2);
-            else { if (hov) FillRound(g, T.subtle, r, r.Height / 2); Pen op(WithAlpha(T.t1, 70), S(1)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), r.Height / 2); g.DrawPath(&op, &gp); }
+            else { if (hov) FillRound(g, T.subtle, r, r.Height / 2); Pen op(WithAlpha(T.t1, 64), S(1)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), r.Height / 2 - S(0.5f)); g.DrawPath(&op, &gp); }
         };
         bool nOn = g_night.count(m.name) && g_night[m.name].on;
-        RectF mp = MoonPill(e); pill(mp, nOn, hovEl && g_hover.h == H_NIGHT);
-        Glyph(g, 0xE708, g_fIconS, nOn ? T.onAccent : T.t2, mp.X + mp.Width / 2, mp.Y + mp.Height / 2);   // moon
+        RectF mp = MoonPill(e); bool mh = hovEl && g_hover.h == H_NIGHT; pill(mp, nOn, false);
+        Icon(g, "moon", S(12), nOn ? T.onAccent : mh ? T.t1 : T.t3, mp.X + mp.Width / 2, mp.Y + mp.Height / 2);
         float left = mp.X;
         if (m.hdrOk) {
-            RectF hp = HdrPill(e); pill(hp, m.hdr, hovEl && g_hover.h == H_HDR);
-            PillText(g, L"HDR", g_fSmall600, m.hdr ? T.onAccent : T.t2, hp, StringAlignmentCenter); left = hp.X;
+            RectF hp = HdrPill(e); bool hh = hovEl && g_hover.h == H_HDR; pill(hp, m.hdr, false);
+            SpacedText(g, L"HDR", g_fH3, m.hdr ? T.onAccent : hh ? T.t1 : T.t3, hp.X + (hp.Width - MeasureW(L"HDR", g_fH3) - S(2)) / 2, hp.Y + hp.Height / 2, S(0.4f)); left = hp.X;
         }
         if (HasRates(e.idx)) {
-            RectF rp = RateBtn(e); bool open = g_ddOpen == e.idx && g_ddKind == 1;
-            pill(rp, false, open || (hovEl && g_hover.h == H_RATEDD));
+            RectF rp = RateBtn(e); bool open = g_ddOpen == e.idx && g_ddKind == 1, rh = open || (hovEl && g_hover.h == H_RATEDD);
+            pill(rp, false, rh);
             std::wstring r = std::to_wstring(m.rate) + L" Hz";
-            PillText(g, r.c_str(), g_fSmall600, T.t1, RectF(rp.X + S(9), rp.Y, rp.Width - S(26), rp.Height));
-            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, rp.X + rp.Width - S(12), rp.Y + rp.Height / 2);
+            PillText(g, r.c_str(), g_f11s, rh ? T.t1 : T.t2, RectF(rp.X + S(9), rp.Y, rp.Width - S(9), rp.Height));
+            Icon(g, "chevron", S(11), rh ? T.t1 : T.t2, rp.X + rp.Width - S(7) - S(5.5f), rp.Y + rp.Height / 2, open ? 180.f : 0.f);
             left = rp.X;
         }
         float maxW = left - S(8) - nx;
@@ -2914,42 +3283,42 @@ static void DrawEl(Graphics& g, int index) {
         return;
     }
     if (e.k == E_MONO) {   // orientation · input · extend / duplicate, across the whole row
-        auto ddBtn = [&](RectF b, const std::wstring& label, bool open, bool hov, int badge) {
+        auto ddBtn = [&](RectF b, const std::wstring& label, bool open, bool hov, int badge, bool input) {
             float bcy = b.Y + b.Height / 2;
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, b, S(T.glass ? 9 : 6));
-            float tx = b.X + S(10);
+            FillRound(g, hov || open ? T.ddBtnHover : input ? T.subtle2 : T.ddBtn, b, S(9));
+            float tx = b.X + S(9);
             if (badge > 0) {   // the screen it copies, by its number
-                RectF nb(tx, bcy - S(7), S(18), S(14)); GraphicsPath gp; AddRound(gp, nb, S(3)); Pen pp(T.t1, S(1.3f)); g.DrawPath(&pp, &gp);
-                wchar_t num[4]; swprintf(num, 4, L"%d", badge); Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter); tx += S(24);
+                RectF nb(tx, bcy - S(8), S(18), S(16)); GraphicsPath gp; AddRound(gp, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(3.5f));
+                Pen pp(WithAlpha(T.t1, 217), S(1.5f)); g.DrawPath(&pp, &gp);
+                wchar_t num[4]; swprintf(num, 4, L"%d", badge); Text(g, num, g_fNum, WithAlpha(T.t1, 217), nb, StringAlignmentCenter); tx += S(26);
             }
             PillText(g, label.c_str(), g_fSmall, T.t1, RectF(tx, b.Y, b.X + b.Width - S(26) - tx, b.Height));
-            float gx = b.X + b.Width - S(14);
-            if (open) { g.TranslateTransform(gx, bcy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t2, 0, 0); g.ResetTransform(); }
-            else Glyph(g, G_CHEVDOWN, g_fIconS, T.t2, gx, bcy);
+            Icon(g, "chevron", S(input ? 12 : 14), T.t1, b.X + b.Width - S(14), bcy, open ? 180.f : 0.f);
         };
         int o = std::max(0, std::min(3, m.orient));
-        ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN, 0);
-        if (HasInputs(e.idx)) ddBtn(InputBtn(e), m.input >= 0 ? InputName(m.input, m.inputs) : L"Input", g_ddOpen == e.idx && g_ddKind == 2, hovEl && g_hover.h == H_INPUTDD, 0);
+        ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN, 0, false);
+        if (HasInputs(e.idx)) ddBtn(InputBtn(e), m.input >= 0 ? InputName(m.input, m.inputs) : L"Input", g_ddOpen == e.idx && g_ddKind == 2, hovEl && g_hover.h == H_INPUTDD, 0, true);
         if (HasMode(e.idx)) {
             bool dup = m.cloneOf >= 0 && m.cloneOf < (int)g_mons.size();
-            ddBtn(MonoBtn(e, 2), dup ? g_mons[m.cloneOf].name : L"Extend", g_ddOpen == e.idx && g_ddKind == 5, hovEl && g_hover.h == H_MODEDD, dup ? m.cloneOf + 1 : 0);
+            ddBtn(MonoBtn(e, 2), dup ? g_mons[m.cloneOf].name : L"Extend", g_ddOpen == e.idx && g_ddKind == 5, hovEl && g_hover.h == H_MODEDD, dup ? m.cloneOf + 1 : 0, false);
         }
         return;
     }
-    if (e.k == E_MONC) {   // contrast: a circle, half filled
-        float ccx = e.r.X + S(6) + S(16), rr = S(7);
-        Pen cp(T.t1, S(1.5f)); g.DrawEllipse(&cp, ccx - rr, cy - rr, 2 * rr, 2 * rr);
-        SolidBrush cb(T.t1); g.FillPie(&cb, ccx - rr, cy - rr, 2 * rr, 2 * rr, -90.f, 180.f);
-    } else if (e.k == E_MONDIM) Glyph(g, 0xEC8A, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);   // lower brightness
-    else if (e.k == E_MONNL) Glyph(g, 0xE708, g_fIcon, Color(255, 255, 154, 60), e.r.X + S(6) + S(16), cy);   // moon, warm
-    else Glyph(g, G_BRIGHT, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
+    float icx = e.r.X + S(6) + S(16);
+    if (e.k == E_MONC) Icon(g, "contrast", S(18), T.t1, icx, cy);
+    else if (e.k == E_MONDIM) Icon(g, "sunLow", S(18), T.t1, icx, cy);              // dim further
+    else if (e.k == E_MONNL) Icon(g, "moon", S(18), Color(255, 255, 154, 60), icx, cy);   // night light strength, warm
+    else Icon(g, "sun", S(18), T.t1, icx, cy);
     RectF sl = CtlSlider(e, cy);
     if (e.k == E_MONDIM || e.k == E_MONNL) {   // Knob's own controls: always available
         float v = ElValue(e);
         int st = g_dragEl == index ? 2 : (hovEl && g_hover.h == H_SLIDER ? 1 : 0);
         DrawSlider(g, sl, v, false, st);
-        if (e.k == E_MONDIM && v <= 0.001f) { RectF vr = CtlVal(e, cy); FillRound(g, T.valBg, vr, S(5)); Text(g, L"Off", g_fSmall600, T.t3, vr, StringAlignmentCenter); }
-        else DrawValue(g, CtlVal(e, cy), (int)lround(v * (e.k == E_MONDIM ? 80 : 100)));
+        RectF vr = CtlVal(e, cy);
+        if (e.k == E_MONDIM) {   // "Off", or how much darker, in the accent
+            wchar_t t[8]; int dv = (int)lround(v * 80); if (dv > 0) swprintf(t, 8, L"%d", dv); else wcscpy(t, L"Off");
+            FillRound(g, T.valBg, vr, S(8)); PillText(g, t, g_f11, dv > 0 ? T.accent : T.t2, vr, StringAlignmentCenter);
+        } else DrawValue(g, vr, (int)lround(v * 100));
         return;
     }
     if (!m.ok) { Text(g, L"Not available — turn on DDC/CI in the monitor menu", g_fSmall, T.t3, RectF(sl.X - S(8), sl.Y, sl.Width + S(46), sl.Height)); return; }
@@ -2960,14 +3329,12 @@ static void DrawEl(Graphics& g, int index) {
 }
 
 // ---- small motion: popups open with a short fade + slide, the tab pill glides between tabs
-enum { TIMER_POP = 12 };
 static const DWORD POP_MS = 170, TAB_MS = 240;
 struct PopAnim { long long key = LLONG_MIN; DWORD start = 0; Bitmap* snap = nullptr; RectF box; float m = 0; bool up = false, closing = false; DWORD closeStart = 0; };
 static const DWORD CLOSE_MS = 130;
 static PopAnim g_paDD, g_paDelay, g_paMenu, g_paSave, g_paSetDD;
-static bool g_animating = false;
 static DWORD g_tabStart = 0; static float g_tabFrom = 0, g_tabTo = 0;
-static void KickAnim() { if (g_hwnd) SetTimer(g_hwnd, TIMER_POP, 15, nullptr); }
+
 static float PopT(PopAnim& a, long long key) {
     if (key != a.key) { a.key = key; a.start = GetTickCount(); a.closing = false; KickAnim(); }
     float t = (GetTickCount() - a.start) / (float)POP_MS;
@@ -3020,103 +3387,193 @@ static void DrawDropdownBody(Graphics& g) {
     RectF btn;
     if (!DropdownRect(btn)) return;
     RectF pop = DropdownPopup(btn);
-    float rad = S(T.glass ? 12 : 8);
+    float rad = S(12);
     Shadow(g, pop, rad);
     FillRound(g, T.popup, pop, rad);
     int curIdx; auto opts = DropdownOptions(curIdx);
+    std::vector<std::wstring> routes;
+    if (g_ddKind == 4 && g_ddOpen >= 0 && g_ddOpen < (int)g_apps.size()) routes = AppRoutes(g_apps[g_ddOpen]);
     for (int i = 0; i < (int)opts.size(); i++) {
         RectF r = DropdownOption(pop, i);
+        float ex = DdExtraBefore(i);
+        if (ex > 0) {   // the line (and heading) above this item
+            float ly = r.Y - ex + S(4);
+            SolidBrush lb(T.subtle2); g.FillRectangle(&lb, pop.X + S(10), ly, pop.Width - S(20), S(1));
+            if (g_ddKind == 5) Text(g, L"Duplicate", g_f11, T.t3, RectF(r.X + S(12), ly + S(4), r.Width, S(19)));
+        }
         bool cur = curIdx == i && g_ddKind != 4, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
-        if (cur) {
-            if (T.glass) FillRound(g, WithAlpha(T.accent, 36), r, S(8));
-            else { FillRound(g, T.subtle, r, S(5)); FillRound(g, T.accent, RectF(r.X, r.Y + S(9), S(3), S(14)), S(1.5f)); }
-        }
-        if (hov) FillRound(g, T.subtle2, r, S(T.glass ? 8 : 5));
-        bool tick = false;
-        if (g_ddKind == 4 && g_ddOpen >= 0 && g_ddOpen < (int)g_apps.size()) {   // ticks for where the app plays
-            auto routes = AppRoutes(g_apps[g_ddOpen]);
-            if (i == 0) tick = routes.empty();
-            else if (i - 1 < (int)g_out.size()) tick = std::find(routes.begin(), routes.end(), g_out[i - 1].id) != routes.end();
-            if (i == (int)opts.size() - 1) { SolidBrush lb(T.subtle2); g.FillRectangle(&lb, r.X + S(8), r.Y - S(1.5f), r.Width - S(16), S(1)); }
-        }
+        if (cur) FillRound(g, WithAlpha(T.accent, 36), r, S(8));
+        else if (hov) FillRound(g, T.subtle, r, S(8));
         float tx = r.X + S(12);
-        if (g_ddKind == 4 && i < (int)opts.size() - 1) {   // Windows 11 style: checkboxes (round for "Default speaker", or for every row on Windows 10)
-            bool round = i == 0 || !ProcLoopbackOk();
-            RectF bx(r.X + S(10), r.Y + r.Height / 2 - S(8), S(16), S(16));
-            if (tick) FillRound(g, T.accent, bx, round ? S(8) : S(4));
-            else { Pen bp(WithAlpha(T.t1, 140), S(1)); GraphicsPath gp; AddRound(gp, RectF(bx.X + S(0.5f), bx.Y + S(0.5f), bx.Width - S(1), bx.Height - S(1)), round ? S(7.5f) : S(3.5f)); g.DrawPath(&bp, &gp); }
-            if (tick) Glyph(g, 0xE73E, g_fIconS, T.onAccent, bx.X + bx.Width / 2, bx.Y + bx.Height / 2);
+        if (g_ddKind == 4) {   // a tick box per speaker (Windows 11 can copy an app to several)
+            bool tick = i == 0 ? routes.empty() : (i - 1 < (int)g_out.size() && std::find(routes.begin(), routes.end(), g_out[i - 1].id) != routes.end());
+            RectF bx(r.X + S(12), r.Y + r.Height / 2 - S(8), S(16), S(16));
+            if (tick) FillRound(g, T.accent, bx, S(4));
+            else {
+                FillRound(g, WithAlpha(T.t1, hov ? 23 : 10), bx, S(4));
+                Pen bp(WithAlpha(T.t1, 140), S(1)); GraphicsPath gp; AddRound(gp, RectF(bx.X + S(0.5f), bx.Y + S(0.5f), bx.Width - S(1), bx.Height - S(1)), S(3.5f)); g.DrawPath(&bp, &gp);
+            }
+            if (tick) { Pen cp(T.onAccent, S(1.5f)); cp.SetStartCap(LineCapRound); cp.SetEndCap(LineCapRound); cp.SetLineJoin(LineJoinRound);
+                        float k = S(10) / 20.f, ox = bx.X + S(3), oy = bx.Y + S(3); PointF pts[3] = {PointF(ox + 4 * k, oy + 10.5f * k), PointF(ox + 7.5f * k, oy + 14 * k), PointF(ox + 16 * k, oy + 6 * k)};
+                        g.DrawLines(&cp, pts, 3); }
             tx = bx.X + bx.Width + S(10);
         }
-        Text(g, opts[i].c_str(), g_fName, g_ddKind == 4 && i == (int)opts.size() - 1 ? T.accent : T.t1, RectF(tx, r.Y, r.X + r.Width - S(6) - tx, r.Height));
+        if (g_ddKind == 5 && i > 0 && i < (int)g_ddModeMap.size()) {   // the screen's number in a small box
+            RectF nb(tx, r.Y + r.Height / 2 - S(8), S(18), S(16)); GraphicsPath gp; AddRound(gp, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(3.5f));
+            Pen pp(WithAlpha(T.t1, 217), S(1.5f)); g.DrawPath(&pp, &gp);
+            wchar_t num[4]; swprintf(num, 4, L"%d", g_ddModeMap[i] + 1); Text(g, num, g_fNum, WithAlpha(T.t1, 217), nb, StringAlignmentCenter);
+            tx += S(26);
+        }
+        if (g_ddKind == 3 && i < (int)g_ddProfMap.size() && g_ddProfMap[i] == -1) { Icon(g, "plus", S(13), T.t1, tx + S(6.5f), r.Y + r.Height / 2); tx += S(19); }
+        Text(g, opts[i].c_str(), g_fName, T.t1, RectF(tx, r.Y, r.X + r.Width - S(6) - tx, r.Height));
     }
 }
 
-static RectF CalCard() {
-    int n = g_calibrating ? 0 : SpeakersInUse();
-    float h = S(70) + (g_calibrating ? S(14) : n * S(22) + S(40));
-    return RectF(PaneX(), PaneBottom() - S(8) - h, PaneW(), h);
+static void GhostBtn(Graphics& g, RectF b, const wchar_t* t, bool hov, bool accent = false, bool enabled = true) {   // the design's small round buttons
+    FillRound(g, accent && enabled ? (hov ? WithAlpha(T.accent, 225) : T.accent) : (hov && enabled ? T.subtle3 : T.subtle2), b, b.Height / 2);
+    Text(g, t, g_f11s, accent && enabled ? T.onAccent : enabled ? T.t1 : T.t3, b, StringAlignmentCenter);
 }
-static RectF CalDoneBtn() { RectF c = CalCard(); return RectF(c.X + c.Width - S(14) - S(76), c.Y + c.Height - S(12) - S(28), S(76), S(28)); }
-static void DrawCalCard(Graphics& g) {   // Auto sync: keep the room quiet, then what each speaker waits
+// ---- Auto sync card (the design's "bpop"): ask first, then which speaker is chirping, then what each one waits
+static bool CalFailed() { return !g_calibrating && !g_calAsk && !g_calStatus.empty() && g_calStatus.rfind(L"In sync", 0) != 0; }
+struct RichWord { std::wstring w; bool bold; };
+static std::vector<std::vector<RichWord>> CalText(float width) {   // the card's sentence, wrapped; some words bold
+    std::vector<RichWord> words;
+    auto addWords = [&](const std::wstring& s, bool b) { std::wstring cur; for (wchar_t c : s + L" ") { if (c == L' ') { if (!cur.empty()) words.push_back({cur, b}); cur.clear(); } else cur += c; } };
+    if (g_calAsk) { addWords(L"Knob plays a short chirp on each speaker and listens with your microphone.", false); addWords(L"Pause music and keep the room quiet.", true); }
+    else if (g_calibrating) { addWords(L"Listening for", false); addWords((g_calK < (int)g_calNames.size() ? g_calNames[g_calK] : std::wstring(L"the speakers")) + L"…", true); }
+    else if (CalFailed()) addWords(g_calStatus, false);
+    std::vector<std::vector<RichWord>> lines(1);
+    float x = 0, sp = MeasureW(L"a b", g_fSmall) - MeasureW(L"ab", g_fSmall);
+    for (auto& w : words) {
+        float ww = MeasureW(w.w.c_str(), g_fSmall) - S(2);
+        if (x > 0 && x + ww > width) { lines.push_back({}); x = 0; }
+        lines.back().push_back(w); x += ww + sp;
+    }
+    if (lines.back().empty()) lines.pop_back();
+    return lines;
+}
+static float CalBodyH() {
+    float w = PaneW() + S(10) - S(28);
+    if (!g_calAsk && !g_calibrating && !CalFailed()) return S(4) + (float)UsedSpeakers().size() * S(21) - S(5) + S(12);   // the list
+    float h = CalText(w).size() * S(17.25f) + S(10);
+    if (g_calibrating) h += S(2) + S(4) + S(12);   // progress bar
+    return h;
+}
+static RectF CalCard() {
+    float h = S(14) + S(17) + S(4) + CalBodyH() + S(24) + S(14);
+    return RectF(S(12), PaneBottom() - S(14) - h, g_W - S(24), h);
+}
+static RectF CalBtn(int which) {
+    RectF c = CalCard(); float y = c.Y + c.Height - S(14) - S(24);
+    const wchar_t* primary = g_calAsk ? L"Start" : g_calibrating ? nullptr : L"Done";
+    const wchar_t* second = g_calAsk ? L"Cancel" : g_calibrating ? L"Stop" : nullptr;
+    float pw = primary ? S(22) + MeasureW(primary, g_f11s) : 0, x = c.X + c.Width - S(14);
+    if (which == 1) return primary ? RectF(x - pw, y, pw, S(24)) : RectF();
+    if (!second) return RectF();
+    float sw = S(22) + MeasureW(second, g_f11s);
+    return RectF(x - (primary ? pw + S(6) : 0) - sw, y, sw, S(24));
+}
+static void DrawCalCard(Graphics& g) {
     if (!g_calShow) return;
-    RectF c = CalCard(); float rad = S(T.glass ? 12 : 8);
+    RectF c = CalCard(); float rad = S(12);
     Shadow(g, c, rad); FillRound(g, T.popup, c, rad);
-    Glyph(g, 0xE916, g_fIconS, T.accent, c.X + S(24), c.Y + S(22));
-    Text(g, g_calibrating ? L"Auto sync \u00b7 measuring" : L"Auto sync", g_fName600, T.t1, RectF(c.X + S(40), c.Y + S(10), c.Width - S(56), S(24)));
-    std::wstring st = g_calibrating ? L"Each speaker plays a short chirp; the microphone times it. Keep the room quiet." : g_calStatus;
-    TextWrap(g, st.c_str(), g_fSmall, T.t3, RectF(c.X + S(16), c.Y + S(36), c.Width - S(32), S(32)));
-    if (g_calibrating) {   // a small sliding bar while it listens
-        RectF bar(c.X + S(16), c.Y + c.Height - S(18), c.Width - S(32), S(4));
-        FillRound(g, T.track, bar, S(2));
-        float t = (GetTickCount() % 1400) / 1400.f, w = bar.Width * 0.3f;
-        FillRound(g, T.accent, RectF(bar.X + (bar.Width - w) * (0.5f - 0.5f * cosf(t * 6.2832f)), bar.Y, w, bar.Height), S(2));
-        g_animating = true; KickAnim();
-        return;
+    Font f13(g_famSemi, S(13), FontStyleRegular, UnitPixel), fB(g_famSemi, S(11.5f), FontStyleRegular, UnitPixel);
+    bool done = !g_calAsk && !g_calibrating && !CalFailed();
+    std::wstring title = g_calAsk ? L"Auto sync" : g_calibrating ? L"Measuring " + std::to_wstring(std::min(g_calK + 1, (int)std::max<size_t>(1, g_calIds.size()))) + L" of " + std::to_wstring(std::max<size_t>(1, g_calIds.size()))
+                       : done ? L"Synced" : L"Couldn't sync";
+    float tx = c.X + S(14), ty = c.Y + S(14) + S(8.5f);
+    Icon(g, done ? "check" : "timer", S(15), T.accent, tx + S(7.5f), ty);
+    Text(g, title.c_str(), &f13, T.t1, RectF(tx + S(23), ty - S(10), c.Width - S(50), S(20)));
+    float y = c.Y + S(14) + S(17) + S(4);
+    if (done) {   // what each speaker waits; the slowest waits nothing
+        y += S(4);
+        for (auto& id : UsedSpeakers()) {
+            int d = ShownDelay(id);
+            Text(g, OutName(id).c_str(), g_fSmall, T.t1, RectF(tx, y, c.Width - S(140), S(16)));
+            if (d) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", d); Text(g, t, &fB, T.accent, RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar); }
+            else Text(g, L"slowest · 0 ms", g_fSmall, T.t3, RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar);
+            y += S(21);
+        }
+    } else {
+        auto lines = CalText(c.Width - S(28));
+        float sp = MeasureW(L"a b", g_fSmall) - MeasureW(L"ab", g_fSmall);
+        for (auto& ln : lines) {
+            float x = tx;
+            for (auto& w : ln) { Font* f = w.bold ? &fB : g_fSmall; Text(g, w.w.c_str(), f, w.bold ? T.t1 : T.t3, RectF(x - S(1), y, S(400), S(17.25f))); x += TextW(g, w.w.c_str(), f) - S(2) + sp; }
+            y += S(17.25f);
+        }
+        y += S(10);
+        if (g_calibrating) {   // how far along
+            RectF bar(tx, y + S(2), c.Width - S(28), S(4));
+            FillRound(g, T.subtle2, bar, S(2));
+            float f = g_calIds.empty() ? 0.f : (float)g_calK / g_calIds.size();
+            if (f > 0) FillRound(g, T.accent, RectF(bar.X, bar.Y, bar.Width * f, bar.Height), S(2));
+        }
     }
-    float y = c.Y + S(70);
-    for (auto& id : UsedSpeakers()) {
-        int d = ShownDelay(id);
-        Text(g, OutName(id).c_str(), g_fSmall, T.t1, RectF(c.X + S(16), y, c.Width - S(120), S(22)));
-        wchar_t t[24]; if (d) swprintf(t, 24, L"+%d ms", d); else wcscpy(t, L"0 ms \u00b7 slowest");
-        Text(g, t, g_fSmall600, d ? T.accent : T.t3, RectF(c.X + c.Width - S(130), y, S(114), S(22)), StringAlignmentFar);
-        y += S(22);
-    }
-    RectF b = CalDoneBtn();
-    FillRound(g, g_hover.h == H_CALDONE ? WithAlpha(T.accent, 220) : T.accent, b, S(6));
-    Text(g, L"Done", g_fSmall600, T.onAccent, b, StringAlignmentCenter);
+    RectF b0 = CalBtn(0), b1 = CalBtn(1);
+    if (b0.Width > 0) GhostBtn(g, b0, g_calAsk ? L"Cancel" : L"Stop", g_hover.h == H_CALCANCEL);
+    if (b1.Width > 0) GhostBtn(g, b1, g_calAsk ? L"Start" : L"Done", g_hover.h == H_CALSTART || g_hover.h == H_CALDONE, true);
+}
+static int MeasuredShown(const std::wstring& id) {   // what Auto sync measured, shown the same way as the chip (slowest 0)
+    auto it = g_delayMeasured.find(id); if (it == g_delayMeasured.end()) return ShownDelay(id);
+    int m = 0; bool first = true;
+    for (auto& u : UsedSpeakers()) { auto f = g_delayMeasured.find(u); int d = f != g_delayMeasured.end() ? f->second : DelayFor(u); if (first || d < m) m = d; first = false; }
+    bool isDef = false; for (auto& o : g_out) if (o.id == id && o.isDefault) isDef = true;
+    return (isDef ? 0 : it->second) - m;
+}
+static std::wstring DelayNote(int i, bool*) {
+    if (i < 0 || i >= (int)g_out.size()) return L"";
+    int base = MeasuredShown(g_out[i].id), now = DelayOf(i), tweak = now - base;
+    std::wstring s = L"Auto sync measured +" + std::to_wstring(base) + L" ms";
+    if (tweak) s += L". Your tweak: " + std::wstring(tweak > 0 ? L"+" : L"−") + std::to_wstring(abs(tweak)) + L" ms";
+    return s + L".";
+}
+static float DelayNoteLines() {
+    Bitmap b(4, 4); Graphics g(&b);
+    StringFormat sf; RectF out; INT chars = 0, lines = 0;
+    std::wstring t = DelayNote(g_delayOpen);
+    g.MeasureString(t.c_str(), -1, g_fSmall, RectF(0, 0, S(228), 1000), &sf, &out, &chars, &lines);
+    return (float)std::max(1, (int)lines);
 }
 static void DrawDelayPopupBody(Graphics& g) {
     RectF chip;
     if (g_delayOpen < 0 || !DelayAnchor(chip)) return;
     RectF pop = DelayPopup(chip);
-    float rad = S(T.glass ? 12 : 8);
+    float rad = S(10);
     Shadow(g, pop, rad);
     FillRound(g, T.popup, pop, rad);
-    Text(g, g_out[g_delayOpen].name.c_str(), g_fName600, T.t1, RectF(pop.X + S(16), pop.Y + S(8), pop.Width - S(32), S(24)));
+    Font f13(g_famSemi, S(13), FontStyleRegular, UnitPixel);
+    Text(g, OutLabel(g_out[g_delayOpen]).c_str(), &f13, T.t1, RectF(pop.X + S(14), pop.Y + S(12), pop.Width - S(28), S(17)));
     for (int k = 0; k < 2; k++) {
         RectF b = k ? DlPlus(pop) : DlMinus(pop); bool hv = g_hover.h == (k ? H_DLPLUS : H_DLMINUS);
-        FillRound(g, hv ? T.ddBtnHover : T.ddBtn, b, S(8));
-        Text(g, k ? L"+" : L"\u2212", g_fName600, T.t1, b, StringAlignmentCenter);
+        FillRound(g, hv ? T.subtle3 : T.subtle2, b, S(8));
+        Font f18(g_famText, S(18), FontStyleRegular, UnitPixel);
+        Text(g, k ? L"+" : L"−", &f18, T.t1, b, StringAlignmentCenter);
     }
-    wchar_t t[16]; swprintf(t, 16, L"+%d ms", DelayOf(g_delayOpen));
-    Text(g, t, g_fName600, T.accent, RectF(pop.X + S(56), pop.Y + S(38), pop.Width - S(112), S(34)), StringAlignmentCenter);
-    Text(g, L"5 ms per click. Below 0 holds the other speakers back instead.", g_fSmall, T.t3, RectF(pop.X + S(16), pop.Y + S(76), pop.Width - S(32), S(20)));
-    RectF sb = DlSync(pop);
-    FillRound(g, g_hover.h == H_DLSYNC ? T.ddBtnHover : T.ddBtn, sb, S(6));
-    Text(g, L"Run Auto sync again", g_fSmall, g_calibrating ? T.t3 : T.t1, sb, StringAlignmentCenter);
+    {   // "+200 ms", big, in the accent
+        Font f21(g_famSemi, S(21), FontStyleRegular, UnitPixel);
+        wchar_t t[16]; swprintf(t, 16, L"+%d", DelayOf(g_delayOpen));
+        float w1 = TextW(g, t, &f21), w2 = TextW(g, L"ms", g_fSmall), cx = pop.X + pop.Width / 2, x = cx - (w1 + S(2) + w2) / 2, cy = pop.Y + S(37) + S(17);
+        Text(g, t, &f21, T.accent, RectF(x, cy - S(14), w1 + S(4), S(28)));
+        Text(g, L"ms", g_fSmall, T.t3, RectF(x + w1 + S(2) - S(2), cy - S(7), w2 + S(6), S(18)));
+    }
+    std::wstring note = DelayNote(g_delayOpen);
+    TextWrap(g, note.c_str(), g_fSmall, T.t3, RectF(pop.X + S(14), pop.Y + S(79), pop.Width - S(28), DelayNoteLines() * S(17.25f) + S(4)));
+    bool canReset = DelayOf(g_delayOpen) != MeasuredShown(g_out[g_delayOpen].id);
+    GhostBtn(g, DlReset(pop), L"Reset", g_hover.h == H_DLRESET, false, canReset);
+    GhostBtn(g, DlSync(pop), L"Run Auto sync again", g_hover.h == H_DLSYNC, false, !g_calibrating);
 }
 
 static void DrawSavePopupBody(Graphics& g) {
     RectF chip;
     if (!g_saveOpen || !SaveAnchor(chip)) return;
     RectF pop = SavePopup(chip);
-    float rad = S(T.glass ? 12 : 8);
+    float rad = S(true ? 12 : 8);
     Shadow(g, pop, rad);
     FillRound(g, T.popup, pop, rad);
     for (int i = 0; i < SaveOptCount(); i++) {
         RectF r = SaveOption(pop, i);
-        if (g_hover.h == H_SAVEOPT && g_hover.idx == i) FillRound(g, T.subtle2, r, S(T.glass ? 8 : 5));
+        if (g_hover.h == H_SAVEOPT && g_hover.idx == i) FillRound(g, T.subtle2, r, S(true ? 8 : 5));
         bool isNew = i == (int)g_prof.size();
         std::wstring t = isNew ? std::wstring(L"New profile\u2026") : L"Save as " + g_prof[i].name;
         if (isNew) { Glyph(g, 0xE710, g_fIconS, T.t1, r.X + S(18), r.Y + r.Height / 2); Text(g, t.c_str(), g_fName, T.t1, RectF(r.X + S(34), r.Y, r.Width - S(38), r.Height)); }
@@ -3254,6 +3711,13 @@ static void Paint(HDC hdc) {
 
         // pane
         g.SetClip(RectF(0, PaneTop(), (float)g_W, PaneBottom() - PaneTop()));
+        for (int i = 0; i < (int)g_els.size(); i++) {   // a screen with night light on gets a faint warm wash, as in the design
+            if (g_els[i].k != E_MONHEAD) continue;
+            int mi = g_els[i].idx; if (mi < 0 || mi >= (int)g_mons.size() || !g_night.count(g_mons[mi].name) || !g_night[g_mons[mi].name].on) continue;
+            float bottom = g_els[i].r.Y + g_els[i].r.Height;
+            for (auto& e2 : g_els) if (e2.idx == mi && (e2.k == E_MONB || e2.k == E_MONC || e2.k == E_MONDIM || e2.k == E_MONNL || e2.k == E_MONO)) bottom = std::max(bottom, e2.r.Y + e2.r.Height);
+            FillRound(g, Color(18, 255, 138, 42), RectF(g_els[i].r.X, g_els[i].r.Y - S(4), g_els[i].r.Width, bottom + S(2) - g_els[i].r.Y + S(4)), S(10));
+        }
         for (int i = 0; i < (int)g_els.size(); i++) DrawEl(g, i);
         float view = PaneBottom() - PaneTop();
         if (g_contentH > view + 1) {
@@ -3278,11 +3742,10 @@ static void Paint(HDC hdc) {
         // tabs
         FillRound(g, T.tabsBg, RectF(S(12), S(12), g_W - S(24), S(38)), S(8));
         const wchar_t* names[3] = {L"Sound", L"Apps", L"Display"};
-        wchar_t glyphs[3] = {G_VOLUME, G_APPS, G_BRIGHT};
         {   // the selected pill glides from tab to tab
             RectF r0 = TabRect(0), r1 = TabRect(1);
             RectF pr(r0.X + TabPos() * (r1.X - r0.X), r0.Y, r0.Width, r0.Height);
-            if (!T.glass) FillRound(g, Color(T.dark ? 40 : 30, 0, 0, 0), RectF(pr.X, pr.Y + S(1), pr.Width, pr.Height), S(6));
+            if (false) FillRound(g, Color(T.dark ? 40 : 30, 0, 0, 0), RectF(pr.X, pr.Y + S(1), pr.Width, pr.Height), S(6));
             FillRound(g, T.tabSel, pr, S(6));
         }
         for (int i = 0; i < 3; i++) {
@@ -3290,18 +3753,18 @@ static void Paint(HDC hdc) {
             bool sel = g_tab == i, hov = g_hover.h == H_TAB && g_hover.idx == i;
             if (!sel && hov && fabsf(TabPos() - i) > 0.5f) FillRound(g, T.hover, r, S(6));
             Font* f = sel ? g_fTab600 : g_fTab;
-            float tw = TextW(g, names[i], f), total = S(15) + S(8) + tw, sx = r.X + (r.Width - total) / 2;
-            Glyph(g, glyphs[i], g_fIconS, T.t1, sx + S(7.5f), r.Y + r.Height / 2);
-            Text(g, names[i], f, T.t1, RectF(sx + S(15) + S(8), r.Y, tw + S(4), r.Height));
+            float tw = TextW(g, names[i], f), total = S(17) + S(8) + tw, sx = r.X + (r.Width - total) / 2;
+            Icon(g, i == 0 ? "speaker" : i == 1 ? "apps" : "sun", S(17), T.t1, sx + S(8.5f), r.Y + r.Height / 2);
+            Text(g, names[i], f, T.t1, RectF(sx + S(17) + S(8), r.Y, tw + S(4), r.Height));
         }
         }
 
         // footer (same surface as the panel: no separate band)
         float fy = PaneBottom() + S(FTR) / 2;
-        Glyph(g, G_EQ, g_fIconS, T.t1, S(16) + S(7), fy);
+        Icon(g, "mixer", S(14), T.t1, S(16) + S(7), fy);
         {   // "Knob" with the version (or the update pill) underneath
             float nx = S(16) + S(14) + S(10);
-            Text(g, APP_NAME, g_fSmall600, T.t1, RectF(nx, fy - S(17), S(120), S(17)));
+            Text(g, APP_NAME, g_fSmall600, T.t1, RectF(nx, fy - S(14), S(120), S(15)));
             std::wstring vt = L"v" APP_VERSION;
             bool upd = g_updState != UPD_NONE;
             if (g_updState == UPD_AVAILABLE) vt = L"Update to v" + g_updVersion;
@@ -3315,7 +3778,7 @@ static void Paint(HDC hdc) {
                 Text(g, vt.c_str(), g_fSmall, Color(255, 240, 90, 90), g_verRect, StringAlignmentCenter);
             } else {
                 g_verRect = RectF();
-                Text(g, vt.c_str(), g_fSmall, T.t3, RectF(nx, fy + S(1), vw + S(8), S(16)));
+                Text(g, vt.c_str(), g_f11, T.t3, RectF(nx, fy + S(1), vw + S(8), S(14)));
             }
         }
         {   // mute every microphone
@@ -3336,7 +3799,8 @@ static void Paint(HDC hdc) {
                 g.ResetTransform();
             } else Glyph(g, G_REFRESH, g_fIcon, T.t1, r.X + r.Width / 2, r.Y + r.Height / 2);
         }
-        DrawIconBtn(g, IdentRect(), G_IDENT, T.t1, g_hover.h == H_IDENT);
+        if (g_hover.h == H_IDENT) FillRound(g, T.hover, IdentRect(), S(6));
+        Icon(g, "identify", S(18), T.t1, IdentRect().X + S(16), IdentRect().Y + S(16));
         DrawIconBtn(g, GearRect(), G_SETTINGS, T.t1, g_hover.h == H_GEAR || g_menuOpen);
 
         // popups on top
@@ -3427,7 +3891,8 @@ static void ShowOsd(int kind, int val, bool muted) {
 static void SetTab(int t);
 static void NextOutput();
 static void StartAutoSync();
-static void RunHotkey(int a) {
+static void SwitchOutput(int i);
+static void RunHotkey(int a, const std::wstring& param = L"") {
     if (a == HK_OPEN) { if (g_set && (g_visible || g_pairHidden)) PairShow(true); else if (g_visible) HideFlyout(); else ShowFlyout(); return; }
     if (a == HK_TABSOUND || a == HK_TABAPPS || a == HK_TABDISPLAY) {   // open straight on that tab
         int t = a == HK_TABSOUND ? T_SOUND : a == HK_TABAPPS ? T_APPS : T_DISPLAY;
@@ -3483,6 +3948,8 @@ static void RunHotkey(int a) {
         for (int k = 1; k <= n; k++) { int i = (cur + k + n) % n; if (!g_prof[i].v.empty()) { ApplyProfile(i); break; } }
         break;
     }
+    case HK_SWITCHTO: for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].name == param || OutLabel(g_out[i]) == param) { SwitchOutput(i); break; } break;
+    case HK_APPLYPROF: for (int i = 0; i < (int)g_prof.size(); i++) if (g_prof[i].name == param && !g_prof[i].v.empty()) { ApplyProfile(i); break; } break;
     case HK_SCREENOFF: HideFlyout(); SetTimer(g_hwnd, TIMER_SCREENOFF, 500, nullptr); break;
     case HK_SYNC: StartAutoSync(); break;
     }
@@ -3759,6 +4226,13 @@ static void ClickOutput(int i) {   // a click switches to that speaker alone, li
     if (had) { SaveSettings(); RestartRouter(); }
     UpdateTrayTip();
 }
+static void SwitchOutput(int i) {   // shortcut "Switch to": that speaker, with the same popup as Next speaker
+    if (i < 0 || i >= (int)g_out.size()) return;
+    std::wstring id = g_out[i].id;
+    ClickOutput(i);
+    for (int k = 0; k < (int)g_out.size(); k++) if (g_out[k].id == id) { ShowOsd(OSD_VOL, (int)lround(g_out[k].level * 100), false); break; }
+    if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
 static void NextOutput() {   // shortcut: the next speaker in the list (skips Bluetooth call-quality outputs)
     int n = (int)g_out.size(), d = DefaultOut();
     for (int k = 1; k < n; k++) {
@@ -4000,7 +4474,7 @@ static std::vector<SItem> g_sItems;
 static int g_sHover = -1;
 static Theme g_setTheme;
 static RectF g_editRect;
-static const float NAVW = 240;
+static const float NAVW = 200;
 // routing board (Settings › Sound): sounds on the left, speakers on the right, a line = "plays there"
 struct RtLine { int src, dst; PointF p[4]; };
 static std::vector<RtLine> g_rtLines;
@@ -4043,13 +4517,13 @@ static void BuildSettingsTheme() {
 }
 
 static bool HandleCaptureKey(UINT vk) {   // shared by the flyout and the settings window
-    if (g_capture < 0) return false;
+    if (g_capture < 0 || g_capture >= (int)g_sc.size()) { g_capture = -1; return false; }
     if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT || vk == VK_LWIN || vk == VK_RWIN) return true;
     UINT mods = (GetKeyState(VK_CONTROL) < 0 ? MOD_CONTROL : 0) | (GetKeyState(VK_MENU) < 0 ? MOD_ALT : 0) |
                 (GetKeyState(VK_SHIFT) < 0 ? MOD_SHIFT : 0) | ((GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) ? MOD_WIN : 0);
     if (vk == VK_ESCAPE && !mods) g_capture = -1;
-    else if ((vk == VK_BACK || vk == VK_DELETE) && !mods) { g_hk[g_capture].mods = 0; g_hk[g_capture].vk = 0; g_capture = -1; }
-    else if (mods || (vk >= VK_F13 && vk <= VK_F24)) { g_hk[g_capture].mods = mods; g_hk[g_capture].vk = vk; g_capture = -1; }
+    else if ((vk == VK_BACK || vk == VK_DELETE) && !mods) { g_sc[g_capture].k.mods = 0; g_sc[g_capture].k.vk = 0; g_capture = -1; }
+    else if (mods || (vk >= VK_F13 && vk <= VK_F24)) { g_sc[g_capture].k.mods = mods; g_sc[g_capture].k.vk = vk; g_capture = -1; }
     else return true;   // a lone key would steal normal typing: wait for a combination
     RegisterHotkeys(); SaveSettings();
     return true;
@@ -4125,6 +4599,27 @@ static void SetPageScroll(float v) {
     g_setScroll = std::max(0.f, std::min(v, std::max(0.f, g_setContentH - view)));
 }
 
+// lines of wrapped text (the design wraps descriptions and notes; GDI+ can't set line height, so lines are drawn one by one)
+static std::vector<std::wstring> WrapLines(Graphics& g, const std::wstring& s, Font* f, float w) {
+    std::vector<std::wstring> out; std::wstring line, word;
+    auto width = [&](const std::wstring& t) { RectF r; g.MeasureString(t.c_str(), -1, f, PointF(0, 0), &r); return r.Width - S(2); };
+    size_t i = 0;
+    while (i <= s.size()) {
+        if (i == s.size() || s[i] == L' ' || s[i] == L'\n') {
+            std::wstring cand = line.empty() ? word : line + L" " + word;
+            if (!line.empty() && width(cand) > w) { out.push_back(line); line = word; } else line = cand;
+            if (i < s.size() && s[i] == L'\n') { out.push_back(line); line.clear(); }
+            word.clear();
+        } else word += s[i];
+        i++;
+    }
+    if (!line.empty()) out.push_back(line);
+    return out;
+}
+static void DrawLinesAt(Graphics& g, const std::vector<std::wstring>& ls, Font* f, Color c, float x, float y, float lh) {
+    for (size_t i = 0; i < ls.size(); i++) Text(g, ls[i].c_str(), f, c, RectF(x - S(1), y + i * lh, S(2000), lh));
+}
+
 static void PaintSettings(HDC hdc) {
     if (g_setW <= 0 || g_setH <= 0) return;
     std::swap(T, g_setTheme);
@@ -4140,192 +4635,421 @@ static void PaintSettings(HDC hdc) {
         Bitmap canvas(g_setW, g_setH, g_setW * 4, PixelFormat32bppPARGB, (BYTE*)bits);
         Graphics g(&canvas);
         g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(g_setGlass ? TextRenderingHintAntiAliasGridFit : TextRenderingHintClearTypeGridFit);   // ClearType needs an opaque background
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(PixelOffsetModeHalf);
-        if (g_setGlass) g.Clear(T.dark ? Color(110, 24, 24, 24) : Color(120, 246, 246, 246));   // acrylic shows through
-        else g.Clear(T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243));
-        Font fTitle(g_famSemi, S(26), FontStyleRegular, UnitPixel), fBody(g_famText, S(14), FontStyleRegular, UnitPixel);
-        Font fBody600(g_famSemi, S(14), FontStyleRegular, UnitPixel), fDesc(g_famText, S(12), FontStyleRegular, UnitPixel);
-        Color card = g_setGlass ? (T.dark ? Color(150, 48, 48, 48) : Color(170, 255, 255, 255)) : (T.dark ? Color(255, 43, 43, 43) : Color(255, 251, 251, 251));
-        Color cardHover = g_setGlass ? (T.dark ? Color(170, 58, 58, 58) : Color(200, 255, 255, 255)) : (T.dark ? Color(255, 50, 50, 50) : Color(255, 246, 246, 246));
+        Color winBg = T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243);
+        g.Clear(winBg);
+        // the design's type: page title 24 semibold, card title 14, description 12, section 13 semibold
+        Font fTitle(g_famSemi, S(24), FontStyleRegular, UnitPixel), fBody(g_famText, S(14), FontStyleRegular, UnitPixel), fBody13(g_famText, S(13), FontStyleRegular, UnitPixel);
+        Font fBody600(g_famSemi, S(14), FontStyleRegular, UnitPixel), fDesc(g_famText, S(12), FontStyleRegular, UnitPixel), fDesc600(g_famSemi, S(12), FontStyleRegular, UnitPixel);
+        Font fH4(g_famSemi, S(13), FontStyleRegular, UnitPixel), fNav600(g_famSemi, S(13), FontStyleRegular, UnitPixel), fSmall115(g_famText, S(11.5f), FontStyleRegular, UnitPixel);
+        Font fRt(g_famText, S(12.5f), FontStyleRegular, UnitPixel), fRhd(g_famSemi, S(11), FontStyleRegular, UnitPixel), fNew(g_famSemi, S(9), FontStyleBold, UnitPixel);
+        Font fBold14(g_famSemi, S(14), FontStyleBold, UnitPixel), fNum11(g_famSemi, S(11), FontStyleRegular, UnitPixel), fPill(g_famSemi, S(11.5f), FontStyleRegular, UnitPixel);
+        Color card = T.dark ? Color(255, 43, 43, 43) : Color(255, 251, 251, 251);
+        Color cardHover = T.dark ? Color(255, 47, 47, 47) : Color(255, 255, 255, 255);
         auto add = [&](int k, int id, RectF r) { g_sItems.push_back({k, id, r}); return (int)g_sItems.size() - 1; };
         auto isHover = [&](int k, int id) { return g_sHover >= 0 && g_sHover < (int)g_sItems.size() && g_sItems[g_sHover].kind == k && g_sItems[g_sHover].id == id; };
+        auto tw = [&](const wchar_t* s, Font* f) { RectF r; g.MeasureString(s, -1, f, PointF(0, 0), &r); return r.Width - S(2); };
 
-        // ---- navigation
-        float nx = S(12);
-        Glyph(g, G_EQ, g_fIcon, T.t1, nx + S(22), S(30));
-        Text(g, L"Knob", &fBody600, T.t1, RectF(nx + S(44), S(16), S(160), S(28)));
+        // ---- navigation (200 wide): Knob, then the five pages
+        Icon(g, "mixer", S(16), T.t1, S(28), S(27));
+        Text(g, L"Knob", &fBody600, T.t1, RectF(S(47), S(17), S(140), S(20)));
         for (int i = 0; i < SP_COUNT; i++) {
-            RectF r(nx, S(64) + i * S(40), S(NAVW) - S(24), S(36));
+            RectF r(S(8), S(51) + i * S(38), S(184), S(36));
             add(SK_NAV, i, r);
             bool sel = g_setPage == i;
             if (sel) { FillRound(g, T.subtle2, r, S(6)); FillRound(g, T.accent, RectF(r.X, r.Y + S(10), S(3), S(16)), S(1.5f)); }
             else if (isHover(SK_NAV, i)) FillRound(g, T.subtle, r, S(6));
-            Glyph(g, SP_GLYPHS[i], g_fIconS, T.t1, r.X + S(24), r.Y + r.Height / 2);
-            Text(g, SP_NAMES[i], sel ? &fBody600 : &fBody, T.t1, RectF(r.X + S(46), r.Y, r.Width - S(50), r.Height));
+            static const char* navIcons[SP_COUNT] = {"gear", "speaker", "monitor", "palette", "info"};
+            Icon(g, navIcons[i], S(16), T.t1, r.X + S(20), r.Y + r.Height / 2);
+            Text(g, SP_NAMES[i], sel ? &fNav600 : &fBody13, T.t1, RectF(r.X + S(39), r.Y, r.Width - S(44), r.Height));
         }
 
-        // ---- content
-        float x0 = S(NAVW) + S(12), cw = g_setW - x0 - S(28);
+        // ---- page: 12 px in, 436 px cards, margins that collapse like the design's
+        float x0 = S(NAVW) + S(12), cw = g_setW - x0 - S(32);
         g.SetClip(RectF(S(NAVW), 0, g_setW - S(NAVW), (float)g_setH));
-        float y = S(24) - g_setScroll;
-        Text(g, SP_NAMES[g_setPage], &fTitle, T.t1, RectF(x0 + S(4), y, cw, S(40)));
-        y += S(60);
-        auto cardRect = [&](float h) { RectF r(x0, y, cw, h); y += h + S(4); return r; };
-        const float lineH = fDesc.GetHeight(&g);
-        auto descLines = [&](const wchar_t* d, float right) { return (d && *d) ? std::min(2, TextLines(g, d, &fDesc, cw - right - S(24))) : 0; };
-        auto cardH = [&](const wchar_t* d, float right) { int n = descLines(d, right); return n == 0 ? S(52) : n == 1 ? S(64) : S(46) + 2 * lineH + S(14); };
-        auto para = [&](const wchar_t* t, float gap) {   // full-width help text, wraps as needed
-            float h = TextLines(g, t, &fDesc, cw) * lineH;
-            TextWrap(g, t, &fDesc, T.t3, RectF(x0 + S(4), y, cw, h + S(2)));
-            y += h + gap;
+        float y = S(12) - g_setScroll, mb = 0;
+        auto top = [&](float mt) { y = y - mb + std::max(mb, mt); };
+        auto after = [&](float h, float m) { y += h + m; mb = m; };
+        top(S(6)); Text(g, SP_NAMES[g_setPage], &fTitle, T.t1, RectF(x0 + S(3), y - S(2), cw, S(33))); after(S(29), S(18));
+        auto h4 = [&](const wchar_t* t) { top(S(18)); Text(g, t, &fH4, T.t1, RectF(x0 + S(3), y - S(1), cw, S(18))); after(S(16), S(8)); };
+        auto snote = [&](const wchar_t* t, float mBottom = 14) {   // help text: 12 px, line height 18
+            top(0); auto ls = WrapLines(g, t, &fDesc, cw - S(8)); DrawLinesAt(g, ls, &fDesc, T.t3, x0 + S(4), y + S(1.5f), S(18)); after(ls.size() * S(18), S(mBottom));
         };
-        auto titleDesc = [&](RectF r, const wchar_t* t, const wchar_t* d, float right) {
-            if (d && *d) {
-                int n = descLines(d, right);
-                float top = r.Y + (r.Height - (S(22) + n * lineH + S(2))) / 2;
-                Text(g, t, &fBody, T.t1, RectF(r.X + S(18), top, r.Width - right - S(24), S(22)));
-                TextWrap(g, d, &fDesc, T.t3, RectF(r.X + S(18), top + S(22), r.Width - right - S(24), n * lineH + S(2)));
-            } else Text(g, t, &fBody, T.t1, RectF(r.X + S(18), r.Y, r.Width - right - S(24), r.Height));
+        // title + description block; returns its height; draws when d is true
+        auto newTag = [&](int bit) { return bit >= 0 && !(g_newSeen & (1 << bit)); };
+        auto stBlock = [&](float x, float yy, float w, const wchar_t* t, const wchar_t* d, int newBit, bool draw, Color dc = Color(0, 0, 0, 0)) {
+            std::wstring tt = t; bool nw = newTag(newBit);
+            auto tl = WrapLines(g, nw ? tt + L" NEWWW" : tt, &fBody, w);   // leave room for the tag
+            if (nw && !tl.empty()) { std::wstring& last = tl.back(); size_t p = last.rfind(L" NEWWW"); if (p != std::wstring::npos) last = last.substr(0, p); else if (last == L"NEWWW") tl.pop_back(); }
+            std::vector<std::wstring> dl; if (d && *d) dl = WrapLines(g, d, &fDesc, w);
+            float h = tl.size() * S(17) + (dl.empty() ? 0 : S(2) + dl.size() * S(15));
+            if (draw) {
+                DrawLinesAt(g, tl, &fBody, T.t1, x, yy, S(17));
+                if (nw && !tl.empty()) {   // small "NEW" after the title, in the accent
+                    float lx = x + tw(tl.back().c_str(), &fBody) + S(6), ly = yy + (tl.size() - 1) * S(17) + S(8.5f) + S(0.5f);
+                    SpacedText(g, L"NEW", &fNew, T.accent, lx, ly, S(0.55f));
+                }
+                if (!dl.empty()) DrawLinesAt(g, dl, &fDesc, dc.GetA() ? dc : T.t3, x, yy + tl.size() * S(17) + S(2), S(15));
+            }
+            return h;
         };
-        auto section = [&](const wchar_t* t) { y += S(14); Text(g, t, &fBody600, T.t1, RectF(x0 + S(4), y, cw, S(22))); y += S(30); };
+        // a card: 18 px in, at least 52 tall, the text block beside whatever sits on the right (rightW)
+        auto cardStart = [&](const wchar_t* t, const wchar_t* d, float rightW, int newBit, RectF& r, float minH = 52, Color dc = Color(0, 0, 0, 0)) {
+            top(0);
+            float stw = cw - S(36) - (rightW > 0 ? rightW + S(10) : 0);
+            float h = stBlock(0, 0, stw, t, d, newBit, false);
+            r = RectF(x0, y, cw, std::max(S(minH), h + S(20)));
+            return [&, t, d, stw, h, newBit, dc](RectF rr, Color bg) { FillRound(g, bg, rr, S(6)); stBlock(rr.X + S(18), rr.Y + (rr.Height - h) / 2, stw, t, d, newBit, true, dc); };
+        };
+        auto cardEnd = [&](const RectF& r) { after(r.Height, S(4)); };
+        auto sbtnW = [&](const wchar_t* t, bool acc = false) { return std::max(S(72), S(32) + tw(t, acc ? &fDesc600 : &fDesc)); };
+        auto sbtn = [&](int kind, int id, RectF r, const wchar_t* t, bool accent = false, bool enabled = true) {
+            if (enabled) add(kind, id, r);
+            bool hv = enabled && isHover(kind, id);
+            Color bg = accent && enabled ? (hv ? WithAlpha(T.accent, 225) : T.accent) : (hv ? T.subtle3 : T.subtle2);
+            FillRound(g, bg, r, S(5));
+            Text(g, t, accent && enabled ? &fDesc600 : &fDesc, accent && enabled ? T.onAccent : (enabled ? T.t1 : T.t3), r, StringAlignmentCenter);
+        };
+        auto sib = [&](int kind, int id, RectF r, const char* icon) {
+            add(kind, id, r);
+            if (isHover(kind, id)) FillRound(g, T.subtle2, r, S(5));
+            Icon(g, icon, S(15), T.t1, r.X + r.Width / 2, r.Y + r.Height / 2);
+        };
         // dropdowns styled like the rest of Knob; the open list is drawn last so it sits on top
         RectF ddPopBtn; std::vector<std::wstring> ddPopOpts; int ddPopCur = -1, ddPopId = -1;
-        auto ddCard = [&](int id, const wchar_t* t, const wchar_t* d, const std::vector<std::wstring>& opts, int cur) {
-            RectF r = cardRect(cardH(d, S(250))); FillRound(g, card, r, S(6));
-            titleDesc(r, t, d, S(250));
-            RectF b(r.X + r.Width - S(18) - S(220), r.Y + r.Height / 2 - S(16), S(220), S(32));
+        auto ddButton = [&](int id, RectF b, const std::wstring& label, const std::vector<std::wstring>& opts, int cur) {
             add(SK_DDBTN, id, b);
             bool open = g_sddOpen == id;
             FillRound(g, open || isHover(SK_DDBTN, id) ? T.subtle3 : T.subtle2, b, S(6));
-            PillText(g, cur >= 0 && cur < (int)opts.size() ? opts[cur].c_str() : L"", &fDesc, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
-            Glyph(g, open ? 0xE70E : 0xE70D, g_fIconS, T.t2, b.X + b.Width - S(18), b.Y + b.Height / 2);
+            PillText(g, label.c_str(), &fDesc, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
+            Icon(g, "chevron", S(14), T.t1, b.X + b.Width - S(12) - S(7), b.Y + b.Height / 2, open ? 180.f : 0.f);
             if (open) { ddPopBtn = b; ddPopOpts = opts; ddPopCur = cur; ddPopId = id; }
         };
-        auto switchCard = [&](int id, const wchar_t* t, const wchar_t* d, bool on) {
-            RectF r = cardRect(cardH(d, S(90)));
-            add(SK_SWITCH, id, r);
-            FillRound(g, isHover(SK_SWITCH, id) ? cardHover : card, r, S(6));
-            titleDesc(r, t, d, S(90));
-            Text(g, on ? L"On" : L"Off", &fBody, T.t1, RectF(r.X + r.Width - S(110), r.Y, S(40), r.Height), StringAlignmentFar);
+        auto ddCard = [&](int id, const wchar_t* t, const wchar_t* d, const std::vector<std::wstring>& opts, int cur, int newBit) {
+            RectF r; auto draw = cardStart(t, d, S(210), newBit, r); draw(r, card);
+            RectF b(r.X + r.Width - S(18) - S(210), r.Y + r.Height / 2 - S(16), S(210), S(32));
+            ddButton(id, b, cur >= 0 && cur < (int)opts.size() ? opts[cur] : L"", opts, cur);
+            cardEnd(r);
+        };
+        auto switchRight = [&](RectF r, bool on) {
             DrawSwitch(g, r.X + r.Width - S(18) - S(40), r.Y + r.Height / 2, on);
+            Text(g, on ? L"On" : L"Off", &fBody13, T.t1, RectF(r.X + r.Width - S(18) - S(40) - S(16) - S(60), r.Y, S(60), r.Height), StringAlignmentFar);
+        };
+        auto switchCard = [&](int id, const wchar_t* t, const wchar_t* d, bool on, int newBit = -1) {
+            RectF r; auto draw = cardStart(t, d, S(19) + S(16) + S(40), newBit, r);
+            add(SK_SWITCH, id, r);
+            draw(r, isHover(SK_SWITCH, id) ? cardHover : card);
+            switchRight(r, on);
+            cardEnd(r);
         };
         auto linkCard = [&](int id, const wchar_t* t, const wchar_t* d) {
-            RectF r = cardRect(cardH(d, S(50)));
+            RectF r; auto draw = cardStart(t, d, S(14), -1, r);
             add(SK_LINK, id, r);
-            FillRound(g, isHover(SK_LINK, id) ? cardHover : card, r, S(6));
-            titleDesc(r, t, d, S(50));
-            Glyph(g, G_OPEN, g_fIconS, T.t2, r.X + r.Width - S(30), r.Y + r.Height / 2);
+            draw(r, isHover(SK_LINK, id) ? cardHover : card);
+            Icon(g, "open", S(14), T.t1, r.X + r.Width - S(18) - S(7), r.Y + r.Height / 2);
+            cardEnd(r);
         };
-        auto button = [&](int kind, int id, RectF r, const wchar_t* t, bool accent = false, bool enabled = true) {
-            if (enabled) add(kind, id, r);
-            Color bg = accent ? T.accent : (isHover(kind, id) && enabled ? T.subtle3 : T.subtle2);
-            FillRound(g, bg, r, S(5));
-            Text(g, t, &fDesc, accent ? T.onAccent : (enabled ? T.t1 : T.t3), r, StringAlignmentCenter);
+        auto btnCard = [&](const wchar_t* t, const wchar_t* d, int kind, int id, const wchar_t* label, bool accent = false, bool enabled = true) {
+            float bw = sbtnW(label, accent);
+            RectF r; auto draw = cardStart(t, d, bw, -1, r); draw(r, card);
+            sbtn(kind, id, RectF(r.X + r.Width - S(18) - bw, r.Y + r.Height / 2 - S(16), bw, S(32)), label, accent, enabled);
+            cardEnd(r);
         };
-        auto iconButton = [&](int kind, int id, RectF r, wchar_t gl) {
-            add(kind, id, r);
-            if (isHover(kind, id)) FillRound(g, T.subtle2, r, S(5));
-            Glyph(g, gl, g_fIconS, T.t1, r.X + r.Width / 2, r.Y + r.Height / 2);
+        auto segc = [&](RectF r, int which, int kind, const std::vector<const wchar_t*>& labels, int cur) {   // segmented control, right of a card
+            std::vector<float> ws; float total = S(6) + S(2) * (labels.size() - 1);
+            for (auto* l : labels) { float w = std::max(S(64), S(20) + tw(l, &fDesc600)); ws.push_back(w); total += w; }
+            RectF box(r.X + r.Width - S(18) - total, r.Y + r.Height / 2 - S(16), total, S(32));
+            FillRound(g, T.subtle, box, S(8));
+            std::vector<float> xs; float bx = box.X + S(3); for (float w : ws) { xs.push_back(bx); bx += w + S(2); }
+            float p = SegPos(which, cur); int a = std::max(0, std::min((int)ws.size() - 1, (int)floorf(p))), b2 = std::min((int)ws.size() - 1, a + 1); float f = p - a;
+            FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(xs[a] + (xs[b2] - xs[a]) * f, box.Y + S(3), ws[a] + (ws[b2] - ws[a]) * f, S(26)), S(6));
+            for (size_t i = 0; i < labels.size(); i++) {
+                RectF b(xs[i], box.Y + S(3), ws[i], S(26));
+                add(kind, (int)i, b);
+                bool on = cur == (int)i;
+                if (!on && isHover(kind, (int)i)) FillRound(g, T.subtle, b, S(6));
+                Text(g, labels[i], on ? &fDesc600 : &fDesc, on ? T.t1 : T.t2, b, StringAlignmentCenter);
+            }
+            return box.Width;
         };
+        auto segW = [&](const std::vector<const wchar_t*>& labels) { float t2 = S(6) + S(2) * (labels.size() - 1); for (auto* l : labels) t2 += std::max(S(64), S(20) + tw(l, &fDesc600)); return t2; };
 
         switch (g_setPage) {
-        case SP_GENERAL:
+        case SP_GENERAL: {
             switchCard(1, L"Keep awake", L"Stop the screen from turning off and the PC from sleeping", g_keepAwake);
             switchCard(2, L"Start with Windows", L"Open Knob in the tray when you sign in", StartupEnabled());
-            ddCard(3, L"Open the panel on", L"Main display opens by the tray, like Windows' own panels. Screen with the mouse follows you when you use the shortcut", {L"Main display", L"Screen with the mouse"}, g_openOn);
-            section(L"Shortcuts");
-            for (int i = 0; i < HK_COUNT; i++) {
-                if (!HkShown(i) && !g_hk[i].vk && g_capture != i) continue;   // other actions get a row once added
-                RectF r = cardRect(S(52)); FillRound(g, card, r, S(6));
-                titleDesc(r, HK_NAMES[i], L"", S(280));
-                RectF c(r.X + r.Width - S(18) - S(36) - S(210), r.Y + S(10), S(210), S(32));
+            ddCard(3, L"Open the panel on", L"Main display opens by the tray, like Windows' own panels. Screen with the mouse follows you when you use the shortcut", {L"Main display", L"Screen with the mouse"}, g_openOn, 0);
+            h4(L"Shortcuts");
+            for (int i = 0; i < (int)g_sc.size(); i++) {   // a row per shortcut: action, which one (speaker / profile), keys, delete
+                Shortcut& sc = g_sc[i];
+                bool cap = g_capture == i, dupe = HkSameKeys(i), taken = sc.k.vk && !sc.k.ok && !cap && !dupe;
+                const wchar_t* warn = dupe ? L"Same keys as another shortcut" : taken ? L"Another app already uses these keys" : L"";
+                int pk = HkParamKind(sc.act);
+                std::vector<std::wstring> popts; int pcur = -1;
+                if (pk == 1) for (auto& o : g_out) { popts.push_back(OutLabel(o)); if (OutLabel(o) == sc.param || o.name == sc.param) pcur = (int)popts.size() - 1; }
+                if (pk == 2) for (auto& p : g_prof) { popts.push_back(p.name); if (p.name == sc.param) pcur = (int)popts.size() - 1; }
+                float pw = 0; std::wstring plabel = pcur >= 0 ? popts[pcur] : (sc.param.empty() ? L"Pick one" : sc.param);
+                if (pk) pw = std::min(S(120), S(10) + tw(plabel.c_str(), &fDesc) + S(30));
+                float rightW = (pk ? pw + S(10) : 0) + S(150) + S(10) + S(32);
+                RectF r; auto draw = cardStart(HK_NAMES[sc.act], warn, rightW, -1, r, 52, T.accent); draw(r, card);
+                float bx = r.X + r.Width - S(18) - S(32);
+                sib(SK_HKDEL, i, RectF(bx, r.Y + r.Height / 2 - S(16), S(32), S(32)), "trash");
+                bx -= S(10) + S(150);
+                RectF c(bx, r.Y + r.Height / 2 - S(16), S(150), S(32));
                 add(SK_HK, i, c);
-                bool cap = g_capture == i;
-                FillRound(g, cap ? WithAlpha(T.accent, 60) : (isHover(SK_HK, i) ? T.subtle3 : T.subtle2), c, S(6));
-                std::wstring t = cap ? L"Press keys\u2026" : ComboName(g_hk[i]);
-                Color tc = cap ? T.t1 : (!g_hk[i].vk ? T.t3 : (!g_hk[i].ok ? Color(255, 232, 72, 72) : T.t1));
-                if (!cap && g_hk[i].vk && !g_hk[i].ok) t += L"  (used by another app)";
-                Text(g, t.c_str(), &fDesc, tc, c, StringAlignmentCenter);
-                iconButton(SK_HKDEL, i, RectF(r.X + r.Width - S(18) - S(32), r.Y + S(10), S(32), S(32)), 0xE74D);
+                FillRound(g, cap ? WithAlpha(T.accent, 64) : (isHover(SK_HK, i) ? T.subtle3 : T.subtle2), c, S(6));
+                std::wstring kt = cap ? L"Press keys…" : sc.k.vk ? ComboName(sc.k) : L"Not set";
+                Text(g, kt.c_str(), &fDesc, cap || sc.k.vk ? T.t1 : T.t3, c, StringAlignmentCenter);
+                if (pk) { bx -= S(10) + pw; ddButton(1000 + i, RectF(bx, c.Y, pw, S(32)), plabel, popts, pcur); }
+                cardEnd(r);
             }
-            {   // + Add a shortcut: the actions without a row yet
+            {   // + Add a shortcut: the actions without a row yet ("Switch to" and "Apply profile" can be added again)
                 g_hkAddMap.clear();
                 std::vector<std::wstring> opts;
-                for (int i = 0; i < HK_COUNT; i++) if (!HkShown(i) && !g_hk[i].vk && g_capture != i) { opts.push_back(HK_NAMES[i]); g_hkAddMap.push_back(i); }
-                if (!opts.empty()) {
-                    RectF b(x0, y, cw, S(40)); y += S(44);
-                    add(SK_HKADD, 0, b);
-                    Pen dp(WithAlpha(T.t1, isHover(SK_HKADD, 0) || g_sddOpen == 4 ? 90 : 50), S(1)); dp.SetDashStyle(DashStyleDash);
-                    GraphicsPath gp; AddRound(gp, RectF(b.X + S(0.5f), b.Y + S(0.5f), b.Width - S(1), b.Height - S(1)), S(6)); g.DrawPath(&dp, &gp);
-                    Text(g, L"+  Add a shortcut", &fDesc, isHover(SK_HKADD, 0) ? T.t1 : T.t2, b, StringAlignmentCenter);
-                    if (g_sddOpen == 4) { ddPopBtn = RectF(b.X + b.Width / 2 - S(130), b.Y, S(260), b.Height); ddPopOpts = opts; ddPopCur = -1; ddPopId = 4; }
+                for (int a = 0; a < HK_OFFERED; a++) {
+                    bool have = false; for (auto& s2 : g_sc) if (s2.act == a) have = true;
+                    if (have && !HkParamKind(a)) continue;
+                    opts.push_back(HK_NAMES[a]); g_hkAddMap.push_back(a);
                 }
+                top(0);
+                RectF b(x0, y, cw, S(36));
+                add(SK_HKADD, 0, b);
+                bool hv = isHover(SK_HKADD, 0) || g_sddOpen == 4;
+                Pen dp(WithAlpha(T.t1, 56), S(1)); dp.SetDashStyle(DashStyleDash);
+                GraphicsPath gp; AddRound(gp, RectF(b.X + S(0.5f), b.Y + S(0.5f), b.Width - S(1), b.Height - S(1)), S(6)); g.DrawPath(&dp, &gp);
+                float lw = S(12) + S(6) + tw(L"Add a shortcut", &fSmall115), lx = b.X + (b.Width - lw) / 2;
+                Icon(g, "plus", S(12), hv ? T.t1 : T.t3, lx + S(6), b.Y + b.Height / 2);
+                Text(g, L"Add a shortcut", &fSmall115, hv ? T.t1 : T.t3, RectF(lx + S(18), b.Y, lw, b.Height));
+                if (g_sddOpen == 4) { ddPopBtn = RectF(b.X + b.Width / 2 - S(130), b.Y, S(260), b.Height); ddPopOpts = opts; ddPopCur = -1; ddPopId = 4; }
+                after(S(36), 0);
             }
-            y += S(6);
-            para(L"Work from anywhere. Click the keys, then press new ones (Ctrl, Alt, Shift or Win plus a key). Esc cancels, Backspace clears. If another app already uses the keys, Knob tells you.", S(4));
-            section(L"Windows settings");
+            snote(L"Works from anywhere. Click the keys, then press new ones (Ctrl, Alt, Shift or Win plus a key). Esc cancels, Backspace clears. If another app already uses the keys, Knob tells you.");
+            h4(L"Windows settings");
             linkCard(1, L"Sound settings", L"");
             linkCard(2, L"Display settings", L"");
-            section(L"Knob");
-            { RectF r = cardRect(S(52)); FillRound(g, card, r, S(6)); titleDesc(r, L"Exit Knob", L"", S(140));
-              button(SK_BUTTON, 1, RectF(r.X + r.Width - S(18) - S(110), r.Y + S(10), S(110), S(32)), L"Exit"); }
+            h4(L"Knob");
+            btnCard(L"Exit Knob", L"", SK_BUTTON, 1, L"Exit");
             break;
+        }
+        case SP_SOUND: {
+            h4(L"Where sound plays");
+            snote(L"Drag from an app to a speaker to play it there. Click a line to remove it. Click a speaker to play everything there. Apps without a line play on the speaker picked in the Sound tab.");
+            {   // Timing: one place for sync
+                int n = SpeakersInUse();
+                bool can = n > 1 && !g_calibrating, ns = NeedsSync();
+                std::wstring d = g_calibrating ? (g_calStatus.empty() ? std::wstring(L"Measuring… keep the room quiet") : g_calStatus)
+                    : n < 2 ? L"When an app plays on two or more speakers, Auto sync lines them up"
+                    : ns ? L"Not synced — a speaker hasn't been measured, so it may play early"
+                    : L"In sync · the faster speakers wait for the slowest one";
+                float b1 = sbtnW(L"Back to one speaker"), b2 = sbtnW(L"Auto sync", true);
+                RectF r; auto draw = cardStart(L"Timing", d.c_str(), b1 + S(10) + b2, -1, r, 52, ns && !g_calibrating && n > 1 ? T.accent : Color(0, 0, 0, 0)); draw(r, card);
+                sbtn(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - b2, r.Y + r.Height / 2 - S(16), b2, S(32)), g_calibrating ? L"Measuring…" : L"Auto sync", true, can);
+                sbtn(SK_BUTTON, 7, RectF(r.X + r.Width - S(18) - b2 - S(10) - b1, r.Y + r.Height / 2 - S(16), b1, S(32)), L"Back to one speaker", false, can);
+                after(r.Height, S(14));
+            }
+            {   // the board: what's playing on the left, speakers on the right, a line = "plays there"
+                top(0);
+                g_rtSrc.clear(); g_rtDst.clear(); g_rtLines.clear();
+                const float gap = S(6), colGap = S(56);
+                float lw = (cw - colGap) / 2, rw = lw, lx = x0, rx = x0 + lw + colGap;
+                float by = y + S(4);
+                SpacedText(g, L"PLAYING NOW", &fRhd, T.t3, lx + S(4), by + S(7), S(0.66f));
+                SpacedText(g, L"SPEAKERS", &fRhd, T.t3, rx + S(4), by + S(7), S(0.66f));
+                float ly = by + S(22), ry = ly;
+                std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
+                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlaying(g_apps[i]) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
+                for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; }
+                for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, S(48)); ry += S(48) + gap; }
+                if (srcs.empty()) { Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), ly + S(6), lw, S(18))); ly += S(36); }
+                auto dotR = [&](int sidx) { RectF r = g_rtSrc[sidx]; return PointF(r.X + r.Width, r.Y + r.Height / 2); };
+                auto dotL = [&](int i) { RectF r = g_rtDst[i]; return PointF(r.X + S(1), r.Y + r.Height / 2); };
+                auto addLine = [&](int sidx, int i, bool own) { PointF a = dotR(sidx), b = dotL(i); float m = (b.X - a.X) * 0.5f;
+                    RtLine l; l.src = own ? sidx : -2 - sidx; l.dst = i; l.p[0] = a; l.p[1] = PointF(a.X + m, a.Y); l.p[2] = PointF(b.X - m, b.Y); l.p[3] = b; g_rtLines.push_back(l); };
+                for (int sidx : srcs) {   // its own speakers, or (no line of its own) wherever the default sound plays now
+                    auto rt = AppRoutes(g_apps[sidx]);
+                    if (!rt.empty()) { for (auto& id : rt) for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].id == id) addLine(sidx, i, true); }
+                    else for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) addLine(sidx, i, false);
+                }
+                int lit = g_rtDrag != RT_NONE ? g_rtDrag : g_rtSel;
+                auto lineSrc = [](const RtLine& l) { return l.src >= 0 ? l.src : -2 - l.src; };
+                for (int k = 0; k < (int)g_rtLines.size(); k++) {   // one kind of line; the chosen sound's lines in the accent colour
+                    auto& l = g_rtLines[k];
+                    bool on = lineSrc(l) == lit, hov = k == g_rtHoverLine && l.src >= 0;
+                    Pen pen(hov ? Color(255, 232, 72, 72) : on ? T.accent : WithAlpha(T.t1, 128), hov || on ? S(2.4f) : S(1.6f));
+                    pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+                    g.DrawBezier(&pen, l.p[0], l.p[1], l.p[2], l.p[3]);
+                }
+                if (g_rtDrag != RT_NONE && g_rtSrc.count(g_rtDrag)) {   // the line being dragged
+                    PointF a = dotR(g_rtDrag), b = g_rtMouse; float m = (b.X - a.X) * 0.5f;
+                    Pen tp(WithAlpha(T.accent, 230), S(1.6f)); float dash[2] = {3.f, 3.f}; tp.SetDashPattern(dash, 2);
+                    g.DrawBezier(&tp, a, PointF(a.X + m, a.Y), PointF(b.X - m, b.Y), b);
+                }
+                for (int sidx : srcs) {
+                    RectF r = g_rtSrc[sidx];
+                    add(SK_RTSRC, sidx, r);
+                    FillRound(g, card, r, S(6));
+                    if (lit == sidx) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
+                    RectF ic(r.X + S(12), r.Y + S(9), S(26), S(26));
+                    AppGroup& a = g_apps[sidx];
+                    Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
+                    if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24))); }
+                    else {
+                        static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
+                        unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
+                        FillRound(g, Hex(tint[hsh % 6]), ic, S(6)); std::wstring l1 = a.name.substr(0, 1); Text(g, l1.c_str(), g_f11s, Color(255, 255, 255, 255), ic, StringAlignmentCenter);
+                    }
+                    auto rt = AppRoutes(a);
+                    std::wstring sub = rt.empty() ? L"Default speaker" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
+                    Text(g, a.name.c_str(), &fRt, T.t1, RectF(r.X + S(48), r.Y + S(6), r.Width - S(60), S(17)));
+                    Text(g, sub.c_str(), g_f11, T.t3, RectF(r.X + S(48), r.Y + S(22), r.Width - S(60), S(15)));
+                    PointF d = dotR(sidx);
+                    float dr = isHover(SK_RTSRC, sidx) ? S(7.2f) : S(6);
+                    SolidBrush ring(winBg); g.FillEllipse(&ring, d.X - dr - S(2), d.Y - dr - S(2), 2 * dr + S(4), 2 * dr + S(4));
+                    SolidBrush db(T.accent); g.FillEllipse(&db, d.X - dr, d.Y - dr, 2 * dr, 2 * dr);
+                }
+                for (int i = 0; i < (int)g_out.size(); i++) {
+                    Endpoint& o = g_out[i];
+                    RectF r = g_rtDst[i];
+                    add(SK_RTDST, i, r);
+                    bool hot = g_rtDrag != RT_NONE && InRect(RectF(r.X - S(30), r.Y, r.Width + S(30), r.Height), g_rtMouse.X, g_rtMouse.Y);
+                    bool used = std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i; });
+                    bool litDst = lit != RT_NONE && std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i && lineSrc(l) == lit; });
+                    bool hv = isHover(SK_RTDST, i) && g_rtDrag == RT_NONE;
+                    FillRound(g, hv ? cardHover : card, r, S(6));
+                    if (hot) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
+                    else if (litDst) { Pen sp(WithAlpha(T.accent, 140), S(1)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), S(5.5f)); g.DrawPath(&sp, &gp); }
+                    RectF ic(r.X + S(12), r.Y + S(11), S(26), S(26));
+                    FillRound(g, T.subtle2, ic, S(6));
+                    DrawDevIcon(g, o.icon, ic.X + S(13), ic.Y + S(13), T.t1, 15);
+                    float right = S(12);
+                    bool pill = used && SpeakersInUse() > 1 && (ShownDelay(o.id) > 0 || g_editDelay == i);   // how long it waits; the slowest shows none
+                    if (pill) {
+                        wchar_t t[24]; swprintf(t, 24, L"+%d ms", ShownDelay(o.id));
+                        float pw = std::max(S(58), S(16) + tw(t, &fPill));
+                        RectF pr(r.X + r.Width - S(12) - pw, r.Y + S(13), pw, S(22));
+                        right = S(12) + pw + S(10);
+                        add(SK_RTDELAY, i, pr);
+                        if (g_editDelay == i) { editRect = RectF(pr.X + S(6), pr.Y + S(3), pr.Width - S(12), pr.Height - S(6)); Pen ep(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, pr, S(11)); g.DrawPath(&ep, &gp); }
+                        FillRound(g, isHover(SK_RTDELAY, i) || g_editDelay == i ? T.subtle3 : T.subtle2, pr, S(11));
+                        if (g_editDelay != i) PillText(g, t, &fPill, T.accent, pr, StringAlignmentCenter);
+                    }
+                    std::wstring sub = hv ? std::wstring(L"Click to play everything here") : o.bt ? std::wstring(L"Bluetooth") : o.detail;
+                    Text(g, OutLabel(o).c_str(), &fRt, T.t1, RectF(r.X + S(48), r.Y + S(8), r.Width - S(48) - right, S(17)));
+                    Text(g, sub.c_str(), g_f11, hv ? T.accent : T.t3, RectF(r.X + S(48), r.Y + S(24), r.Width - S(48) - right, S(15)));
+                    PointF d = dotL(i);
+                    SolidBrush ring(winBg); g.FillEllipse(&ring, d.X - S(8), d.Y - S(8), S(16), S(16));
+                    SolidBrush db(used ? T.accent : T.t3); g.FillEllipse(&db, d.X - S(6), d.Y - S(6), S(12), S(12));
+                }
+                float bottom = std::max(ly, ry) - gap + S(6);
+                after(bottom - y, 0);
+                if (!ProcLoopbackOk()) snote(L"This version of Windows can send each app to one speaker only. Windows 11 lets an app play on several.");
+            }
+            h4(L"More sound options");
+            {
+                std::vector<std::wstring> opts = {L"Same as main output"}; int cur = 0;
+                for (auto& o : g_out) { opts.push_back(o.name); if (!g_callDev.empty() && o.id == g_callDev) cur = (int)opts.size() - 1; }
+                ddCard(1, L"Device for calls", L"For apps that follow Windows' call device, like Teams and Skype; everything else keeps the main output", opts, cur, 1);
+            }
+            switchCard(11, L"Switch to headphones when they connect", L"And back to the previous output when they disconnect", g_autoSwitch, 2);
+            switchCard(12, L"Mono audio", L"Both ears hear everything — handy with one earbud", MonoOn(), 3);
+            ddCard(2, L"During calls", L"How much Windows turns other sounds down", {L"Mute everything else", L"Reduce by 80%", L"Reduce by 50%", L"Do nothing"}, Ducking(), 4);
+            break;
+        }
+        case SP_DISPLAY: {
+            switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
+            h4(L"Colour");
+            snote(L"Per screen. Night light adds a soft orange tint that's easier on the eyes; set how strong it is here, and switch it on from the moon button in the Display tab or by schedule.");
+            for (int i = 0; i < (int)g_mons.size(); i++) {
+                MonUI& m = g_mons[i];
+                if (m.cloneOf >= 0) continue;   // a duplicate shares its source's colour
+                top(0);
+                RectF r(x0, y, cw, S(124)); FillRound(g, card, r, S(6));
+                float ix = r.X + S(18), iw = r.Width - S(36), yy = r.Y + S(10);
+                {   // number, name, connection
+                    RectF nb(ix, yy, S(22), S(22)); FillRound(g, T.subtle2, nb, S(6));
+                    { GraphicsPath gp; AddRound(gp, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(5.25f)); Pen pp(T.t1, S(1.5f)); g.DrawPath(&pp, &gp); }
+                    wchar_t num[4]; swprintf(num, 4, L"%d", i + 1); Text(g, num, &fNum11, T.t1, nb, StringAlignmentCenter);
+                    float nw = std::min(iw - S(140), tw(m.name.c_str(), &fBold14));
+                    Text(g, m.name.c_str(), &fBold14, T.t1, RectF(ix + S(32), yy, nw + S(4), S(22)));
+                    Text(g, m.detail.c_str(), &fSmall115, T.t3, RectF(ix + S(32) + nw + S(10), yy + S(1), iw - nw - S(42), S(22)));
+                }
+                yy += S(22) + S(8);
+                {   // HDR (only screens that can)
+                    RectF hr(ix, yy, iw, S(40));
+                    Text(g, L"HDR", &fBody13, T.t1, RectF(hr.X, hr.Y, S(90), hr.Height));
+                    if (m.hdrOk) {
+                        add(SK_SWITCH, 100 + i, hr);
+                        Text(g, m.hdr ? L"Brighter highlights, for HDR games and video" : L"Off", &fSmall115, T.t3, RectF(hr.X + S(100), hr.Y, hr.Width - S(100) - S(85), hr.Height));
+                        DrawSwitch(g, hr.X + hr.Width - S(40), hr.Y + hr.Height / 2, m.hdr);
+                        Text(g, m.hdr ? L"On" : L"Off", &fBody13, T.t1, RectF(hr.X + hr.Width - S(40) - S(16) - S(60), hr.Y, S(60), hr.Height), StringAlignmentFar);
+                    } else Text(g, L"This screen doesn't support HDR", &fSmall115, T.t3, RectF(hr.X + S(100), hr.Y, hr.Width - S(100), hr.Height));
+                }
+                yy += S(40) + S(2);
+                {   // night light strength
+                    int str = g_night.count(m.name) ? g_night[m.name].str : 40;
+                    Text(g, L"Night light", &fDesc, T.t2, RectF(ix, yy, S(80), S(32)));
+                    RectF sl(ix + S(80), yy, iw - S(80) - S(78), S(32));
+                    add(SK_NLSL, i, RectF(sl.X - S(10), sl.Y, sl.Width + S(20), sl.Height));
+                    DrawSlider(g, sl, str / 100.f, false, g_sDragNl == i ? 2 : (isHover(SK_NLSL, i) ? 1 : 0), true);
+                    wchar_t t[8]; swprintf(t, 8, L"%d", str);
+                    Text(g, t, &fDesc600, T.t1, RectF(ix + iw - S(56), yy, S(56), S(32)), StringAlignmentFar);
+                }
+                after(r.Height, S(4));
+            }
+            ddCard(5, L"Turn night light on automatically", L"Screens with night light switched on follow this", {L"Never — only with the moon button", L"Evenings (7 pm – 7 am)", L"Sunset to sunrise"}, g_nightAuto, 5);
+            h4(L"Profiles");
+            snote(L"Save the brightness and contrast of every display, then switch with one click from the Display tab.");
+            for (int i = 0; i < (int)g_prof.size(); i++) {
+                bool active = ProfileActive(i);
+                std::wstring sub = g_prof[i].v.empty() ? L"Empty — Save current to fill it" : std::to_wstring(g_prof[i].v.size()) + (g_prof[i].v.size() == 1 ? L" display saved" : L" displays saved");
+                if (active) sub += L" · active";
+                float aw = sbtnW(L"Apply"), sw2 = sbtnW(L"Save current"), rightW = aw + S(10) + sw2 + S(10) + S(32) + S(10) + S(32);
+                RectF r; auto draw = cardStart(g_editProfile == i ? L" " : g_prof[i].name.c_str(), sub.c_str(), rightW, -1, r, 52, active ? T.accent : Color(0, 0, 0, 0)); draw(r, card);
+                if (g_editProfile == i) editRect = RectF(r.X + S(14), r.Y + r.Height / 2 - S(20), cw - S(36) - rightW - S(4), S(22));
+                float bx = r.X + r.Width - S(18), cy = r.Y + r.Height / 2 - S(16);
+                bx -= S(32); sib(SK_PDELETE, i, RectF(bx, cy, S(32), S(32)), "trash");
+                bx -= S(10) + S(32); sib(SK_PRENAME, i, RectF(bx, cy, S(32), S(32)), "pencil");
+                bx -= S(10) + sw2; sbtn(SK_PUPDATE, i, RectF(bx, cy, sw2, S(32)), L"Save current");
+                bx -= S(10) + aw; sbtn(SK_PAPPLY, i, RectF(bx, cy, aw, S(32)), L"Apply", false, !g_prof[i].v.empty());
+                cardEnd(r);
+            }
+            {
+                bool can = (int)g_prof.size() < MAX_PROFILES;
+                btnCard(can ? L"New profile from the current settings" : L"You can keep up to 8 profiles", L"", SK_PNEW, 0, L"+ New profile", true, can);
+            }
+            break;
+        }
         case SP_APPEAR: {
             {   // Theme: follow Windows, or force light / dark
-                RectF r = cardRect(cardH(L"Follow Windows, or always light or dark", S(260))); FillRound(g, card, r, S(6));
-                titleDesc(r, L"Theme", L"Follow Windows, or always light or dark", S(260));
-                RectF box(r.X + r.Width - S(18) - S(246), r.Y + r.Height / 2 - S(17), S(246), S(34));
-                FillRound(g, T.subtle, box, S(8));
-                const wchar_t* tl[3] = {L"System", L"Light", L"Dark"};
-                FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(0, g_themeMode) * S(80), box.Y + S(3), S(78), S(28)), S(6));
-                for (int i = 0; i < 3; i++) {
-                    RectF b(box.X + S(3) + i * S(80), box.Y + S(3), S(78), S(28));
-                    add(SK_THEME, i, b);
-                    bool on = g_themeMode == i;
-                    if (!on && isHover(SK_THEME, i)) FillRound(g, T.subtle, b, S(6));
-                    Text(g, tl[i], on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
-                }
+                std::vector<const wchar_t*> L3 = {L"System", L"Light", L"Dark"};
+                RectF r; auto draw = cardStart(L"Theme", L"Follow Windows, or always light or dark", segW(L3), -1, r); draw(r, card);
+                segc(r, 0, SK_THEME, L3, g_themeMode); cardEnd(r);
             }
-            RectF r = cardRect(cardH(L"Glass needs Windows 11 22H2 or newer; older versions use Solid", S(200))); FillRound(g, card, r, S(6));
-            titleDesc(r, L"Style", T.dark || true ? L"Glass needs Windows 11 22H2 or newer; older versions use Solid" : L"", S(200));
-            RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
-            FillRound(g, T.subtle, box, S(8));
-            FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(1, g_style) * S(87), box.Y + S(3), S(85), S(28)), S(6));
-            for (int i = 0; i < 2; i++) {
-                RectF b(box.X + S(3) + i * S(87), box.Y + S(3), S(85), S(28));
-                add(SK_STYLE, i, b);
-                bool on = g_style == i;
-                if (!on && isHover(SK_STYLE, i)) FillRound(g, T.subtle, b, S(6));
-                Text(g, i == 0 ? L"Solid" : L"Glass", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
+            {
+                std::vector<const wchar_t*> L2 = {L"Solid", L"Glass"};
+                RectF r; auto draw = cardStart(L"Style", L"Glass needs Windows 11 22H2 or newer; older versions use Solid", segW(L2), -1, r); draw(r, card);
+                segc(r, 1, SK_STYLE, L2, g_style); cardEnd(r);
             }
             {   // accent: Windows, or your own colour
+                std::vector<const wchar_t*> L2 = {L"Windows", L"Custom"};
                 const wchar_t* ad = g_accentId ? L"Pick any colour below" : L"Follows your Windows accent colour";
-                r = cardRect(cardH(ad, S(200))); FillRound(g, card, r, S(6));
-                titleDesc(r, L"Accent color", ad, S(200));
-                RectF box(r.X + r.Width - S(18) - S(178), r.Y + r.Height / 2 - S(17), S(178), S(34));
-                FillRound(g, T.subtle, box, S(8));
-                FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), RectF(box.X + S(3) + SegPos(2, g_accentId) * S(87), box.Y + S(3), S(85), S(28)), S(6));
-                for (int i = 0; i < 2; i++) {
-                    RectF b(box.X + S(3) + i * S(87), box.Y + S(3), S(85), S(28));
-                    add(SK_ACCMODE, i, b);
-                    bool on = g_accentId == i;
-                    if (!on && isHover(SK_ACCMODE, i)) FillRound(g, T.subtle, b, S(6));
-                    Text(g, i == 0 ? L"Windows" : L"Custom", on ? g_fSmall600 : g_fSmall, T.t1, b, StringAlignmentCenter);
-                }
+                RectF r; auto draw = cardStart(L"Accent color", ad, segW(L2), -1, r); draw(r, card);
+                segc(r, 2, SK_ACCMODE, L2, g_accentId); cardEnd(r);
             }
             if (g_accentId) {
-                r = cardRect(S(132)); FillRound(g, card, r, S(6));
+                top(0);
+                RectF r(x0, y, cw, S(120)); FillRound(g, card, r, S(6));
                 Color cur = CustomAccent(T.dark, g_accentHue, g_accentSat);
-                // preview chip + hex
-                RectF chip(r.X + r.Width - S(18) - S(96), r.Y + S(14), S(96), S(26));
-                FillRound(g, cur, chip, S(13));
                 wchar_t hx[16]; swprintf(hx, 16, L"#%02X%02X%02X", cur.GetR(), cur.GetG(), cur.GetB());
-                Text(g, hx, g_fSmall600, Color(255, 255, 255, 255), chip, StringAlignmentCenter);
-                Text(g, L"Your colour", &fBody, T.t1, RectF(r.X + S(18), r.Y + S(14), S(200), S(26)));
+                float chw = S(24) + tw(hx, &fPill);
+                RectF chip(r.X + r.Width - S(18) - chw, r.Y + S(10), chw, S(26));
+                FillRound(g, cur, chip, S(13));
+                Text(g, hx, &fPill, Color(255, 255, 255, 255), chip, StringAlignmentCenter);
+                Text(g, L"Your colour", &fBody, T.t1, RectF(r.X + S(18), r.Y + S(10), S(200), S(26)));
                 auto track = [&](int id, const wchar_t* label, float yy, float v) {
-                    Text(g, label, &fDesc, T.t2, RectF(r.X + S(18), yy - S(12), S(80), S(24)));
-                    RectF t(r.X + S(100), yy - S(5), r.Width - S(100) - S(28), S(10));
+                    Text(g, label, &fDesc, T.t2, RectF(r.X + S(18), yy - S(8), S(70), S(16)));
+                    RectF t(r.X + S(100), yy - S(5), r.Width - S(100) - S(26), S(10));
                     add(SK_COLOR, id, RectF(t.X - S(10), yy - S(14), t.Width + S(20), S(28)));
                     GraphicsPath gp; AddRound(gp, t, S(5));
                     LinearGradientBrush lb(PointF(t.X, 0), PointF(t.X + t.Width, 0), Color(255, 0, 0, 0), Color(255, 0, 0, 0));
@@ -4339,219 +5063,47 @@ static void PaintSettings(HDC hdc) {
                     }
                     g.FillPath(&lb, &gp);
                     float fx = t.X + t.Width * v, R = S(9);
-                    bool act = g_sDragColor == id + 1 || isHover(SK_COLOR, id);
-                    SolidBrush sh(Color(70, 0, 0, 0)); g.FillEllipse(&sh, fx - R, yy - R + S(1), 2 * R, 2 * R);
+                    SolidBrush sh(Color(115, 0, 0, 0)); g.FillEllipse(&sh, fx - R, yy - R + S(1), 2 * R, 2 * R);
                     SolidBrush wb(Color(255, 255, 255, 255)); g.FillEllipse(&wb, fx - R, yy - R, 2 * R, 2 * R);
-                    float ir = act ? S(6) : S(5.5f);
-                    SolidBrush cb(cur); g.FillEllipse(&cb, fx - ir, yy - ir, 2 * ir, 2 * ir);
+                    SolidBrush cb(cur); g.FillEllipse(&cb, fx - S(5), yy - S(5), S(10), S(10));
                 };
-                track(0, L"Hue", r.Y + S(70), g_accentHue / 359.f);
-                track(1, L"Intensity", r.Y + S(106), g_accentSat / 100.f);
+                track(0, L"Hue", r.Y + S(65.5f), g_accentHue / 359.f);
+                track(1, L"Intensity", r.Y + S(102.5f), g_accentSat / 100.f);
+                after(r.Height, S(4));
             }
             break;
         }
-        case SP_SOUND: {
-            y -= S(14);
-            section(L"Where sound plays");
-            y -= S(4);
-            para(L"Drag from an app to a speaker to play it there. Click a line to remove it. Apps without a line play on the speaker picked in the Sound tab.", S(12));
-            {   // Timing: one place for sync
-                int n = SelectedOutCount();
-                bool can = g_router && !g_calibrating;
-                std::wstring d = !g_calStatus.empty() ? g_calStatus
-                    : n < 2 ? L"When an app plays on two or more speakers, Auto sync lines them up"
-                            : L"Lines the speakers up using your microphone. Pause music and keep the room quiet.";
-                bool multi = SpeakersInUse() > 1;
-                RectF r = cardRect(cardH(d.c_str(), S(300))); FillRound(g, card, r, S(6));
-                titleDesc(r, L"Timing", d.c_str(), S(300));
-                button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(120), r.Y + r.Height / 2 - S(16), S(120), S(32)),
-                       g_calibrating ? L"Listening\u2026" : L"Auto sync", can, can);
-                button(SK_BUTTON, 7, RectF(r.X + r.Width - S(18) - S(120) - S(8) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)),
-                       L"Back to one speaker", false, multi && !g_calibrating);
-                y += S(12);
-            }
-            {   // the board
-                g_rtSrc.clear(); g_rtDst.clear(); g_rtLines.clear();
-                const float nodeH = S(48), gap = S(6), lineGap = S(70);
-                float lw = (cw - lineGap) * 0.44f, rw = cw - lineGap - lw, lx = x0, rx = x0 + lw + lineGap;
-                SpacedText(g, L"PLAYING NOW", g_fH3, T.t3, lx + S(4), y + S(7), S(1));
-                SpacedText(g, L"SPEAKERS", g_fH3, T.t3, rx + S(4), y + S(7), S(1));
-                y += S(24);
-                float top = y, ly = y, ry = y;
-                std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
-                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlaying(g_apps[i]) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
-                for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, nodeH); ly += nodeH + gap; }
-                for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, nodeH); ry += nodeH + gap; }
-                auto dotR = [&](int sidx) { RectF r = g_rtSrc[sidx]; return PointF(r.X + r.Width - S(1), r.Y + r.Height / 2); };
-                auto dotL = [&](int i) { RectF r = g_rtDst[i]; return PointF(r.X + S(1), r.Y + r.Height / 2); };
-                auto addLine = [&](int sidx, int i) { PointF a = dotR(sidx), b = dotL(i); float m = (b.X - a.X) * 0.5f;
-                    RtLine l; l.src = sidx; l.dst = i; l.p[0] = a; l.p[1] = PointF(a.X + m, a.Y); l.p[2] = PointF(b.X - m, b.Y); l.p[3] = b; g_rtLines.push_back(l); };
-                for (int sidx : srcs) if (sidx >= 0) for (auto& id : AppRoutes(g_apps[sidx])) for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].id == id) addLine(sidx, i);
-                int lit = g_rtDrag != RT_NONE ? g_rtDrag : g_rtSel;
-                for (int k = 0; k < (int)g_rtLines.size(); k++) {   // one kind of line; the chosen sound's lines in the accent colour
-                    auto& l = g_rtLines[k];
-                    bool on = l.src == lit, hov = k == g_rtHoverLine;
-                    Pen pen(hov ? Color(255, 232, 72, 72) : on ? T.accent : WithAlpha(T.t1, 120), hov || on ? S(2.2f) : S(1.6f));
-                    pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
-                    g.DrawBezier(&pen, l.p[0], l.p[1], l.p[2], l.p[3]);
-                }
-                for (int sidx : srcs) {
-                    RectF r = g_rtSrc[sidx];
-                    add(SK_RTSRC, sidx, r);
-                    bool sel = lit == sidx;
-                    FillRound(g, isHover(SK_RTSRC, sidx) ? cardHover : card, r, S(6));
-                    if (sel) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, r, S(6)); g.DrawPath(&sp, &gp); }
-                    RectF ic(r.X + S(12), r.Y + S(11), S(26), S(26));
-                    std::wstring title, sub;
-                    if (sidx < 0) { FillRound(g, T.subtle2, ic, S(6)); Glyph(g, G_VOLUME, g_fIconS, T.t1, ic.X + S(13), ic.Y + S(13)); title = L"Everything else"; sub = L"Windows, games, new apps"; }
-                    else {
-                        AppGroup& a = g_apps[sidx];
-                        Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
-                        if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24))); }
-                        else { FillRound(g, T.subtle2, ic, S(6)); Glyph(g, G_APPS, g_fIconS, T.t1, ic.X + S(13), ic.Y + S(13)); }
-                        title = a.name;
-                        auto rt = AppRoutes(a);
-                        sub = rt.empty() ? L"Default speaker" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
-                    }
-                    Text(g, title.c_str(), &fBody, T.t1, RectF(r.X + S(46), r.Y + S(5), r.Width - S(56), S(22)));
-                    Text(g, sub.c_str(), &fDesc, T.t3, RectF(r.X + S(46), r.Y + S(25), r.Width - S(56), S(18)));
-                    SolidBrush db(T.accent); PointF d = dotR(sidx); g.FillEllipse(&db, d.X - S(6), d.Y - S(6), S(12), S(12));
-                }
-                for (int i = 0; i < (int)g_out.size(); i++) {
-                    Endpoint& o = g_out[i];
-                    RectF r = g_rtDst[i];
-                    add(SK_RTDST, i, r);
-                    bool hot = g_rtDrag != RT_NONE && InRect(RectF(r.X - S(30), r.Y, r.Width + S(30), r.Height), g_rtMouse.X, g_rtMouse.Y);
-                    bool used = OutSelected(i) || std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i; });
-                    FillRound(g, card, r, S(6));
-                    if (hot) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, r, S(6)); g.DrawPath(&sp, &gp); }
-                    RectF ic(r.X + S(14), r.Y + S(11), S(26), S(26));
-                    FillRound(g, OutSelected(i) ? T.accent : T.subtle2, ic, S(6));
-                    DrawDevIcon(g, o.icon, ic.X + S(13), ic.Y + S(13), OutSelected(i) ? T.onAccent : T.t1);
-                    float right = S(12);
-                    bool pill = used && SpeakersInUse() > 1;   // when several speakers play: how long each waits (the slowest 0 ms)
-                    RectF pr(r.X + r.Width - S(12) - S(70), r.Y + S(13), S(70), S(22));
-                    if (pill) {
-                        right = S(12) + S(70) + S(8);
-                        add(SK_RTDELAY, i, pr);
-                        if (g_editDelay == i) editRect = RectF(pr.X + S(8), pr.Y + S(3), pr.Width - S(16), pr.Height - S(6));
-                        FillRound(g, isHover(SK_RTDELAY, i) || g_editDelay == i ? T.subtle3 : T.subtle2, pr, S(11));
-                        if (g_editDelay != i) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", ShownDelay(o.id)); PillText(g, t, g_fSmall600, T.accent, pr, StringAlignmentCenter); }
-                    }
-                    std::wstring sub = o.bt ? std::wstring(L"Bluetooth") : o.detail;
-                    Text(g, OutLabel(o).c_str(), &fBody, T.t1, RectF(r.X + S(48), r.Y + S(5), r.Width - S(56) - right, S(22)));
-                    Text(g, sub.c_str(), &fDesc, T.t3, RectF(r.X + S(48), r.Y + S(25), r.Width - S(56) - right, S(18)));
-                    SolidBrush db(used ? T.accent : T.t3); PointF d = dotL(i); g.FillEllipse(&db, d.X - S(5), d.Y - S(5), S(10), S(10));
-                }
-                if (g_rtDrag != RT_NONE && g_rtSrc.count(g_rtDrag)) {   // the line being dragged
-                    PointF a = dotR(g_rtDrag), b = g_rtMouse; float m = (b.X - a.X) * 0.5f;
-                    Pen tp(T.accent, S(2)); tp.SetDashStyle(DashStyleDash);
-                    g.DrawBezier(&tp, a, PointF(a.X + m, a.Y), PointF(b.X - m, b.Y), b);
-                }
-                if (srcs.empty()) Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), top, lw, nodeH));
-                y = std::max(ly, ry) + S(4);
-                (void)top;
-                if (!ProcLoopbackOk()) { y += S(4); para(L"This version of Windows can send each app to one speaker only. Windows 11 lets an app play on several.", S(4)); }
-            }
-            section(L"More sound options");
-            {
-                std::vector<std::wstring> opts = {L"Same as main output"}; int cur = 0;
-                for (auto& o : g_out) { opts.push_back(o.name); if (!g_callDev.empty() && o.id == g_callDev) cur = (int)opts.size() - 1; }
-                ddCard(1, L"Device for calls", L"For apps that follow Windows' call device, like Teams and Skype; everything else keeps the main output", opts, cur);
-            }
-            switchCard(11, L"Switch to headphones when they connect", L"And back to the previous output when they disconnect", g_autoSwitch);
-            switchCard(12, L"Mono audio", L"Both ears hear everything \u2014 handy with one earbud", MonoOn());
-            ddCard(2, L"During calls", L"How much Windows turns other sounds down", {L"Mute everything else", L"Reduce by 80%", L"Reduce by 50%", L"Do nothing"}, Ducking());
-            break;
-        }
-        case SP_DISPLAY:
-            switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
-            section(L"Colour");
-            y -= S(4);
-            para(L"Per screen. Night light adds a warm tint that's easier on the eyes; switch it on with the moon button in the Display tab. HDR shows only for screens that support it.", S(10));
-            for (int i = 0; i < (int)g_mons.size(); i++) {
-                MonUI& m = g_mons[i];
-                if (m.cloneOf >= 0) continue;   // a duplicate shares its source's colour
-                RectF r = cardRect(m.hdrOk ? S(140) : S(100)); FillRound(g, card, r, S(6));
-                wchar_t num[4]; swprintf(num, 4, L"%d", i + 1);
-                RectF nb(r.X + S(18), r.Y + S(14), S(22), S(18)); GraphicsPath gp; AddRound(gp, nb, S(4)); Pen pp(T.t1, S(1.3f)); g.DrawPath(&pp, &gp);
-                Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter);
-                Text(g, m.name.c_str(), &fBody600, T.t1, RectF(r.X + S(50), r.Y + S(10), r.Width - S(70), S(26)));
-                float ry = r.Y + S(46);
-                if (m.hdrOk) {
-                    RectF hr(r.X + S(8), ry, r.Width - S(16), S(40));
-                    add(SK_SWITCH, 100 + i, hr);
-                    if (isHover(SK_SWITCH, 100 + i)) FillRound(g, cardHover, hr, S(5));
-                    Text(g, L"HDR", &fBody, T.t1, RectF(hr.X + S(10), hr.Y, S(120), hr.Height));
-                    Text(g, m.hdr ? L"Brighter highlights for HDR games and video" : L"Off", &fDesc, T.t3, RectF(hr.X + S(130), hr.Y, hr.Width - S(240), hr.Height));
-                    Text(g, m.hdr ? L"On" : L"Off", &fBody, T.t1, RectF(hr.X + hr.Width - S(102), hr.Y, S(40), hr.Height), StringAlignmentFar);
-                    DrawSwitch(g, hr.X + hr.Width - S(10) - S(40), hr.Y + hr.Height / 2, m.hdr);
-                    ry += S(44);
-                }
-                {   // night light strength
-                    int str = g_night.count(m.name) ? g_night[m.name].str : 40;
-                    Text(g, L"Night light", &fBody, T.t1, RectF(r.X + S(18), ry, S(120), S(36)));
-                    RectF sl(r.X + S(140), ry + S(4), r.Width - S(140) - S(80), S(28));
-                    add(SK_NLSL, i, RectF(sl.X - S(10), sl.Y, sl.Width + S(20), sl.Height));
-                    DrawSlider(g, sl, str / 100.f, false, g_sDragNl == i ? 2 : (isHover(SK_NLSL, i) ? 1 : 0));
-                    wchar_t t[8]; swprintf(t, 8, L"%d", str);
-                    Text(g, t, g_fSmall600, T.t1, RectF(r.X + r.Width - S(70), ry, S(52), S(36)), StringAlignmentFar);
-                }
-            }
-            ddCard(5, L"Turn night light on automatically", L"Screens with night light switched on follow this", {L"Whenever it's switched on", L"Evenings only (7 pm \u2013 7 am)"}, g_nightAuto);
-            section(L"Profiles");
-            y -= S(4);
-            para(L"Save the brightness and contrast of every display, then switch with one click from the Display tab.", S(10));
-            for (int i = 0; i < (int)g_prof.size(); i++) {
-                RectF r = cardRect(S(64)); FillRound(g, card, r, S(6));
-                bool active = ProfileActive(i);
-                std::wstring sub = g_prof[i].v.empty() ? L"Empty — Save current to fill it" : std::to_wstring(g_prof[i].v.size()) + (g_prof[i].v.size() == 1 ? L" display saved" : L" displays saved");
-                if (active) sub += L" · active";
-                float right = S(18) + S(32) + S(4) + S(32) + S(8) + S(110) + S(8) + S(72);
-                if (g_editProfile == i) editRect = RectF(r.X + S(14), r.Y + S(8), r.Width - right - S(30), S(28));
-                else Text(g, g_prof[i].name.c_str(), &fBody, T.t1, RectF(r.X + S(18), r.Y + S(12), r.Width - right - S(24), S(22)));
-                Text(g, sub.c_str(), &fDesc, active ? T.accent : T.t3, RectF(r.X + S(18), r.Y + S(36), r.Width - right - S(24), S(20)));
-                float bx = r.X + r.Width - S(18);
-                bx -= S(32); iconButton(SK_PDELETE, i, RectF(bx, r.Y + S(16), S(32), S(32)), 0xE74D);
-                bx -= S(36); iconButton(SK_PRENAME, i, RectF(bx, r.Y + S(16), S(32), S(32)), 0xE70F);
-                bx -= S(118); button(SK_PUPDATE, i, RectF(bx, r.Y + S(16), S(110), S(32)), L"Save current");
-                bx -= S(80); button(SK_PAPPLY, i, RectF(bx, r.Y + S(16), S(72), S(32)), L"Apply", false, !g_prof[i].v.empty());
-            }
-            {
-                RectF r = cardRect(S(52)); FillRound(g, card, r, S(6));
-                bool can = (int)g_prof.size() < MAX_PROFILES;
-                titleDesc(r, can ? L"New profile from the current settings" : L"You can keep up to 8 profiles", L"", S(170));
-                button(SK_PNEW, 0, RectF(r.X + r.Width - S(18) - S(150), r.Y + S(10), S(150), S(32)), L"+ New profile", true, can);
-            }
-            break;
         case SP_ABOUT: {
-            RectF r = cardRect(S(96)); FillRound(g, card, r, S(6));
-            Text(g, APP_NAME L" " APP_VERSION, &fBody600, T.t1, RectF(r.X + S(18), r.Y + S(14), r.Width - S(36), S(24)));
-            Text(g, L"A tiny tray app for volume, apps, audio outputs and display brightness.", &fDesc, T.t2, RectF(r.X + S(18), r.Y + S(42), r.Width - S(36), S(20)));
-            Text(g, L"No install, no background services — only built-in Windows parts.", &fDesc, T.t3, RectF(r.X + S(18), r.Y + S(62), r.Width - S(36), S(20)));
-            { RectF r = cardRect(S(64)); FillRound(g, card, r, S(6));
-              std::wstring st = g_updStatus.empty() ? L"Checks github.com/" UPDATE_REPO L" every 6 hours" : g_updStatus;
-              r.Height = cardH(st.c_str(), S(170)); y += r.Height - S(64); FillRound(g, card, r, S(6));
-              titleDesc(r, L"Updates", st.c_str(), S(170));
-              if (g_updState == UPD_FAILED) button(SK_BUTTON, 6, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), L"Download in browser", true);
-              else if (g_updState == UPD_AVAILABLE) button(SK_BUTTON, 4, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), (L"Update to " + g_updVersion).c_str(), true);
-              else button(SK_BUTTON, 3, RectF(r.X + r.Width - S(18) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)), g_updState == UPD_DOWNLOADING ? L"Updating\u2026" : L"Check now", false, g_updState != UPD_DOWNLOADING); }
+            {   // name, version, what it is
+                top(0);
+                RectF r(x0, y, cw, S(71)); FillRound(g, card, r, S(6));
+                Text(g, APP_NAME L" " APP_VERSION, &fBody, T.t1, RectF(r.X + S(17), r.Y + S(10), r.Width - S(36), S(17)));
+                Text(g, L"A tiny tray app for volume, apps, audio outputs and display brightness.", &fDesc, T.t3, RectF(r.X + S(17), r.Y + S(29), r.Width - S(36), S(15)));
+                Text(g, L"No install, no background services — only built-in Windows parts.", &fDesc, T.t3, RectF(r.X + S(17), r.Y + S(46), r.Width - S(36), S(15)));
+                after(r.Height, S(4));
+            }
+            {
+                std::wstring st = g_updStatus.empty() ? L"Checks github.com/" UPDATE_REPO L" every 6 hours" : g_updStatus;
+                if (g_updState == UPD_FAILED) btnCard(L"Updates", st.c_str(), SK_BUTTON, 6, L"Download in browser", true);
+                else if (g_updState == UPD_AVAILABLE) btnCard(L"Updates", st.c_str(), SK_BUTTON, 4, (L"Update to " + g_updVersion).c_str(), true);
+                else btnCard(L"Updates", st.c_str(), SK_BUTTON, 3, g_updState == UPD_DOWNLOADING ? L"Updating…" : L"Check now", false, g_updState != UPD_DOWNLOADING);
+            }
             linkCard(3, L"Open the settings folder", L"settings.ini lives in %APPDATA%\\Knob");
-            { const wchar_t* rd = L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness";
-              RectF r = cardRect(cardH(rd, S(160))); FillRound(g, card, r, S(6)); titleDesc(r, L"Reset all settings", rd, S(160));
-              button(SK_BUTTON, 2, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)), L"Reset settings"); }
+            btnCard(L"Reset all settings", L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness", SK_BUTTON, 2, L"Reset settings");
             break;
         }
         }
         if (ddPopId >= 0) {   // open dropdown list, on top of everything
             float ih = S(32), ph = ih * ddPopOpts.size() + S(8);
-            RectF pop(ddPopBtn.X, ddPopBtn.Y + ddPopBtn.Height + S(4), ddPopBtn.Width, ph);
+            float pw = ddPopBtn.Width; for (auto& o : ddPopOpts) pw = std::max(pw, S(28) + tw(o.c_str(), &fDesc));
+            pw = std::min(pw, cw);
+            RectF pop(std::min(ddPopBtn.X, x0 + cw - pw), ddPopBtn.Y + ddPopBtn.Height + S(4), pw, ph);
             if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
             if (pop.Y < S(8)) pop.Y = std::max(S(8), g_setH - S(8) - ph);              // no room either way: as much of the window as it needs
             for (int i = 0; i < (int)ddPopOpts.size(); i++) add(SK_DDOPT, ddPopId * 100 + i, RectF(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih));
             float pt = PopT(g_paSetDD, ddPopId);
             DrawPopAnimated(g, g_paSetDD, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
-                FillRound(gg, Color(60, 0, 0, 0), RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height), S(8));
+                FillRound(gg, Color(70, 0, 0, 0), RectF(pop.X - S(1), pop.Y + S(3), pop.Width + S(2), pop.Height + S(2)), S(9));
                 FillRound(gg, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
                 for (int i = 0; i < (int)ddPopOpts.size(); i++) {
                     RectF it(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih);
@@ -4561,7 +5113,7 @@ static void PaintSettings(HDC hdc) {
                 }
             });
         } else ClosePop(g, g_paSetDD);
-        g_setContentH = y + g_setScroll + S(24);
+        g_setContentH = y + g_setScroll + S(22);
         g.ResetClip();
         float view = (float)g_setH;
         if (g_setContentH > view + 1) {
@@ -4657,8 +5209,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int ln = RtLineAt(x, y);
             if (ln >= 0) {
                 RtLine l = g_rtLines[ln];
-                if (l.src < 0) { if (SelectedOutCount() > 1) ToggleOutput(l.dst); }   // something always plays
-                else if (l.src < (int)g_apps.size() && l.dst < (int)g_out.size()) AppRouteRemove(g_apps[l.src], g_out[l.dst].id);
+                if (l.src < 0) { g_rtHoverLine = -1; return 0; }   // an app on the default speaker: nothing of its own to remove
+                if (l.src < (int)g_apps.size() && l.dst < (int)g_out.size()) AppRouteRemove(g_apps[l.src], g_out[l.dst].id);
                 g_rtHoverLine = -1; SettingsChanged(); return 0;
             }
             if (g_rtSel != RT_NONE) { g_rtSel = RT_NONE; InvalidateRect(h, nullptr, FALSE); }
@@ -4676,20 +5228,35 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_themeMode = it.id; SaveSettings();
             ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); UpdateTrayIcon(); SettingsChanged();
             break;
-        case SK_DDBTN: g_sddOpen = g_sddOpen == it.id ? -1 : it.id; InvalidateRect(h, nullptr, FALSE); return 0;
+        case SK_DDBTN: {
+            static const int newBit[6] = {-1, 1, 4, 0, -1, 5};   // dropdown id -> its "NEW" tag
+            if (it.id >= 1 && it.id <= 5 && newBit[it.id] >= 0 && !(g_newSeen & (1 << newBit[it.id]))) { g_newSeen |= 1 << newBit[it.id]; SaveSettings(); }
+            g_sddOpen = g_sddOpen == it.id ? -1 : it.id; InvalidateRect(h, nullptr, FALSE); return 0;
+        }
         case SK_DDOPT: {
             int dd = it.id / 100, k = it.id % 100;
             if (dd == 1) { std::wstring id; if (k > 0 && k - 1 < (int)g_out.size()) id = g_out[k - 1].id; SetCallDevice(id); SaveSettings(); }
             if (dd == 2) AudioRegSet(L"UserDuckingPreference", (DWORD)k);
             if (dd == 3) { g_openOn = k ? 1 : 0; SaveSettings(); }
-            if (dd == 4 && k < (int)g_hkAddMap.size()) { g_capture = g_hkAddMap[k]; UnregisterHotkeys(); }   // new shortcut: wait for its keys
-            if (dd == 5) { g_nightAuto = k ? 1 : 0; SaveSettings(); ApplyNight(); }
+            if (dd == 4 && k < (int)g_hkAddMap.size()) {   // new shortcut: a row, then wait for its keys
+                int a = g_hkAddMap[k]; Shortcut s2{a, L"", {0, 0, false}};
+                if (HkParamKind(a) == 1) { int di = DefaultOut(); if (!g_out.empty()) s2.param = OutLabel(g_out[di >= 0 ? di : 0]); }
+                if (HkParamKind(a) == 2 && !g_prof.empty()) s2.param = g_prof[0].name;
+                g_sc.push_back(s2); g_capture = (int)g_sc.size() - 1; UnregisterHotkeys(); SaveSettings();
+            }
+            if (dd == 5) { g_nightAuto = std::min(2, k); SaveSettings(); GeoRefresh(); ApplyNight(); }
+            if (dd >= 1000 && dd - 1000 < (int)g_sc.size()) {   // which speaker / profile a shortcut uses
+                Shortcut& s2 = g_sc[dd - 1000];
+                if (HkParamKind(s2.act) == 1 && k < (int)g_out.size()) s2.param = OutLabel(g_out[k]);
+                if (HkParamKind(s2.act) == 2 && k < (int)g_prof.size()) s2.param = g_prof[k].name;
+                SaveSettings();
+            }
             g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
         }
         case SK_SWITCH:
             if (it.id == 10) { SetMulti(!g_multi); SettingsChanged(); }
-            else if (it.id == 11) g_autoSwitch = !g_autoSwitch;
-            else if (it.id == 12) AudioRegSet(L"AccessibilityMonoMixState", MonoOn() ? 0 : 1);
+            else if (it.id == 11) { g_autoSwitch = !g_autoSwitch; g_newSeen |= 1 << 2; }
+            else if (it.id == 12) { AudioRegSet(L"AccessibilityMonoMixState", MonoOn() ? 0 : 1); g_newSeen |= 1 << 3; }
             else if (it.id >= 100 && it.id - 100 < (int)g_mons.size()) { int mi = it.id - 100; g_dispStatus = SetHdr(mi, !g_mons[mi].hdr) ? L"" : L"Windows didn't change HDR for this screen"; BrightRequest(true, false); }
             if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
@@ -4705,7 +5272,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_BUTTON:
             if (it.id == 1) { DestroyWindow(g_hwnd); return 0; }
             if (it.id == 3) { g_updStatus = L"Checking\u2026"; CheckForUpdates(); }
-            if (it.id == 5) StartAutoSync();
+            if (it.id == 5) { g_calAsk = false; g_calShow = true; StartAutoSync(); }
             if (it.id == 7) { OneSpeaker(); g_calStatus.clear(); }
             if (it.id == 6) ShellExecuteW(nullptr, L"open", L"https://github.com/" UPDATE_REPO L"/raw/main/dist/Knob.exe", nullptr, nullptr, SW_SHOWNORMAL);
             if (it.id == 4) StartUpdate();
@@ -4720,7 +5287,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_COLOR: g_sDragColor = it.id + 1; SetCapture(h); SettingsColorAt(x); return 0;
         case SK_HK: g_capture = it.id; UnregisterHotkeys(); break;
         case SK_STEP: g_step = it.id; SaveSettings(); break;
-        case SK_RESETHK: for (int i = 0; i < HK_COUNT; i++) g_hk[i] = HK_DEFAULT[i]; RegisterHotkeys(); SaveSettings(); break;
+        case SK_RESETHK: g_sc.clear(); RegisterHotkeys(); SaveSettings(); break;
         case SK_PAPPLY: ApplyProfile(it.id); break;
         case SK_PUPDATE: SaveProfile(it.id); break;
         case SK_PRENAME: StartRename(it.id); return 0;
@@ -4734,11 +5301,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case SK_DELAY: g_sDragDelay = it.id; SetCapture(h); SettingsDelayAt(x); return 0;
-        case SK_HKDEL: g_hk[it.id].mods = 0; g_hk[it.id].vk = 0; if (g_capture == it.id) g_capture = -1; RegisterHotkeys(); SaveSettings(); break;
+        case SK_HKDEL: if (it.id < (int)g_sc.size()) { UnregisterHotkeys(); g_sc.erase(g_sc.begin() + it.id); g_capture = -1; RegisterHotkeys(); SaveSettings(); } break;
         case SK_HKADD: g_sddOpen = g_sddOpen == 4 ? -1 : 4; InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_NLSL: g_sDragNl = it.id; SetCapture(h); SettingsNlAt(x); return 0;
         case SK_RTSRC: g_rtSel = it.id; g_rtDrag = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
-        case SK_RTDST: break;
+        case SK_RTDST:   // a speaker: everything plays there, and only there
+            if (it.id < (int)g_out.size()) {
+                std::wstring id = g_out[it.id].id;
+                OneSpeaker();
+                if (!g_out[it.id].isDefault) { SetDefaultDevice(id); LoadEndpoints(eRender, g_out); }
+                g_rtSel = RT_NONE; UpdateTrayTip();
+            }
+            break;
         case SK_RTDELAY: StartDelayEdit(it.id); return 0;
         }
         SettingsChanged();
@@ -4816,7 +5390,7 @@ static void OpenSettings(int page, bool newProfile) {
         UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
-        RECT r = {0, 0, (LONG)S(820), (LONG)S(600)};
+        RECT r = {0, 0, (LONG)S(680), (LONG)S(526)};   // the design's Settings window
         DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;   // fixed size, close button only
         AdjustWindowRectExForDpi(&r, style, FALSE, 0, dx);
         int w = r.right - r.left, hgt = r.bottom - r.top;
@@ -4878,11 +5452,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
     }
+    case WM_APP + 33: g_calK = (int)wp; if (g_visible) InvalidateRect(h, nullptr, FALSE); if (g_set) InvalidateRect(g_set, nullptr, FALSE); return 0;
+    case WM_APP + 34: if ((int)wp < (int)g_calIds.size()) g_calHeard[g_calIds[wp]] = (int)lp; if (g_visible) InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_APP_CALDONE: {
         CalResult* r = (CalResult*)lp;
         InterlockedExchange(&g_calibrating, 0);
+        if (r && r->status == L"Stopped") { g_calShow = false; g_calStatus.clear(); delete r; r = nullptr; g_calPass = 0; }
         if (r) {
-            for (auto& d : r->delays) g_delay[d.first] = d.second;
+            for (auto& d : r->delays) { g_delay[d.first] = d.second; g_delayMeasured[d.first] = d.second; }
             g_calStatus = r->status;
             if (!r->delays.empty()) SaveSettings();
             int di = DefaultOut();
@@ -4912,10 +5489,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         UpdateTrayTip();
         if (g_visible && g_dragEl < 0) InvalidateRect(h, nullptr, FALSE);
         return 0;
-    case WM_HOTKEY: if (wp >= 100 && wp < 100 + HK_COUNT) RunHotkey((int)wp - 100); return 0;
+    case WM_HOTKEY: if (wp >= 100 && (int)wp < 100 + (int)g_sc.size()) RunHotkey(g_sc[wp - 100].act, g_sc[wp - 100].param); return 0;
     case WM_APP_AUDIOCHANGED: SetTimer(h, TIMER_AUDIODEBOUNCE, 200, nullptr); return 0;
+    case WM_APP + 31: SaveSettings(); ApplyNight(); return 0;   // location for sunset to sunrise arrived
     case WM_APP_MONITORS: {
         MonMsg* m = (MonMsg*)lp;
+        if (g_demo) {   // the design's two screens
+            m->mons.clear();
+            MonUI a; a.name = L"Built-in display"; a.detail = L"Laptop panel"; a.pct = 62; a.ok = true; a.internal = true; a.hdrOk = true; a.rates = {60, 120}; a.rate = 120; a.gdi = L"\\\\.\\DISPLAY1";
+            MonUI b; b.name = L"DELL G2724D"; b.detail = L"DisplayPort"; b.pct = 100; b.con = 50; b.ok = true; b.hasCon = true; b.hdrOk = true; b.rates = {60, 120, 144, 165}; b.rate = 165;
+            b.inputs = {15, 17, 18}; b.input = 15; b.gdi = L"\\\\.\\DISPLAY2";
+            m->mons.push_back(a); m->mons.push_back(b);
+        }
         bool draggingMon = g_dragEl >= 0 && g_dragEl < (int)g_els.size() && (g_els[g_dragEl].k == E_MONB || g_els[g_dragEl].k == E_MONC);
         if (m->fromEnum || !draggingMon) {
             std::set<std::wstring> before;
@@ -4946,7 +5531,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             return 0;
         }
-        if (wp == TIMER_NIGHT) { ApplyNight(); return 0; }
+        if (wp == TIMER_NIGHT) { GeoRefresh(); ApplyNight(); return 0; }
         if (wp == TIMER_DELAYAPPLY) { KillTimer(h, TIMER_DELAYAPPLY); RestartRouter(); return 0; }
         if (wp == TIMER_FADE) {
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
@@ -5015,14 +5600,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_SYSKEYDOWN:
     case WM_KEYDOWN:
+        if (g_capture >= (int)g_sc.size()) g_capture = -1;
         if (g_capture >= 0) {   // recording a new shortcut
             UINT vk = (UINT)wp;
             if (vk == VK_CONTROL || vk == VK_MENU || vk == VK_SHIFT || vk == VK_LWIN || vk == VK_RWIN) return 0;
             UINT mods = (GetKeyState(VK_CONTROL) < 0 ? MOD_CONTROL : 0) | (GetKeyState(VK_MENU) < 0 ? MOD_ALT : 0) |
                         (GetKeyState(VK_SHIFT) < 0 ? MOD_SHIFT : 0) | ((GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) ? MOD_WIN : 0);
             if (vk == VK_ESCAPE && !mods) { g_capture = -1; }
-            else if ((vk == VK_BACK || vk == VK_DELETE) && !mods) { g_hk[g_capture].mods = 0; g_hk[g_capture].vk = 0; g_capture = -1; }
-            else if (mods || (vk >= VK_F13 && vk <= VK_F24)) { g_hk[g_capture].mods = mods; g_hk[g_capture].vk = vk; g_capture = -1; }
+            else if ((vk == VK_BACK || vk == VK_DELETE) && !mods) { g_sc[g_capture].k.mods = 0; g_sc[g_capture].k.vk = 0; g_capture = -1; }
+            else if (mods || (vk >= VK_F13 && vk <= VK_F24)) { g_sc[g_capture].k.mods = mods; g_sc[g_capture].k.vk = vk; g_capture = -1; }
             else return 0;   // a plain key alone would steal normal typing: wait for a combo
             RegisterHotkeys(); SaveSettings();
             InvalidateRect(h, nullptr, FALSE);
@@ -5072,7 +5658,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Hit ht = HitTest(x, y);
         // an open popup swallows the click that closes it
         if (g_menuOpen && ht.h != H_MENU && ht.h != H_MENUBG) { g_menuOpen = false; InvalidateRect(h, nullptr, FALSE); return 0; }
-        if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLSYNC && ht.h != H_MENUBG) {
+        if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLSYNC && ht.h != H_DLRESET && ht.h != H_MENUBG) {
             bool same = ht.h == H_DELAYCHIP && ht.idx == g_delayOpen;
             g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE);
             if (same || ht.h != H_DELAYCHIP) return 0;
@@ -5111,7 +5697,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     auto r = AppRoutes(a);
                     if (std::find(r.begin(), r.end(), id) != r.end()) AppRouteRemove(a, id); else AppRouteAdd(a, id);
                     if (ProcLoopbackOk()) { g_ddOpen = idx; g_ddKind = 4; }   // ticking several: the list stays open
-                } else { OpenSettings(SP_SOUND_PAGE, false); return 0; }   // Open routing…
+                }
             }
             else if (kind == 3 && k < (int)g_ddProfMap.size()) {
                 int pi = g_ddProfMap[k];
@@ -5145,9 +5731,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(h, TIMER_DELAYAPPLY, 350, nullptr);   // apply once the clicking stops
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             break;
-        case H_DLSYNC: g_delayOpen = -1; StartAutoSync(); g_calShow = true; break;
-        case H_AUTOSYNC: StartAutoSync(); g_calShow = true; break;
-        case H_CALDONE: g_calShow = false; break;
+        case H_DLSYNC: g_delayOpen = -1; g_calShow = true; g_calAsk = true; break;   // ask first, like the header button
+        case H_DLRESET:   // back to what Auto sync measured
+            for (auto& kv : g_delayMeasured) g_delay[kv.first] = kv.second;
+            SaveSettings(); RestartRouter(); break;
+        case H_AUTOSYNC: if (!g_calibrating) { g_calShow = true; g_calAsk = true; g_calStatus.clear(); } else g_calShow = true; g_delayOpen = -1; break;
+        case H_CALSTART: g_calAsk = false; StartAutoSync(); break;
+        case H_CALCANCEL: if (g_calAsk) { g_calAsk = false; g_calShow = false; } else InterlockedExchange(&g_calCancel, 1); break;
+        case H_CALDONE: g_calShow = false; g_calStatus.clear(); break;
         case H_DELAYSL: {
             RectF chip; if (!DelayAnchor(chip)) break;
             RectF sl = DelaySlider(DelayPopup(chip));
@@ -5160,7 +5751,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_HKCHIP: g_capture = ht.idx; UnregisterHotkeys(); break;   // free all combos while recording
         case H_OSD: g_osd = !g_osd; SaveSettings(); if (g_osd) ShowOsd(OSD_VOL, DefaultOut() >= 0 ? (int)lround(g_out[DefaultOut()].level * 100) : 0, false); break;
         case H_STEP: { int vals[3] = {2, 5, 10}; g_step = vals[ht.idx]; SaveSettings(); break; }
-        case H_RESET: for (int i = 0; i < HK_COUNT; i++) g_hk[i] = HK_DEFAULT[i]; RegisterHotkeys(); SaveSettings(); break;
+        case H_RESET: g_sc.clear(); RegisterHotkeys(); SaveSettings(); break;
         case H_PROFILE:
             if (ht.idx == ChipCount() - 1) g_saveOpen = true;
             else if (ProfileEmpty(ht.idx)) SaveProfile(ht.idx);   // first click on an empty profile stores the current setup
@@ -5295,6 +5886,7 @@ static bool InstallOrUpdate() {
 
 // ---------------------------------------------------------------- entry
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
+    g_demo = cmd && wcsstr(cmd, L"--demo");
     g_inst = hi;
     if (InstallOrUpdate()) return 0;
     {   // tidy up downloaded updates
