@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.33.0"
-#define APP_VERNUM  ((1 << 16) | (33 << 8) | 0)
+#define APP_VERSION L"1.34.0"
+#define APP_VERNUM  ((1 << 16) | (34 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2180,6 +2180,7 @@ static void TextWrap(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r) {
     SolidBrush b(c);
     g.DrawString(s, -1, f, r, &sf, &b);
 }
+static void PillText(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r, StringAlignment h = StringAlignmentNear) { Text(g, s, f, c, RectF(r.X, r.Y - S(1), r.Width, r.Height), h); }
 static float TextW(Graphics& g, const wchar_t* s, Font* f) { RectF out; g.MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width; }
 static void Glyph(Graphics& g, wchar_t ch, Font* f, Color c, float cx, float cy) {
     wchar_t s[2] = {ch, 0};
@@ -2234,7 +2235,7 @@ static void DrawSlider(Graphics& g, RectF r, float v, bool dim, int state /*0 re
 }
 static void DrawValue(Graphics& g, RectF r, int v) {
     wchar_t pct[8]; swprintf(pct, 8, L"%d", v);
-    if (T.glass) { FillRound(g, T.valBg, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), S(8)); Text(g, pct, g_fSmall, T.t2, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), StringAlignmentCenter); }
+    if (T.glass) { FillRound(g, T.valBg, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), S(8)); PillText(g, pct, g_fSmall, T.t2, RectF(r.X + S(2), r.Y, r.Width - S(2), r.Height), StringAlignmentCenter); }
     else Text(g, pct, g_fSmall, T.t2, RectF(r.X, r.Y, r.Width - S(4), r.Height), StringAlignmentFar);
 }
 static void DrawIconBtn(Graphics& g, RectF r, wchar_t glyph, Color c, bool hover) {
@@ -2354,7 +2355,7 @@ static void DrawEl(Graphics& g, int index) {
             bool routed = !g_apps[e.idx].outId.empty();
             {
                 std::wstring lbl = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
-                g_appChipW[e.idx] = std::max(S(96), std::min(S(170), S(32) + TextW(g, lbl.c_str(), g_fSmall) + S(14)));
+                g_appChipW[e.idx] = std::max(S(96), std::min(S(170), S(32) + TextW(g, lbl.c_str(), g_fSmall) + S(8)));
             }
             RectF c = AppOutChip(e);
             maxW = c.X - S(8) - nx;
@@ -2362,7 +2363,7 @@ static void DrawEl(Graphics& g, int index) {
             FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
             Glyph(g, G_VOLUME, g_fIconS, routed ? T.accent : T.t2, c.X + S(17), c.Y + c.Height / 2);
             std::wstring on = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
-            Text(g, on.c_str(), g_fSmall, routed ? T.t1 : T.t2, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(14), c.Height));
+            PillText(g, on.c_str(), g_fSmall, routed ? T.t1 : T.t2, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(6), c.Height));
         }
         if (e.k == E_OUT && HasDelayChip(e.idx)) {
             RectF c = DelayChip(e);
@@ -2371,7 +2372,7 @@ static void DrawEl(Graphics& g, int index) {
             FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
             wchar_t t[32]; swprintf(t, 32, L"Sync %d ms", DelayOf(e.idx));
             Glyph(g, 0xE916, g_fIconS, T.t1, c.X + S(17), c.Y + c.Height / 2);   // stopwatch
-            Text(g, t, g_fSmall, T.t1, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(12), c.Height));
+            PillText(g, t, g_fSmall, T.t1, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(8), c.Height));
         }
         Font* nf = e.k == E_MASTER ? g_fName600 : g_fName;
         float nw = std::min(TextW(g, name.c_str(), nf), maxW * 0.7f);
@@ -2456,14 +2457,14 @@ static void DrawEl(Graphics& g, int index) {
         FillRound(g, open || (hovEl && g_hover.h == H_PROFDD) ? T.ddBtnHover : T.ddBtn, pb, S(T.glass ? 9 : 6));
         int act = -1; for (int i = 0; i < (int)g_prof.size(); i++) if (ProfileActive(i)) { act = i; break; }
         Glyph(g, 0xE74E, g_fIconS, T.t2, pb.X + S(18), pb.Y + pb.Height / 2);
-        Text(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(34), pb.Y, pb.Width - S(60), pb.Height));
+        PillText(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(34), pb.Y, pb.Width - S(60), pb.Height));
         float gx = pb.X + pb.Width - S(18), gy = pb.Y + pb.Height / 2;
         if (open) { g.TranslateTransform(gx, gy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
         else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, gy);
         FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.ddBtnHover : T.ddBtn, ob, S(T.glass ? 9 : 6));
         float tw = TextW(g, L"Turn off displays", g_fSmall), sx = ob.X + (ob.Width - (S(14) + S(6) + tw)) / 2;
         Glyph(g, 0xE7E8, g_fIconS, T.t1, sx + S(7), ob.Y + ob.Height / 2);   // power
-        Text(g, L"Turn off displays", g_fSmall, T.t1, RectF(sx + S(20), ob.Y, tw + S(4), ob.Height));
+        PillText(g, L"Turn off displays", g_fSmall, T.t1, RectF(sx + S(20), ob.Y, tw + S(4), ob.Height));
         return;
     }
     MonUI& m = g_mons[e.idx];
@@ -2482,7 +2483,7 @@ static void DrawEl(Graphics& g, int index) {
             FillRound(g, open || (hovEl && g_hover.h == H_INPUTDD) ? T.ddBtnHover : T.ddBtn, ib, S(T.glass ? 8 : 5));
             Glyph(g, G_TV, g_fIconS, T.t2, ib.X + S(17), ib.Y + ib.Height / 2);
             std::wstring in = m.input >= 0 ? InputName(m.input, m.inputs) : L"Input";
-            Text(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(32), ib.Y, ib.Width - S(32) - S(34), ib.Height));
+            PillText(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(32), ib.Y, ib.Width - S(32) - S(34), ib.Height));
             Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, ib.X + ib.Width - S(18), ib.Y + ib.Height / 2);
         }
         float nw = std::min(TextW(g, m.name.c_str(), g_fName), maxW * 0.7f);
@@ -2490,13 +2491,16 @@ static void DrawEl(Graphics& g, int index) {
         if (!m.detail.empty()) Text(g, m.detail.c_str(), g_fSmall, T.t3, RectF(nx + nw + S(8), cy - S(9), std::max(0.f, maxW - nw - S(8)), S(18)));
         return;
     }
-    wchar_t lead = e.k == E_MONB ? G_BRIGHT : e.k == E_MONC ? G_CONTRAST : G_ROTATE;
-    Glyph(g, lead, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
+    if (e.k == E_MONC) {   // contrast: a circle, half filled
+        float ccx = e.r.X + S(6) + S(16), rr = S(7);
+        Pen cp(T.t1, S(1.5f)); g.DrawEllipse(&cp, ccx - rr, cy - rr, 2 * rr, 2 * rr);
+        SolidBrush cb(T.t1); g.FillPie(&cb, ccx - rr, cy - rr, 2 * rr, 2 * rr, -90.f, 180.f);
+    } else Glyph(g, e.k == E_MONB ? G_BRIGHT : G_ROTATE, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
     RectF sl = CtlSlider(e, cy);
     if (e.k == E_MONO) {   // orientation and refresh rate, side by side
         auto ddBtn = [&](RectF b, const wchar_t* label, bool open, bool hov) {
             FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, b, S(T.glass ? 9 : 6));
-            Text(g, label, g_fName, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
+            PillText(g, label, g_fName, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
             float gx = b.X + b.Width - S(18);
             if (open) { g.TranslateTransform(gx, cy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
             else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, cy);
@@ -2516,13 +2520,14 @@ static void DrawEl(Graphics& g, int index) {
 // ---- small motion: popups open with a short fade + slide, the tab pill glides between tabs
 enum { TIMER_POP = 12 };
 static const DWORD POP_MS = 170, TAB_MS = 240;
-struct PopAnim { long long key = LLONG_MIN; DWORD start = 0; };
+struct PopAnim { long long key = LLONG_MIN; DWORD start = 0; Bitmap* snap = nullptr; RectF box; float m = 0; bool up = false, closing = false; DWORD closeStart = 0; };
+static const DWORD CLOSE_MS = 130;
 static PopAnim g_paDD, g_paDelay, g_paMenu, g_paSave, g_paSetDD;
 static bool g_animating = false;
 static DWORD g_tabStart = 0; static float g_tabFrom = 0, g_tabTo = 0;
 static void KickAnim() { if (g_hwnd) SetTimer(g_hwnd, TIMER_POP, 15, nullptr); }
 static float PopT(PopAnim& a, long long key) {
-    if (key != a.key) { a.key = key; a.start = GetTickCount(); KickAnim(); }
+    if (key != a.key) { a.key = key; a.start = GetTickCount(); a.closing = false; KickAnim(); }
     float t = (GetTickCount() - a.start) / (float)POP_MS;
     if (t < 1) { g_animating = true; return t; }
     return 1.f;
@@ -2535,25 +2540,38 @@ static float TabPos() {
     float e = t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2;   // ease in-out
     return g_tabFrom + (g_tabTo - g_tabFrom) * e;
 }
-template <class F> static void DrawPopAnimated(Graphics& g, RectF box, float t, bool opensUp, F draw) {
-    if (t >= 1) { draw(g); return; }
-    float e = 1 - (1 - t) * (1 - t) * (1 - t);   // ease out
-    float m = S(20);
-    int bw = (int)ceilf(box.Width + 2 * m), bh = (int)ceilf(box.Height + 2 * m);
-    Bitmap bmp(bw, bh, PixelFormat32bppPARGB);
-    {
-        Graphics bg(&bmp);
-        bg.SetSmoothingMode(SmoothingModeAntiAlias);
-        bg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-        bg.TranslateTransform(m - box.X, m - box.Y);
-        draw(bg);
-    }
+static void BlitPop(Graphics& g, Bitmap* bmp, RectF box, float m, bool opensUp, float e) {
+    float bw = (float)bmp->GetWidth(), bh = (float)bmp->GetHeight();
     ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, e, 0}, {0, 0, 0, 0, 1}}};
     ImageAttributes ia; ia.SetColorMatrix(&cm);
     float sc = 0.95f + 0.05f * e, slide = (1 - e) * S(8) * (opensUp ? 1 : -1);
     float dw = bw * sc, dh = bh * sc;
     float ax = box.X - m + bw / 2.f, ay = opensUp ? box.Y - m + bh : box.Y - m;   // grows from the edge next to its button
-    g.DrawImage(&bmp, RectF(ax - dw / 2, (opensUp ? ay - dh : ay) + slide, dw, dh), 0, 0, (REAL)bw, (REAL)bh, UnitPixel, &ia);
+    g.DrawImage(bmp, RectF(ax - dw / 2, (opensUp ? ay - dh : ay) + slide, dw, dh), 0, 0, bw, bh, UnitPixel, &ia);
+}
+template <class F> static void DrawPopAnimated(Graphics& g, PopAnim& a, RectF box, float t, bool opensUp, F draw) {
+    float m = S(20);
+    int bw = (int)ceilf(box.Width + 2 * m), bh = (int)ceilf(box.Height + 2 * m);
+    Bitmap* bmp = new Bitmap(bw, bh, PixelFormat32bppPARGB);   // snapshot: used while opening and kept for the closing fade
+    {
+        Graphics bg(bmp);
+        bg.SetSmoothingMode(SmoothingModeAntiAlias);
+        bg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        bg.TranslateTransform(m - box.X, m - box.Y);
+        draw(bg);
+    }
+    delete a.snap; a.snap = bmp; a.box = box; a.m = m; a.up = opensUp;
+    if (t >= 1) { draw(g); return; }
+    BlitPop(g, bmp, box, m, opensUp, 1 - (1 - t) * (1 - t) * (1 - t));
+}
+static void ClosePop(Graphics& g, PopAnim& a) {   // call when the popup is not open: starts / runs the closing fade
+    if (a.key != LLONG_MIN) { a.key = LLONG_MIN; if (a.snap) { a.closing = true; a.closeStart = GetTickCount(); KickAnim(); } }
+    if (!a.closing || !a.snap) return;
+    float t = (GetTickCount() - a.closeStart) / (float)CLOSE_MS;
+    if (t >= 1) { a.closing = false; delete a.snap; a.snap = nullptr; return; }
+    g_animating = true;
+    float e = (1 - t) * (1 - t);   // ease in on the way out
+    BlitPop(g, a.snap, a.box, a.m, a.up, e);
 }
 
 static void DrawDropdownBody(Graphics& g) {
@@ -2658,30 +2676,30 @@ static void DrawMenuBody(Graphics& g) {
 
 static void DrawDropdown(Graphics& g) {
     RectF btn;
-    if (!DropdownRect(btn)) { g_paDD.key = LLONG_MIN; return; }
+    if (!DropdownRect(btn)) { ClosePop(g, g_paDD); return; }
     RectF pop = DropdownPopup(btn);
     float t = PopT(g_paDD, (long long)g_ddKind * 100000 + g_ddOpen);
-    DrawPopAnimated(g, pop, t, pop.Y < btn.Y, [&](Graphics& gg) { DrawDropdownBody(gg); });
+    DrawPopAnimated(g, g_paDD, pop, t, pop.Y < btn.Y, [&](Graphics& gg) { DrawDropdownBody(gg); });
 }
 static void DrawDelayPopup(Graphics& g) {
     RectF chip;
-    if (g_delayOpen < 0 || !DelayAnchor(chip)) { g_paDelay.key = LLONG_MIN; return; }
+    if (g_delayOpen < 0 || !DelayAnchor(chip)) { ClosePop(g, g_paDelay); return; }
     RectF pop = DelayPopup(chip);
     float t = PopT(g_paDelay, g_delayOpen);
-    DrawPopAnimated(g, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawDelayPopupBody(gg); });
+    DrawPopAnimated(g, g_paDelay, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawDelayPopupBody(gg); });
 }
 static void DrawSavePopup(Graphics& g) {
     RectF chip;
-    if (!g_saveOpen || !SaveAnchor(chip)) { g_paSave.key = LLONG_MIN; return; }
+    if (!g_saveOpen || !SaveAnchor(chip)) { ClosePop(g, g_paSave); return; }
     RectF pop = SavePopup(chip);
     float t = PopT(g_paSave, 1);
-    DrawPopAnimated(g, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawSavePopupBody(gg); });
+    DrawPopAnimated(g, g_paSave, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawSavePopupBody(gg); });
 }
 static void DrawMenu(Graphics& g) {
-    if (!g_menuOpen) { g_paMenu.key = LLONG_MIN; return; }
+    if (!g_menuOpen) { ClosePop(g, g_paMenu); return; }
     BuildMenu();
     float t = PopT(g_paMenu, 1);
-    DrawPopAnimated(g, g_menuBox, t, true, [&](Graphics& gg) { DrawMenuBody(gg); });
+    DrawPopAnimated(g, g_paMenu, g_menuBox, t, true, [&](Graphics& gg) { DrawMenuBody(gg); });
 }
 
 static bool g_dwmRound = false;
@@ -3536,7 +3554,7 @@ static void PaintSettings(HDC hdc) {
             add(SK_DDBTN, id, b);
             bool open = g_sddOpen == id;
             FillRound(g, open || isHover(SK_DDBTN, id) ? T.subtle3 : T.subtle2, b, S(6));
-            Text(g, cur >= 0 && cur < (int)opts.size() ? opts[cur].c_str() : L"", &fDesc, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
+            PillText(g, cur >= 0 && cur < (int)opts.size() ? opts[cur].c_str() : L"", &fDesc, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
             Glyph(g, open ? 0xE70E : 0xE70D, g_fIconS, T.t2, b.X + b.Width - S(18), b.Y + b.Height / 2);
             if (open) { ddPopBtn = b; ddPopOpts = opts; ddPopCur = cur; ddPopId = id; }
         };
@@ -3775,7 +3793,7 @@ static void PaintSettings(HDC hdc) {
             if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
             for (int i = 0; i < (int)ddPopOpts.size(); i++) add(SK_DDOPT, ddPopId * 100 + i, RectF(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih));
             float pt = PopT(g_paSetDD, ddPopId);
-            DrawPopAnimated(g, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
+            DrawPopAnimated(g, g_paSetDD, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
                 FillRound(gg, Color(60, 0, 0, 0), RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height), S(8));
                 FillRound(gg, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
                 for (int i = 0; i < (int)ddPopOpts.size(); i++) {
@@ -3785,7 +3803,7 @@ static void PaintSettings(HDC hdc) {
                     Text(gg, ddPopOpts[i].c_str(), &fDesc, T.t1, RectF(it.X + S(12), it.Y, it.Width - S(16), it.Height));
                 }
             });
-        } else g_paSetDD.key = LLONG_MIN;
+        } else ClosePop(g, g_paSetDD);
         g_setContentH = y + g_setScroll + S(24);
         g.ResetClip();
         float view = (float)g_setH;
