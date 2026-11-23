@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.3"
+#define APP_VERSION L"1.37.4"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -393,7 +393,7 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"restorebright", g_restoreBright ? L"1" : L"0", g_iniPath.c_str());
     {
         std::wstring d, l;
-        for (auto& kv : g_delay) if (kv.second > 0) { d += kv.first + L"=" + std::to_wstring(kv.second); d.push_back(0); }
+        for (auto& kv : g_delay) if (kv.second != 0) { d += kv.first + L"=" + std::to_wstring(kv.second); d.push_back(0); }
         for (auto& kv : g_lastMon) { l += kv.first + L"=" + std::to_wstring(kv.second.first) + L"," + std::to_wstring(kv.second.second); l.push_back(0); }
         d.push_back(0); l.push_back(0);
         WritePrivateProfileSectionW(L"delay", d.c_str(), g_iniPath.c_str());
@@ -1031,6 +1031,10 @@ static void RestartAppRouters() {
         AppExtra& x = kv.second;
         if (!x.pid || x.ids.empty()) continue;
         std::wstring prim = !x.primary.empty() ? x.primary : (di >= 0 ? g_out[di].id : L"");
+        for (auto& id : x.ids) if (DelayFor(id) < DelayFor(prim)) {   // a slower speaker: it should be the one the app plays on directly
+            AppGroup tmp; tmp.pids = {x.pid};
+            if (AppOutputSet(tmp, id)) { std::replace(x.ids.begin(), x.ids.end(), id, prim); prim = id; x.primary = id; }
+        }
         int pd = DelayFor(prim);
         auto* r = new RouterCtx;
         r->pid = x.pid;
@@ -1092,7 +1096,8 @@ static void RestartMirror() {
 // copy k plays. The mic hears main alone, then main + copy k: the gap between them is copy k's offset.
 struct CalTarget { std::wstring id, name; int delayMs; };
 struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstring status, swapTo, swapName; };
-static int g_calPass = 0;   // 1 = second run after Knob made the slowest speaker the main output
+static int g_calPass = 0;
+static bool g_calApps = false;   // this run also measures speakers only apps play on: no main-speaker switch, delays may go below 0   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
 static const UINT32 CAL_RATE = 48000;
 
@@ -1225,14 +1230,14 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
                 int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
                 if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
                 if (nd < -10 && g_calPass) notes += t.name + L" couldn't be lined up fully. ";
-                nd = std::max(0, std::min(500, nd));
+                nd = g_calApps ? std::max(-500, std::min(500, nd)) : std::max(0, std::min(500, nd));   // app copies: keep "faster than main" too
                 res->delays.push_back({t.id, nd});
                 ok++;
             } else if (r == 2) { res->status = L"The microphone couldn't hear the main output — turn the volume up"; break; }
             else if (r == 3) notes += L"Couldn't use " + t.name + L". ";
             else notes += L"Couldn't hear " + t.name + L". ";
         }
-        if (res->status.empty() && worst < -10 && !g_calPass) {   // let Knob make the slowest speaker the main output, then sync again
+        if (res->status.empty() && worst < -10 && !g_calPass && !g_calApps) {   // let Knob make the slowest speaker the main output, then sync again
             res->swapTo = worstId; res->swapName = worstName; res->delays.clear();
             res->status = L"Syncing\u2026 keep the room quiet";   // the slowest speaker quietly becomes the one Windows plays on, then a second pass
         }
@@ -1248,9 +1253,30 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
 }
 static void StartAutoSync() {
     if (g_calibrating) return;
-    if (!g_router) { g_calStatus = L"Connect Everything else to two or more speakers first"; return; }
+    int di = DefaultOut();
+    std::vector<RouterTarget> all;
+    if (g_router) all = g_router->targets;
+    for (auto& kv : g_appExtra) {   // speakers apps are copied to, and each app's own speaker
+        std::vector<std::wstring> ids = kv.second.ids; ids.push_back(kv.second.primary);
+        for (auto& id : ids) {
+            if (id.empty() || (di >= 0 && g_out[di].id == id)) continue;
+            bool have = false; for (auto& t : all) if (t.id == id) have = true;
+            if (!have) { auto it = g_delay.find(id); all.push_back({id, it == g_delay.end() ? 0 : std::max(0, it->second)}); }
+        }
+    }
+    if (all.empty() || di < 0) { g_calStatus = L"Connect an app to two or more speakers first"; return; }
+    g_calApps = !g_router || all.size() > g_router->targets.size();
+    if (g_calApps) {   // a short-lived copy of the main speaker's sound to all of them, just for measuring
+        StopRouter();
+        g_router = new RouterCtx;
+        g_router->src = g_out[di].id;
+        g_router->targets = all;
+        g_router->thread = CreateThread(nullptr, 0, RouterProc, g_router, 0, nullptr);
+        if (g_router->thread) SetThreadPriority(g_router->thread, THREAD_PRIORITY_TIME_CRITICAL);
+        Sleep(300);
+    }
     auto* ts = new std::vector<CalTarget>;
-    for (auto& t : g_router->targets) {
+    for (auto& t : all) {
         std::wstring name = t.id;
         for (auto& e : g_out) if (e.id == t.id) name = e.name;
         ts->push_back({t.id, name, t.delayMs});
@@ -3932,13 +3958,22 @@ static bool HandleCaptureKey(UINT vk) {   // shared by the flyout and the settin
     return true;
 }
 
+static std::vector<std::wstring> UsedSpeakers() {   // every speaker something plays on through Knob
+    std::vector<std::wstring> r;
+    for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id);
+    for (auto& kv : g_appExtra) { auto ids = kv.second.ids; ids.push_back(kv.second.primary); for (auto& id : ids) if (!id.empty() && std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id); }
+    return r;
+}
+static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
+static int MinDelay() { int m = 0; bool first = true; for (auto& id : UsedSpeakers()) { int d = DelayFor(id); if (first || d < m) m = d; first = false; } return m; }
+static int ShownDelay(const std::wstring& id) { return DelayFor(id) - MinDelay(); }   // the slowest speaker shows 0 ms
 static void CommitRename(bool keep) {
     if (!g_edit) return;
     if (g_editDelay >= 0) {   // typed sync delay
         if (keep && g_editDelay < (int)g_out.size()) {
             wchar_t b[16]; GetWindowTextW(g_edit, b, 16);
             int v = std::max(0, std::min(500, (int)lround(_wtoi(b) / 5.0) * 5));
-            g_delay[g_out[g_editDelay].id] = v; SaveSettings(); RestartRouter();
+            g_delay[g_out[g_editDelay].id] = v + MinDelay(); SaveSettings(); RestartRouter();
         }
         HWND e = g_edit; g_edit = nullptr; g_editDelay = -1; DestroyWindow(e);
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
@@ -3988,8 +4023,7 @@ static void StartDelayEdit(int i) {
     g_editDelay = i;
     if (g_editFont) DeleteObject(g_editFont);
     g_editFont = CreateFontW(-(int)S(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    auto it = g_delay.find(g_out[i].id);
-    g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(it == g_delay.end() ? 0 : it->second).c_str(), WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
+    g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(ShownDelay(g_out[i].id)).c_str(), WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
     SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
     SendMessageW(g_edit, EM_LIMITTEXT, 3, 0);
     g_editProc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
@@ -4232,12 +4266,12 @@ static void PaintSettings(HDC hdc) {
             y -= S(14);
             section(L"Where sound plays");
             y -= S(4);
-            para(L"Drag from a sound to a speaker to play it there. Click a line to remove it. Two or more speakers play in time automatically.", S(12));
+            para(L"Drag from an app to a speaker to play it there. Click a line to remove it. Apps without a line play on the speaker picked in the Sound tab.", S(12));
             {   // Timing: one place for sync
                 int n = SelectedOutCount();
                 bool can = g_router && !g_calibrating;
                 std::wstring d = !g_calStatus.empty() ? g_calStatus
-                    : n < 2 ? L"Connect Everything else to two or more speakers and they\u2019ll play in time"
+                    : n < 2 ? L"When an app plays on two or more speakers, Auto sync lines them up"
                             : L"Lines the speakers up using your microphone. Pause music and keep the room quiet.";
                 RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
                 titleDesc(r, L"Timing", d.c_str(), S(170));
@@ -4253,15 +4287,14 @@ static void PaintSettings(HDC hdc) {
                 SpacedText(g, L"SPEAKERS", g_fH3, T.t3, rx + S(4), y + S(7), S(1));
                 y += S(24);
                 float top = y, ly = y, ry = y;
-                std::vector<int> srcs = {-1};
-                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system) srcs.push_back(i);
+                std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
+                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlaying(g_apps[i]) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
                 for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, nodeH); ly += nodeH + gap; }
                 for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, nodeH); ry += nodeH + gap; }
                 auto dotR = [&](int sidx) { RectF r = g_rtSrc[sidx]; return PointF(r.X + r.Width - S(1), r.Y + r.Height / 2); };
                 auto dotL = [&](int i) { RectF r = g_rtDst[i]; return PointF(r.X + S(1), r.Y + r.Height / 2); };
                 auto addLine = [&](int sidx, int i) { PointF a = dotR(sidx), b = dotL(i); float m = (b.X - a.X) * 0.5f;
                     RtLine l; l.src = sidx; l.dst = i; l.p[0] = a; l.p[1] = PointF(a.X + m, a.Y); l.p[2] = PointF(b.X - m, b.Y); l.p[3] = b; g_rtLines.push_back(l); };
-                for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) addLine(-1, i);
                 for (int sidx : srcs) if (sidx >= 0) for (auto& id : AppRoutes(g_apps[sidx])) for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].id == id) addLine(sidx, i);
                 int lit = g_rtDrag != RT_NONE ? g_rtDrag : g_rtSel;
                 for (int k = 0; k < (int)g_rtLines.size(); k++) {   // one kind of line; the chosen sound's lines in the accent colour
@@ -4305,14 +4338,14 @@ static void PaintSettings(HDC hdc) {
                     FillRound(g, OutSelected(i) ? T.accent : T.subtle2, ic, S(6));
                     DrawDevIcon(g, o.icon, ic.X + S(13), ic.Y + S(13), OutSelected(i) ? T.onAccent : T.t1);
                     float right = S(12);
-                    bool pill = !o.isDefault && g_mirror.count(o.id);   // speakers that play a held-back copy
+                    bool pill = used && SpeakersInUse() > 1;   // when several speakers play: how long each waits (the slowest 0 ms)
                     RectF pr(r.X + r.Width - S(12) - S(70), r.Y + S(13), S(70), S(22));
                     if (pill) {
                         right = S(12) + S(70) + S(8);
                         add(SK_RTDELAY, i, pr);
                         if (g_editDelay == i) editRect = RectF(pr.X + S(8), pr.Y + S(3), pr.Width - S(16), pr.Height - S(6));
                         FillRound(g, isHover(SK_RTDELAY, i) || g_editDelay == i ? T.subtle3 : T.subtle2, pr, S(11));
-                        if (g_editDelay != i) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", DelayFor(o.id)); PillText(g, t, g_fSmall600, T.accent, pr, StringAlignmentCenter); }
+                        if (g_editDelay != i) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", ShownDelay(o.id)); PillText(g, t, g_fSmall600, T.accent, pr, StringAlignmentCenter); }
                     }
                     std::wstring sub = o.bt ? std::wstring(L"Bluetooth") : o.detail;
                     Text(g, OutLabel(o).c_str(), &fBody, T.t1, RectF(r.X + S(48), r.Y + S(5), r.Width - S(56) - right, S(22)));
@@ -4324,6 +4357,7 @@ static void PaintSettings(HDC hdc) {
                     Pen tp(T.accent, S(2)); tp.SetDashStyle(DashStyleDash);
                     g.DrawBezier(&tp, a, PointF(a.X + m, a.Y), PointF(b.X - m, b.Y), b);
                 }
+                if (srcs.empty()) Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), top, lw, nodeH));
                 y = std::max(ly, ry) + S(4);
                 (void)top;
                 if (!ProcLoopbackOk()) { y += S(4); para(L"This version of Windows can send each app to one speaker only. Windows 11 lets an app play on several.", S(4)); }
