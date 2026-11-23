@@ -6,12 +6,14 @@ A tiny Windows 10/11 tray app for sound and screens: one ~400 KB exe, no install
 
 **Sound**
 - Volume and mute for every output and input device
-- Play on several outputs at once (the default output's audio is copied to the others), with a sync delay per output to line up Bluetooth
+- Click a speaker to switch to it; in Settings › Sound, drag lines to play on several speakers at once
+- Auto sync lines speakers up with your microphone; each delay can also be typed in
 - Pick the microphone; mute every microphone with one button
 
 **Apps**
 - Master volume (moves all selected outputs together)
 - Per-app volume and mute, with a live "playing" indicator
+- Send an app to its own speaker (click its icon); on Windows 11 an app can play on several speakers
 
 **Display**
 - Brightness and contrast for external monitors (DDC/CI), brightness for the laptop panel
@@ -20,7 +22,7 @@ A tiny Windows 10/11 tray app for sound and screens: one ~400 KB exe, no install
 
 **Also**
 - Solid or Glass style, Windows accent or one of six accent colors
-- Optional global shortcut to open the panel
+- Shortcuts from a short list: open on Sound / Apps / Display, volume, mute, brightness, next speaker and more
 - Keep awake, start with Windows
 - Updates itself from this repo's releases
 
