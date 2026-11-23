@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.4"
+#define APP_VERSION L"1.37.5"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -2071,7 +2071,7 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
     }
     if (g_ddKind == 4) {   // where an app plays: ticks, not a single choice (Windows 11 can copy an app to several speakers)
         if (g_ddOpen < 0 || g_ddOpen >= (int)g_apps.size()) return o;
-        o.push_back(L"Play with everything else");
+        o.push_back(L"Default speaker");
         for (size_t i = 0; i < g_out.size(); i++) o.push_back(OutLabel(g_out[i]));
         o.push_back(L"Open routing\u2026");
         return o;
@@ -4320,7 +4320,7 @@ static void PaintSettings(HDC hdc) {
                         else { FillRound(g, T.subtle2, ic, S(6)); Glyph(g, G_APPS, g_fIconS, T.t1, ic.X + S(13), ic.Y + S(13)); }
                         title = a.name;
                         auto rt = AppRoutes(a);
-                        sub = rt.empty() ? L"Plays with Everything else" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
+                        sub = rt.empty() ? L"Default speaker" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
                     }
                     Text(g, title.c_str(), &fBody, T.t1, RectF(r.X + S(46), r.Y + S(5), r.Width - S(56), S(22)));
                     Text(g, sub.c_str(), &fDesc, T.t3, RectF(r.X + S(46), r.Y + S(25), r.Width - S(56), S(18)));
