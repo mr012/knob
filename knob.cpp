@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.34.0"
-#define APP_VERNUM  ((1 << 16) | (34 << 8) | 0)
+#define APP_VERSION L"1.35.0"
+#define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -84,6 +84,7 @@ static const wchar_t* HK_KEYS[HK_COUNT] = {L"open"};
 static const HotKey HK_DEFAULT[HK_COUNT] = {{0, 0, false}};   // no shortcut until the user picks one
 static bool g_noSave = false, g_restartAfterExit = false;
 static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
+static int g_openOn = 0;             // where the panel opens: 0 main display (like Windows' own flyouts), 1 the screen with the mouse
 static std::wstring g_callDev;       // output for calls (empty = same as main)
 static bool g_autoSwitch = true;     // switch to headphones when they connect
 static std::wstring g_autoPrev, g_autoTarget;   // output to go back to when they disconnect
@@ -306,6 +307,7 @@ static void LoadSettings() {
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
     g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
     g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
+    g_openOn = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"openon", 0, g_iniPath.c_str())));
     g_autoSwitch = GetPrivateProfileIntW(L"main", L"autoswitch", 1, g_iniPath.c_str()) != 0;
     { wchar_t cb[512] = {}; GetPrivateProfileStringW(L"main", L"calldev", L"", cb, 512, g_iniPath.c_str()); g_callDev = cb; }
     {   // sections stored as key=value lists
@@ -363,6 +365,7 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"mirrorsaved", s.c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"multi", g_multi ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"theme", std::to_wstring(g_themeMode).c_str(), g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"openon", std::to_wstring(g_openOn).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"calldev", g_callDev.c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"keepawake", g_keepAwake ? L"1" : L"0", g_iniPath.c_str());
@@ -2900,12 +2903,15 @@ static LRESULT CALLBACK OsdProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
     return DefWindowProcW(h, msg, wp, lp);
 }
+static HMONITOR PanelMonitor() {   // the screen Knob's windows open on
+    if (g_openOn == 0) { POINT o = {0, 0}; return MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY); }
+    POINT pt; GetCursorPos(&pt); return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
 static void ShowOsd(int kind, int val, bool muted) {
     if (!g_osd) return;
     g_osdKind = kind; g_osdVal = val; g_osdMuted = muted;
     if (kind == OSD_MIC) g_osdVal = muted ? 0 : 100;
-    POINT pt; GetCursorPos(&pt);
-    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    HMONITOR hm = PanelMonitor();
     MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
     int w = (int)S(240), h = (int)S(48);
     int x = (mi.rcWork.left + mi.rcWork.right - w) / 2, y = mi.rcWork.bottom - h - (int)S(64);
@@ -3010,9 +3016,7 @@ static void ApplyDpi(int dpi) {
 }
 
 static void PositionFlyout() {
-    POINT pt; GetCursorPos(&pt);
-    if (g_visible) { RECT r; GetWindowRect(g_hwnd, &r); pt.x = r.right - 1; pt.y = r.bottom - 1; }
-    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    HMONITOR hm = g_visible ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) : PanelMonitor();
     UINT dx = 96, dy = 96;
     GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
     ApplyDpi((int)dx);
@@ -3589,6 +3593,7 @@ static void PaintSettings(HDC hdc) {
         case SP_GENERAL:
             switchCard(1, L"Keep awake", L"Stop the screen from turning off and the PC from sleeping", g_keepAwake);
             switchCard(2, L"Start with Windows", L"Open Knob in the tray when you sign in", StartupEnabled());
+            ddCard(3, L"Open the panel on", L"Main display opens by the tray, like Windows' own panels. Screen with the mouse follows you when you use the shortcut", {L"Main display", L"Screen with the mouse"}, g_openOn);
             section(L"Shortcut");
             for (int i = 0; i < HK_COUNT; i++) {
                 RectF r = cardRect(S(52)); FillRound(g, card, r, S(6));
@@ -3903,6 +3908,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int dd = it.id / 100, k = it.id % 100;
             if (dd == 1) { std::wstring id; if (k > 0 && k - 1 < (int)g_out.size()) id = g_out[k - 1].id; SetCallDevice(id); SaveSettings(); }
             if (dd == 2) AudioRegSet(L"UserDuckingPreference", (DWORD)k);
+            if (dd == 3) { g_openOn = k ? 1 : 0; SaveSettings(); }
             g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
         }
         case SK_SWITCH:
@@ -4009,8 +4015,7 @@ static void OpenSettings(int page, bool newProfile) {
     }
     BuildSettingsTheme();
     if (!g_set) {
-        POINT pt; GetCursorPos(&pt);
-        HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        HMONITOR hm = g_visible ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) : PanelMonitor();   // next to the panel
         UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
