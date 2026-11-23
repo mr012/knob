@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.5"
+#define APP_VERSION L"1.37.6"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -1076,6 +1076,25 @@ static void AppRouteRemove(AppGroup& a, const std::wstring& id) {
     RestartAppRouters();
 }
 static void AppRouteClear(AppGroup& a) { if (AppOutputSet(a, L"")) a.outId.clear(); g_appExtra.erase(a.key); RestartAppRouters(); }
+static std::vector<std::wstring> UsedSpeakers() {   // every speaker something plays on through Knob
+    std::vector<std::wstring> r;
+    for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id);
+    for (auto& kv : g_appExtra) { auto ids = kv.second.ids; ids.push_back(kv.second.primary); for (auto& id : ids) if (!id.empty() && std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id); }
+    return r;
+}
+static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
+static int MinDelay() { int m = 0; bool first = true; for (auto& id : UsedSpeakers()) { int d = DelayFor(id); if (first || d < m) m = d; first = false; } return m; }
+static int ShownDelay(const std::wstring& id) { return DelayFor(id) - MinDelay(); }   // the slowest speaker shows 0 ms
+static void UpdateTrayTip();
+static void OneSpeaker() {   // back to a single speaker: every app and Windows sound on the default speaker, no copies
+    AppOutputResetAll();
+    for (auto& a : g_apps) a.outId.clear();
+    g_appExtra.clear();
+    g_mirror.clear();
+    SaveSettings();
+    RestartRouter();
+    UpdateTrayTip();
+}
 static void RestartMirror() {
     if (g_calibrating) { g_routerPending = true; return; }   // auto sync is using the router; restart when it finishes
     StopRouter();
@@ -1868,7 +1887,7 @@ enum : wchar_t {
 // ---------------------------------------------------------------- layout model
 enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
@@ -1978,6 +1997,7 @@ static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return
 static bool AppRouted(int i) { return i >= 0 && i < (int)g_apps.size() && !AppRoutes(g_apps[i]).empty(); }
 static RectF AppIconRect(const El& e) { float lx = e.r.X + S(8) + S(16), cy = e.r.Y + S(21); return RectF(lx - S(16), cy - S(16), S(32), S(32)); }
 static RectF AppDdAnchor(const El& e) { return AppRouted(e.idx) ? AppOutChip(e) : AppIconRect(e); }   // the list opens from the chip, or from the icon
+static RectF OneRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64) - S(8) - S(104), e.r.Y + e.r.Height / 2 - S(12), S(104), S(24)); }
 static RectF RoutingRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64), e.r.Y - S(5), S(62), e.r.Height + S(10)); }
 static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
 static std::wstring OutLabel(const Endpoint& o) {   // the device's name; add its type when two devices share a name
@@ -2207,6 +2227,7 @@ static Hit HitTest(float x, float y) {
         El& e = g_els[i];
         if (e.k == E_H3 && e.text == L"APPS" && AppRouteReady() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(RoutingRect(e), x, y)) { h.h = H_ROUTING; h.el = i; return h; }
+        if (e.k == E_H3 && e.text == L"OUTPUT" && SpeakersInUse() > 1 && InRect(OneRect(e), x, y)) { h.h = H_ONESPK; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
@@ -2642,12 +2663,13 @@ static void DrawEl(Graphics& g, int index) {
         if (e.text == L"OUTPUT") {   // how many speakers play, and the way to Settings › Sound
             RectF rr = RoutingRect(e);
             Text(g, L"Routing", g_fSmall600, g_hover.h == H_ROUTING ? T.t1 : T.accent, RectF(rr.X, rr.Y, rr.Width - S(6), rr.Height), StringAlignmentFar);
-            int n = SelectedOutCount();
-            if (n > 1) {
+            int n = SpeakersInUse();
+            if (n > 1) {   // "3 speakers ×": click to go back to one speaker
+                RectF op = OneRect(e); bool hov = g_hover.h == H_ONESPK;
+                FillRound(g, hov ? T.ddBtnHover : T.ddBtn, op, op.Height / 2);
                 std::wstring st = std::to_wstring(n) + L" speakers";
-                float tw = TextW(g, st.c_str(), g_fSmall), tx = rr.X - S(8) - tw, cy = e.r.Y + e.r.Height / 2;
-                Text(g, st.c_str(), g_fSmall, T.t2, RectF(tx, e.r.Y - S(5), tw + S(4), e.r.Height + S(10)));
-                SolidBrush dot(T.accent); g.FillEllipse(&dot, tx - S(11), cy - S(3), S(6), S(6));
+                PillText(g, st.c_str(), g_fSmall, T.t1, RectF(op.X + S(10), op.Y, op.Width - S(30), op.Height));
+                Glyph(g, G_CLOSE, g_fIconS, hov ? T.t1 : T.t2, op.X + op.Width - S(14), op.Y + op.Height / 2);
             }
         }
         return;
@@ -3958,15 +3980,6 @@ static bool HandleCaptureKey(UINT vk) {   // shared by the flyout and the settin
     return true;
 }
 
-static std::vector<std::wstring> UsedSpeakers() {   // every speaker something plays on through Knob
-    std::vector<std::wstring> r;
-    for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id);
-    for (auto& kv : g_appExtra) { auto ids = kv.second.ids; ids.push_back(kv.second.primary); for (auto& id : ids) if (!id.empty() && std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id); }
-    return r;
-}
-static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
-static int MinDelay() { int m = 0; bool first = true; for (auto& id : UsedSpeakers()) { int d = DelayFor(id); if (first || d < m) m = d; first = false; } return m; }
-static int ShownDelay(const std::wstring& id) { return DelayFor(id) - MinDelay(); }   // the slowest speaker shows 0 ms
 static void CommitRename(bool keep) {
     if (!g_edit) return;
     if (g_editDelay >= 0) {   // typed sync delay
@@ -4273,10 +4286,13 @@ static void PaintSettings(HDC hdc) {
                 std::wstring d = !g_calStatus.empty() ? g_calStatus
                     : n < 2 ? L"When an app plays on two or more speakers, Auto sync lines them up"
                             : L"Lines the speakers up using your microphone. Pause music and keep the room quiet.";
-                RectF r = cardRect(cardH(d.c_str(), S(170))); FillRound(g, card, r, S(6));
-                titleDesc(r, L"Timing", d.c_str(), S(170));
-                button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32)),
+                bool multi = SpeakersInUse() > 1;
+                RectF r = cardRect(cardH(d.c_str(), S(300))); FillRound(g, card, r, S(6));
+                titleDesc(r, L"Timing", d.c_str(), S(300));
+                button(SK_BUTTON, 5, RectF(r.X + r.Width - S(18) - S(120), r.Y + r.Height / 2 - S(16), S(120), S(32)),
                        g_calibrating ? L"Listening\u2026" : L"Auto sync", can, can);
+                button(SK_BUTTON, 7, RectF(r.X + r.Width - S(18) - S(120) - S(8) - S(150), r.Y + r.Height / 2 - S(16), S(150), S(32)),
+                       L"Back to one speaker", false, multi && !g_calibrating);
                 y += S(12);
             }
             {   // the board
@@ -4614,6 +4630,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (it.id == 1) { DestroyWindow(g_hwnd); return 0; }
             if (it.id == 3) { g_updStatus = L"Checking\u2026"; CheckForUpdates(); }
             if (it.id == 5) StartAutoSync();
+            if (it.id == 7) { OneSpeaker(); g_calStatus.clear(); }
             if (it.id == 6) ShellExecuteW(nullptr, L"open", L"https://github.com/" UPDATE_REPO L"/raw/main/dist/Knob.exe", nullptr, nullptr, SW_SHOWNORMAL);
             if (it.id == 4) StartUpdate();
             if (it.id == 2 && MessageBoxW(h, L"Reset all Knob settings to their defaults? Knob will restart.", APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
@@ -5029,6 +5046,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_APPOUT: g_ddOpen = ht.idx; g_ddKind = 4; break;
         case H_RESETOUT: AppOutputResetAll(); for (auto& a : g_apps) a.outId.clear(); g_appExtra.clear(); RestartAppRouters(); break;
         case H_ROUTING: OpenSettings(SP_SOUND_PAGE, false); return 0;
+        case H_ONESPK: OneSpeaker(); if (g_set) InvalidateRect(g_set, nullptr, FALSE); break;
         case H_INPUTDD: g_ddOpen = ht.idx; g_ddKind = 2; break;
         case H_MODEDD: g_ddOpen = ht.idx; g_ddKind = 5; break;
         case H_NIGHT: if (ht.idx >= 0 && ht.idx < (int)g_mons.size()) { auto& n = g_night[g_mons[ht.idx].name]; n.on = !n.on; SaveSettings(); ApplyNight(); } break;
