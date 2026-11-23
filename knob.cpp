@@ -44,8 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.6"
-#define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
+#define APP_VERSION L"1.37.7"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4780,7 +4779,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_APP_SHOW: ShowFlyout(); return 0;
-    case WM_APP_VERSION: return APP_VERNUM;
+    case WM_APP_VERSION: return ParseVer(APP_VERSION);
     case WM_APP_UPDINFO: {
         if (wp == 1) {
             g_updState = UPD_FAILED;
@@ -4791,7 +4790,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (wp == 2) { g_updState = UPD_NONE; g_updStatus = L"No build on GitHub yet \u00B7 you're up to date"; }
         else if (UpdInfo* u = (UpdInfo*)lp) {
-            if (ParseVer(u->version) > APP_VERNUM) {
+            if (ParseVer(u->version) > ParseVer(APP_VERSION)) {
                 g_updVersion = u->version[0] == L'v' ? u->version.substr(1) : u->version; g_updUrl = u->url;
                 if (g_updState != UPD_DOWNLOADING) g_updState = UPD_AVAILABLE;
                 g_updStatus = L"Version " + g_updVersion + L" is available";
@@ -5184,11 +5183,11 @@ static bool InstallOrUpdate() {
     if (running) {
         DWORD_PTR v = 0;
         SendMessageTimeoutW(running, WM_APP_VERSION, 0, 0, SMTO_ABORTIFHUNG, 2000, &v);
-        if (v > APP_VERNUM) {   // never downgrade
+        if (v > ParseVer(APP_VERSION)) {   // never downgrade
             MessageBoxW(nullptr, L"A newer version of Knob is already running.", APP_NAME, MB_OK | MB_ICONINFORMATION);
             return true;
         }
-        if (v == APP_VERNUM) { PostMessageW(running, WM_APP_SHOW, 0, 0); return true; }   // same version: just open it
+        if (v == ParseVer(APP_VERSION)) { PostMessageW(running, WM_APP_SHOW, 0, 0); return true; }   // same version: just open it
         PostMessageW(running, WM_APP_QUIT, 0, 0);   // older Knob: let it save and close
         WaitForExit(running);
     }
