@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.1"
+#define APP_VERSION L"1.37.2"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -3764,10 +3764,23 @@ static DWORD WINAPI UpdateCheckProc(LPVOID) {
     UpdInfo* info = nullptr;
     DWORD code = 0;
     WPARAM kind = 0;   // 0 = result or unreachable, 2 = no build in the repo yet
-    if (HttpGet(UPDATE_RAW L"version.txt", j, L"", &code)) {
+    // GitHub's raw files are cached for a few minutes, so version.txt and Knob.exe can briefly disagree.
+    // Ask which commit main is on right now, then read both files from that exact commit (never cached stale).
+    std::wstring base = UPDATE_RAW;
+    {
+        std::string api;
+        if (HttpGet(L"https://api.github.com/repos/" UPDATE_REPO L"/commits/main", api)) {
+            size_t a = api.find("\"sha\":\""), b = a == std::string::npos ? a : api.find('"', a + 7);
+            if (a != std::string::npos && b != std::string::npos && b - (a + 7) == 40) {
+                std::string sha = api.substr(a + 7, 40);
+                base = L"https://raw.githubusercontent.com/" UPDATE_REPO L"/" + std::wstring(sha.begin(), sha.end()) + L"/dist/";
+            }
+        }
+    }
+    if (HttpGet(base + L"version.txt", j, L"", &code)) {
         std::string v;
         for (char c : j) if ((c >= '0' && c <= '9') || c == '.') v += c; else if (!v.empty()) break;
-        if (!v.empty()) info = new UpdInfo{std::wstring(v.begin(), v.end()), UPDATE_RAW L"Knob.exe"};
+        if (!v.empty()) info = new UpdInfo{std::wstring(v.begin(), v.end()), base + L"Knob.exe"};
         else kind = 2;
     } else if (code == 404) kind = 2;
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_UPDINFO, kind, (LPARAM)info)) delete info;
@@ -3778,6 +3791,14 @@ static void CheckForUpdates() {
     if (InterlockedExchange(&g_updBusy, 1)) return;
     HANDLE t = CreateThread(nullptr, 0, UpdateCheckProc, nullptr, 0, nullptr);
     if (t) CloseHandle(t); else InterlockedExchange(&g_updBusy, 0);
+}
+static std::wstring FileVersionOf(const std::wstring& file) {   // "1.37.2" from the exe's version resource
+    DWORD h = 0, n = GetFileVersionInfoSizeW(file.c_str(), &h);
+    if (!n) return L"";
+    std::vector<BYTE> b(n);
+    VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
+    if (!GetFileVersionInfoW(file.c_str(), 0, n, b.data()) || !VerQueryValueW(b.data(), L"\\", (void**)&fi, &len) || !fi) return L"";
+    return std::to_wstring(HIWORD(fi->dwFileVersionMS)) + L"." + std::to_wstring(LOWORD(fi->dwFileVersionMS)) + L"." + std::to_wstring(HIWORD(fi->dwFileVersionLS));
 }
 static DWORD WINAPI UpdateDownloadProc(LPVOID p) {   // like G-Helper: download, then the new exe replaces this one and restarts
     std::wstring* url = (std::wstring*)p;
@@ -3795,6 +3816,10 @@ static DWORD WINAPI UpdateDownloadProc(LPVOID p) {   // like G-Helper: download,
         char mz[2] = {}; DWORD rd = 0; LARGE_INTEGER sz = {};
         if (f != INVALID_HANDLE_VALUE) { ReadFile(f, mz, 2, &rd, nullptr); GetFileSizeEx(f, &sz); CloseHandle(f); }
         if (rd != 2 || mz[0] != 'M' || mz[1] != 'Z' || sz.QuadPart < 100000) err = L"The download wasn't a valid Knob.exe";
+        else {   // it must really be the newer version, or the same old one would just reinstall itself
+            std::wstring got = FileVersionOf(file);
+            if (!got.empty() && ParseVer(got) <= ParseVer(APP_VERSION)) err = L"GitHub sent an older copy (" + got + L"). Try again in a few minutes";
+        }
     }
     if (err.empty()) {
         std::wstring cmd = L"\"" + file + L"\" --update";
