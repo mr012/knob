@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.2"
+#define APP_VERSION L"1.39.3"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -181,6 +181,7 @@ struct AppGroup {
     float level = 1;
     BOOL mute = FALSE;
     float peak = 0;
+    bool active = false;   // Windows says it has sound going right now (what its volume mixer lists)
 };
 struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
@@ -777,7 +778,7 @@ struct AppExtra { DWORD pid = 0; std::wstring primary; std::vector<std::wstring>
 static std::map<std::wstring, AppExtra> g_appExtra;   // app key -> speakers it also plays on
 static void RestartAppRouters();
 static std::vector<std::wstring> AppRoutes(const AppGroup& a);   // every speaker an app plays on (empty = with everything else)
-static void LoadApps() {
+static void LoadApps(bool all = false) {   // all = include apps Windows marks idle (only for the mute-the-app-in-front shortcut)
     FreeApps();
     if (g_demo) {
         struct D { const wchar_t* n; int lvl; bool sys; } L[] = {{L"Brave", 100, false}, {L"Discord", 72, false}, {L"Spotify", 85, false}, {L"System sounds", 60, true}};
@@ -834,6 +835,7 @@ static void LoadApps() {
                                     it = idx.find(key);
                                 }
                                 g_apps[it->second].vols.push_back(sv);
+                                if (st == AudioSessionStateActive) g_apps[it->second].active = true;
                                 if (!sys && std::find(g_apps[it->second].pids.begin(), g_apps[it->second].pids.end(), pid) == g_apps[it->second].pids.end())
                                     g_apps[it->second].pids.push_back(pid);
                                 Meter* mi = nullptr;
@@ -866,13 +868,17 @@ static void LoadApps() {
         if (alive) ++it; else { it = g_appExtra.erase(it); gone = true; }
     }
     if (gone) RestartAppRouters();
+    if (all) return;
+    // same list as Windows' volume mixer: only apps with sound going right now. Apps with a speaker you set stay, so you can change it back.
+    for (size_t i = g_apps.size(); i-- > 0;) {
+        AppGroup& a = g_apps[i];
+        if (a.system || a.active || !a.outId.empty() || g_appExtra.count(a.key)) continue;
+        for (auto* v : a.vols) v->Release();
+        for (auto* m : a.meters) m->Release();
+        g_apps.erase(g_apps.begin() + i);
+    }
 }
 
-static bool AppPlayedWithin(const AppGroup& a, DWORD ms) {
-    if (g_demo) return a.name == L"Brave" || a.name == L"Spotify";
-    auto it = g_live.find(a.key);
-    return it != g_live.end() && it->second.lastActive && GetTickCount() - it->second.lastActive < ms;
-}
 static bool AppPlaying(const AppGroup& a) {
     if (g_demo) return a.name == L"Brave" || a.name == L"Spotify";
     auto it = g_live.find(a.key);
@@ -3685,8 +3691,7 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
     case HK_APPMUTE: {   // the app whose window is in front
         DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         std::wstring path = ToLower(ProcPath(pid));
-        bool wasEmpty = g_apps.empty();
-        if (wasEmpty) LoadApps();
+        LoadApps(true);   // the app in front may be quiet right now, so look at every app Windows knows
         for (auto& ap : g_apps) {
             if (ap.system) continue;
             bool match = std::find(ap.pids.begin(), ap.pids.end(), pid) != ap.pids.end() || (!path.empty() && ap.key == path);
@@ -3696,7 +3701,7 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
             ShowOsd(OSD_VOL, (int)lround(ap.level * 100), ap.mute != FALSE);
             break;
         }
-        if (wasEmpty && !g_visible) FreeApps();
+        if (!g_visible) FreeApps(); else LoadApps();   // back to the mixer's list
         break;
     }
     case HK_BRIUP: case HK_BRIDOWN: {
@@ -4592,7 +4597,7 @@ static void PaintSettings(HDC hdc) {
                 SpacedText(g, L"SPEAKERS", &fRhd, T.t3, rx + S(4), by + S(7), S(0.66f));
                 float ly = by + S(22), ry = ly;
                 std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
-                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlayedWithin(g_apps[i], 4000) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
+                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system) srcs.push_back(i);   // the list already matches Windows' mixer
                 for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; }
                 for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, S(48)); ry += S(48) + gap; }
                 if (srcs.empty()) { Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), ly + S(6), lw, S(18))); ly += S(36); }
