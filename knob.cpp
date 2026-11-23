@@ -44,12 +44,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.7"
+#define APP_VERSION L"1.38.0"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -1117,6 +1117,7 @@ struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstrin
 static int g_calPass = 0;
 static bool g_calApps = false;   // this run also measures speakers only apps play on: no main-speaker switch, delays may go below 0   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
+static bool g_calShow = false;   // the panel's Auto sync card (while measuring, then the result)
 static const UINT32 CAL_RATE = 48000;
 
 static const GUID KNOB_IID_IAudioClient2 = {0x726778cd, 0xf60a, 0x4eda, {0x82, 0xde, 0xe4, 0x76, 0x10, 0xcd, 0x78, 0xaa}};
@@ -1886,7 +1887,7 @@ enum : wchar_t {
 // ---------------------------------------------------------------- layout model
 enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
@@ -1996,7 +1997,8 @@ static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return
 static bool AppRouted(int i) { return i >= 0 && i < (int)g_apps.size() && !AppRoutes(g_apps[i]).empty(); }
 static RectF AppIconRect(const El& e) { float lx = e.r.X + S(8) + S(16), cy = e.r.Y + S(21); return RectF(lx - S(16), cy - S(16), S(32), S(32)); }
 static RectF AppDdAnchor(const El& e) { return AppRouted(e.idx) ? AppOutChip(e) : AppIconRect(e); }   // the list opens from the chip, or from the icon
-static RectF OneRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64) - S(8) - S(104), e.r.Y + e.r.Height / 2 - S(12), S(104), S(24)); }
+static RectF AutoSyncRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64) - S(6) - S(78), e.r.Y + e.r.Height / 2 - S(12), S(78), S(24)); }
+static RectF OneRect(const El& e) { RectF a = AutoSyncRect(e); return RectF(a.X - S(6) - S(104), a.Y, S(104), S(24)); }
 static RectF RoutingRect(const El& e) { return RectF(e.r.X + e.r.Width - S(64), e.r.Y - S(5), S(62), e.r.Height + S(10)); }
 static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
 static std::wstring OutLabel(const Endpoint& o) {   // the device's name; add its type when two devices share a name
@@ -2004,17 +2006,32 @@ static std::wstring OutLabel(const Endpoint& o) {   // the device's name; add it
     return same > 1 && !o.detail.empty() ? o.name + L" \u00b7 " + o.detail : o.name;
 }
 static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return OutLabel(o); return L"Default output"; }
-static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(104), e.r.Y + S(8), S(104), S(26)); }
+static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(92), e.r.Y + S(8), S(92), S(26)); }
 static bool DelayAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_OUT && e.idx == g_delayOpen) { chip = DelayChip(e); return true; } return false; }
 static RectF DelayPopup(const RectF& chip) {
-    float w = S(250), h = S(96);
+    float w = S(256), h = S(150);
     float y = chip.Y + chip.Height + S(6);
     if (y + h > PaneBottom() - S(4)) y = chip.Y - S(6) - h;
     return RectF(chip.X + chip.Width - w, y, w, h);
 }
 static RectF DelaySlider(const RectF& pop) { return RectF(pop.X + S(16), pop.Y + S(36), pop.Width - S(32), S(28)); }
-static bool HasDelayChip(int i) { return i >= 0 && i < (int)g_out.size() && !g_out[i].isDefault && g_mirror.count(g_out[i].id); }
-static int DelayOf(int i) { auto it = g_delay.find(g_out[i].id); return it == g_delay.end() ? 0 : it->second; }
+static RectF DlMinus(const RectF& pop) { return RectF(pop.X + S(14), pop.Y + S(38), S(36), S(34)); }
+static RectF DlPlus(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(36), pop.Y + S(38), S(36), S(34)); }
+static RectF DlSync(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(150), pop.Y + pop.Height - S(12) - S(30), S(150), S(30)); }
+static bool InUse(int i) { auto u = UsedSpeakers(); return i >= 0 && i < (int)g_out.size() && std::find(u.begin(), u.end(), g_out[i].id) != u.end(); }
+static int DelayOf(int i) { return ShownDelay(g_out[i].id); }   // how long this speaker waits; the slowest shows 0
+static bool HasDelayChip(int i) { return SpeakersInUse() > 1 && InUse(i) && (DelayOf(i) > 0 || g_delayOpen == i); }
+static bool NeedsSync() {   // several speakers, and one of them was never measured
+    if (SpeakersInUse() < 2) return false;
+    int di = DefaultOut();
+    for (auto& id : UsedSpeakers()) if ((di < 0 || g_out[di].id != id) && !g_delay.count(id)) return true;
+    return false;
+}
+static void NudgeDelay(int i, int ms) {   // −/+ in the delay popup: going below 0 holds the other speakers back instead
+    if (i < 0 || i >= (int)g_out.size()) return;
+    if (g_out[i].isDefault) { for (auto& id : UsedSpeakers()) if (id != g_out[i].id) g_delay[id] = std::max(-500, std::min(500, DelayFor(id) - ms)); }
+    else g_delay[g_out[i].id] = std::max(-500, std::min(500, DelayFor(g_out[i].id) + ms));
+}
 
 static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height; }
 static RectF BackRect() { return RectF(S(12), S(12), S(36), S(36)); }
@@ -2178,6 +2195,8 @@ static void BuildMenu() {
     g_menuBox = RectF(x, top, w, y);
 }
 
+static RectF CalCard();
+static RectF CalDoneBtn();
 static Hit HitTest(float x, float y) {
     Hit h;
     if (g_menuOpen) {
@@ -2188,12 +2207,15 @@ static Hit HitTest(float x, float y) {
             return h;
         }
     }
+    if (g_calShow && g_tab == T_SOUND && g_view == 0 && InRect(CalCard(), x, y)) {
+        h.h = !g_calibrating && InRect(CalDoneBtn(), x, y) ? H_CALDONE : H_MENUBG;
+        return h;
+    }
     RectF dchip;
     if (g_delayOpen >= 0 && DelayAnchor(dchip)) {
         RectF pop = DelayPopup(dchip);
         if (InRect(pop, x, y)) {
-            RectF sl = DelaySlider(pop);
-            h.h = InRect(RectF(sl.X - S(10), sl.Y - S(4), sl.Width + S(20), sl.Height + S(8)), x, y) ? H_DELAYSL : H_MENUBG;
+            h.h = InRect(DlMinus(pop), x, y) ? H_DLMINUS : InRect(DlPlus(pop), x, y) ? H_DLPLUS : InRect(DlSync(pop), x, y) ? H_DLSYNC : H_MENUBG;
             return h;
         }
     }
@@ -2227,6 +2249,7 @@ static Hit HitTest(float x, float y) {
         if (e.k == E_H3 && e.text == L"APPS" && AppRouteReady() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(RoutingRect(e), x, y)) { h.h = H_ROUTING; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && SpeakersInUse() > 1 && InRect(OneRect(e), x, y)) { h.h = H_ONESPK; h.el = i; return h; }
+        if (e.k == E_H3 && e.text == L"OUTPUT" && SpeakersInUse() > 1 && InRect(AutoSyncRect(e), x, y)) { h.h = H_AUTOSYNC; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
@@ -2669,6 +2692,9 @@ static void DrawEl(Graphics& g, int index) {
                 std::wstring st = std::to_wstring(n) + L" speakers";
                 PillText(g, st.c_str(), g_fSmall, T.t1, RectF(op.X + S(10), op.Y, op.Width - S(30), op.Height));
                 Glyph(g, G_CLOSE, g_fIconS, hov ? T.t1 : T.t2, op.X + op.Width - S(14), op.Y + op.Height / 2);
+                RectF ar = AutoSyncRect(e); bool ah = g_hover.h == H_AUTOSYNC, need = NeedsSync();   // filled when a speaker was never measured
+                FillRound(g, need ? (ah ? WithAlpha(T.accent, 220) : T.accent) : (ah ? T.ddBtnHover : T.ddBtn), ar, ar.Height / 2);
+                PillText(g, g_calibrating ? L"Syncing\u2026" : L"Auto sync", g_fSmall600, need ? T.onAccent : T.t1, ar, StringAlignmentCenter);
             }
         }
         return;
@@ -2756,10 +2782,10 @@ static void DrawEl(Graphics& g, int index) {
             RectF c = DelayChip(e);
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_DELAYCHIP, open = g_delayOpen == e.idx;
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
-            wchar_t t[32]; swprintf(t, 32, L"Sync %d ms", DelayOf(e.idx));
-            Glyph(g, 0xE916, g_fIconS, T.t1, c.X + S(17), c.Y + c.Height / 2);   // stopwatch
-            PillText(g, t, g_fSmall, T.t1, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(8), c.Height));
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);   // neutral pill; only the icon and time in the accent
+            wchar_t t[32]; swprintf(t, 32, L"+%d ms", DelayOf(e.idx));
+            Glyph(g, 0xE916, g_fIconS, T.accent, c.X + S(17), c.Y + c.Height / 2);   // stopwatch
+            PillText(g, t, g_fSmall600, T.accent, RectF(c.X + S(32), c.Y, c.Width - S(32) - S(8), c.Height));
         }
         Font* nf = e.k == E_MASTER ? g_fName600 : g_fName;
         float nw = std::min(TextW(g, name.c_str(), nf), maxW * 0.7f);
@@ -3000,7 +3026,7 @@ static void DrawDropdownBody(Graphics& g) {
     int curIdx; auto opts = DropdownOptions(curIdx);
     for (int i = 0; i < (int)opts.size(); i++) {
         RectF r = DropdownOption(pop, i);
-        bool cur = curIdx == i, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
+        bool cur = curIdx == i && g_ddKind != 4, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
         if (cur) {
             if (T.glass) FillRound(g, WithAlpha(T.accent, 36), r, S(8));
             else { FillRound(g, T.subtle, r, S(5)); FillRound(g, T.accent, RectF(r.X, r.Y + S(9), S(3), S(14)), S(1.5f)); }
@@ -3013,11 +3039,53 @@ static void DrawDropdownBody(Graphics& g) {
             else if (i - 1 < (int)g_out.size()) tick = std::find(routes.begin(), routes.end(), g_out[i - 1].id) != routes.end();
             if (i == (int)opts.size() - 1) { SolidBrush lb(T.subtle2); g.FillRectangle(&lb, r.X + S(8), r.Y - S(1.5f), r.Width - S(16), S(1)); }
         }
-        Text(g, opts[i].c_str(), g_fName, g_ddKind == 4 && i == (int)opts.size() - 1 ? T.accent : T.t1, RectF(r.X + S(12), r.Y, r.Width - S(16) - (g_ddKind == 4 ? S(24) : 0), r.Height));
-        if (tick) Glyph(g, 0xE73E, g_fIconS, T.accent, r.X + r.Width - S(16), r.Y + r.Height / 2);
+        float tx = r.X + S(12);
+        if (g_ddKind == 4 && i < (int)opts.size() - 1) {   // Windows 11 style: checkboxes (round for "Default speaker", or for every row on Windows 10)
+            bool round = i == 0 || !ProcLoopbackOk();
+            RectF bx(r.X + S(10), r.Y + r.Height / 2 - S(8), S(16), S(16));
+            if (tick) FillRound(g, T.accent, bx, round ? S(8) : S(4));
+            else { Pen bp(WithAlpha(T.t1, 140), S(1)); GraphicsPath gp; AddRound(gp, RectF(bx.X + S(0.5f), bx.Y + S(0.5f), bx.Width - S(1), bx.Height - S(1)), round ? S(7.5f) : S(3.5f)); g.DrawPath(&bp, &gp); }
+            if (tick) Glyph(g, 0xE73E, g_fIconS, T.onAccent, bx.X + bx.Width / 2, bx.Y + bx.Height / 2);
+            tx = bx.X + bx.Width + S(10);
+        }
+        Text(g, opts[i].c_str(), g_fName, g_ddKind == 4 && i == (int)opts.size() - 1 ? T.accent : T.t1, RectF(tx, r.Y, r.X + r.Width - S(6) - tx, r.Height));
     }
 }
 
+static RectF CalCard() {
+    int n = g_calibrating ? 0 : SpeakersInUse();
+    float h = S(70) + (g_calibrating ? S(14) : n * S(22) + S(40));
+    return RectF(PaneX(), PaneBottom() - S(8) - h, PaneW(), h);
+}
+static RectF CalDoneBtn() { RectF c = CalCard(); return RectF(c.X + c.Width - S(14) - S(76), c.Y + c.Height - S(12) - S(28), S(76), S(28)); }
+static void DrawCalCard(Graphics& g) {   // Auto sync: keep the room quiet, then what each speaker waits
+    if (!g_calShow) return;
+    RectF c = CalCard(); float rad = S(T.glass ? 12 : 8);
+    Shadow(g, c, rad); FillRound(g, T.popup, c, rad);
+    Glyph(g, 0xE916, g_fIconS, T.accent, c.X + S(24), c.Y + S(22));
+    Text(g, g_calibrating ? L"Auto sync \u00b7 measuring" : L"Auto sync", g_fName600, T.t1, RectF(c.X + S(40), c.Y + S(10), c.Width - S(56), S(24)));
+    std::wstring st = g_calibrating ? L"Each speaker plays a short chirp; the microphone times it. Keep the room quiet." : g_calStatus;
+    TextWrap(g, st.c_str(), g_fSmall, T.t3, RectF(c.X + S(16), c.Y + S(36), c.Width - S(32), S(32)));
+    if (g_calibrating) {   // a small sliding bar while it listens
+        RectF bar(c.X + S(16), c.Y + c.Height - S(18), c.Width - S(32), S(4));
+        FillRound(g, T.track, bar, S(2));
+        float t = (GetTickCount() % 1400) / 1400.f, w = bar.Width * 0.3f;
+        FillRound(g, T.accent, RectF(bar.X + (bar.Width - w) * (0.5f - 0.5f * cosf(t * 6.2832f)), bar.Y, w, bar.Height), S(2));
+        g_animating = true; KickAnim();
+        return;
+    }
+    float y = c.Y + S(70);
+    for (auto& id : UsedSpeakers()) {
+        int d = ShownDelay(id);
+        Text(g, OutName(id).c_str(), g_fSmall, T.t1, RectF(c.X + S(16), y, c.Width - S(120), S(22)));
+        wchar_t t[24]; if (d) swprintf(t, 24, L"+%d ms", d); else wcscpy(t, L"0 ms \u00b7 slowest");
+        Text(g, t, g_fSmall600, d ? T.accent : T.t3, RectF(c.X + c.Width - S(130), y, S(114), S(22)), StringAlignmentFar);
+        y += S(22);
+    }
+    RectF b = CalDoneBtn();
+    FillRound(g, g_hover.h == H_CALDONE ? WithAlpha(T.accent, 220) : T.accent, b, S(6));
+    Text(g, L"Done", g_fSmall600, T.onAccent, b, StringAlignmentCenter);
+}
 static void DrawDelayPopupBody(Graphics& g) {
     RectF chip;
     if (g_delayOpen < 0 || !DelayAnchor(chip)) return;
@@ -3025,11 +3093,18 @@ static void DrawDelayPopupBody(Graphics& g) {
     float rad = S(T.glass ? 12 : 8);
     Shadow(g, pop, rad);
     FillRound(g, T.popup, pop, rad);
-    Text(g, L"Sync delay", g_fName600, T.t1, RectF(pop.X + S(16), pop.Y + S(8), S(140), S(24)));
-    wchar_t t[16]; swprintf(t, 16, L"%d ms", DelayOf(g_delayOpen));
-    Text(g, t, g_fSmall600, T.t1, RectF(pop.X + pop.Width - S(86), pop.Y + S(8), S(70), S(24)), StringAlignmentFar);
-    DrawSlider(g, DelaySlider(pop), DelayOf(g_delayOpen) / 500.f, false, g_dragDelay ? 2 : (g_hover.h == H_DELAYSL ? 1 : 0));
-    Text(g, L"Delays this output so it lines up with the others", g_fSmall, T.t3, RectF(pop.X + S(16), pop.Y + S(66), pop.Width - S(32), S(22)));
+    Text(g, g_out[g_delayOpen].name.c_str(), g_fName600, T.t1, RectF(pop.X + S(16), pop.Y + S(8), pop.Width - S(32), S(24)));
+    for (int k = 0; k < 2; k++) {
+        RectF b = k ? DlPlus(pop) : DlMinus(pop); bool hv = g_hover.h == (k ? H_DLPLUS : H_DLMINUS);
+        FillRound(g, hv ? T.ddBtnHover : T.ddBtn, b, S(8));
+        Text(g, k ? L"+" : L"\u2212", g_fName600, T.t1, b, StringAlignmentCenter);
+    }
+    wchar_t t[16]; swprintf(t, 16, L"+%d ms", DelayOf(g_delayOpen));
+    Text(g, t, g_fName600, T.accent, RectF(pop.X + S(56), pop.Y + S(38), pop.Width - S(112), S(34)), StringAlignmentCenter);
+    Text(g, L"5 ms per click. Below 0 holds the other speakers back instead.", g_fSmall, T.t3, RectF(pop.X + S(16), pop.Y + S(76), pop.Width - S(32), S(20)));
+    RectF sb = DlSync(pop);
+    FillRound(g, g_hover.h == H_DLSYNC ? T.ddBtnHover : T.ddBtn, sb, S(6));
+    Text(g, L"Run Auto sync again", g_fSmall, g_calibrating ? T.t3 : T.t1, sb, StringAlignmentCenter);
 }
 
 static void DrawSavePopupBody(Graphics& g) {
@@ -3268,6 +3343,7 @@ static void Paint(HDC hdc) {
         DrawDropdown(g);
         DrawSavePopup(g);
         DrawDelayPopup(g);
+        if (g_tab == T_SOUND) DrawCalCard(g);
         DrawMenu(g);
         if (!g_dwmRound) { Pen bp(T.subtle3, S(1)); g.DrawRectangle(&bp, RectF(0, 0, g_W - 1.f, g_H - 1.f)); }
     }
@@ -4870,6 +4946,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == TIMER_NIGHT) { ApplyNight(); return 0; }
+        if (wp == TIMER_DELAYAPPLY) { KillTimer(h, TIMER_DELAYAPPLY); RestartRouter(); return 0; }
         if (wp == TIMER_FADE) {
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
@@ -4994,7 +5071,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Hit ht = HitTest(x, y);
         // an open popup swallows the click that closes it
         if (g_menuOpen && ht.h != H_MENU && ht.h != H_MENUBG) { g_menuOpen = false; InvalidateRect(h, nullptr, FALSE); return 0; }
-        if (g_delayOpen >= 0 && ht.h != H_DELAYSL && ht.h != H_MENUBG) {
+        if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLSYNC && ht.h != H_MENUBG) {
             bool same = ht.h == H_DELAYCHIP && ht.idx == g_delayOpen;
             g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE);
             if (same || ht.h != H_DELAYCHIP) return 0;
@@ -5032,6 +5109,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     const std::wstring& id = g_out[k - 1].id;
                     auto r = AppRoutes(a);
                     if (std::find(r.begin(), r.end(), id) != r.end()) AppRouteRemove(a, id); else AppRouteAdd(a, id);
+                    if (ProcLoopbackOk()) { g_ddOpen = idx; g_ddKind = 4; }   // ticking several: the list stays open
                 } else { OpenSettings(SP_SOUND_PAGE, false); return 0; }   // Open routing…
             }
             else if (kind == 3 && k < (int)g_ddProfMap.size()) {
@@ -5061,6 +5139,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_MICALL: MicToggleMute(); break;
         case H_UPDATE: StartUpdate(); break;
         case H_DELAYCHIP: g_delayOpen = ht.idx; break;
+        case H_DLMINUS: case H_DLPLUS:
+            NudgeDelay(g_delayOpen, ht.h == H_DLPLUS ? 5 : -5); SaveSettings();
+            SetTimer(h, TIMER_DELAYAPPLY, 350, nullptr);   // apply once the clicking stops
+            if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+            break;
+        case H_DLSYNC: g_delayOpen = -1; StartAutoSync(); g_calShow = true; break;
+        case H_AUTOSYNC: StartAutoSync(); g_calShow = true; break;
+        case H_CALDONE: g_calShow = false; break;
         case H_DELAYSL: {
             RectF chip; if (!DelayAnchor(chip)) break;
             RectF sl = DelaySlider(DelayPopup(chip));
@@ -5183,11 +5269,11 @@ static bool InstallOrUpdate() {
     if (running) {
         DWORD_PTR v = 0;
         SendMessageTimeoutW(running, WM_APP_VERSION, 0, 0, SMTO_ABORTIFHUNG, 2000, &v);
-        if (v > ParseVer(APP_VERSION)) {   // never downgrade
+        if ((int)v > ParseVer(APP_VERSION)) {   // never downgrade
             MessageBoxW(nullptr, L"A newer version of Knob is already running.", APP_NAME, MB_OK | MB_ICONINFORMATION);
             return true;
         }
-        if (v == ParseVer(APP_VERSION)) { PostMessageW(running, WM_APP_SHOW, 0, 0); return true; }   // same version: just open it
+        if ((int)v == ParseVer(APP_VERSION)) { PostMessageW(running, WM_APP_SHOW, 0, 0); return true; }   // same version: just open it
         PostMessageW(running, WM_APP_QUIT, 0, 0);   // older Knob: let it save and close
         WaitForExit(running);
     }
