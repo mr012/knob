@@ -45,12 +45,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.1"
+#define APP_VERSION L"1.39.2"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -72,7 +72,6 @@ static int g_style = 1;      // 0 = Solid, 1 = Glass
 static int g_accentId = 0;   // 0 = Windows accent, 1 = custom (g_accentHue / g_accentSat)
 static int g_accentHue = 25, g_accentSat = 85;
 static float g_scroll[4] = {0, 0, 0, 0};   // per tab + shortcuts page
-static int g_view = 0;                       // 0 = main tabs, 1 = shortcuts page
 static int SI();
 
 // global shortcuts
@@ -96,6 +95,7 @@ static int g_openOn = 0;             // where the panel opens: 0 main display (l
 static std::wstring g_callDev;       // output for calls (empty = same as main)
 static bool g_autoSwitch = true;     // switch to headphones when they connect
 static std::wstring g_autoPrev, g_autoTarget;   // output to go back to when they disconnect
+static std::set<std::wstring> g_autoPrevMirror;  // speakers that played together before the headphones took over
 static std::set<std::wstring> g_prevOutIds; static bool g_prevOutKnown = false;
 // update check (GitHub releases)
 enum { UPD_NONE, UPD_AVAILABLE, UPD_DOWNLOADING, UPD_FAILED };
@@ -193,8 +193,6 @@ static std::vector<AppGroup> g_apps;
 static std::map<std::wstring, ProcInfo> g_procCache;
 static std::map<std::wstring, AppLive> g_live;
 static std::set<std::wstring> g_mirror;   // extra outputs that play a copy of the default output
-static std::set<std::wstring> g_mirrorSaved;   // the group to bring back when Multi is turned on again
-static bool g_multi = false;   // Multi on: clicking outputs adds/removes them; off: clicking switches output
 
 struct MonUI { std::wstring name, detail, gdi; int pct = 0, con = 50, orient = 0; bool ok = false, hasCon = false, internal = false; RECT rc{};
                int cloneOf = -1; LUID adapter{}; UINT32 target = 0; bool hdrOk = false, hdr = false;   // duplicate of another screen; HDR
@@ -297,11 +295,6 @@ static void LoadSettings() {
     std::wstring s = buf.data(), cur;
     for (wchar_t c : s) { if (c == L'|') { if (!cur.empty()) g_mirror.insert(cur); cur.clear(); } else cur += c; }
     if (!cur.empty()) g_mirror.insert(cur);
-    GetPrivateProfileStringW(L"main", L"mirrorsaved", L"", buf.data(), (DWORD)buf.size(), g_iniPath.c_str());
-    s = buf.data(); cur.clear();
-    for (wchar_t c : s) { if (c == L'|') { if (!cur.empty()) g_mirrorSaved.insert(cur); cur.clear(); } else cur += c; }
-    if (!cur.empty()) g_mirrorSaved.insert(cur);
-    g_multi = true;   // no Play together switch any more: speakers are added in Settings › Sound
     g_keepAwake = GetPrivateProfileIntW(L"main", L"keepawake", 0, g_iniPath.c_str()) != 0;
     g_tab = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"tab", 0, g_iniPath.c_str())));
     g_style = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"style", 1, g_iniPath.c_str())));
@@ -396,10 +389,6 @@ static void SaveSettings() {
     std::wstring s;
     for (auto& id : g_mirror) { if (!s.empty()) s += L'|'; s += id; }
     WritePrivateProfileStringW(L"main", L"mirror", s.c_str(), g_iniPath.c_str());
-    s.clear();
-    for (auto& id : g_mirrorSaved) { if (!s.empty()) s += L'|'; s += id; }
-    WritePrivateProfileStringW(L"main", L"mirrorsaved", s.c_str(), g_iniPath.c_str());
-    WritePrivateProfileStringW(L"main", L"multi", g_multi ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"theme", std::to_wstring(g_themeMode).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"openon", std::to_wstring(g_openOn).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
@@ -994,6 +983,7 @@ static DWORD WINAPI RouterProc(LPVOID p) {
             if (FAILED(en->GetDevice(t.id.c_str(), &d))) continue;
             Out o; o.ti = ti;
             o.delayFrames = (UINT32)((UINT64)rate * std::max(0, std::min(1000, t.delayMs)) / 1000);
+            o.q.reserve((size_t)(o.delayFrames + rate) * fb);   // room for a second of audio, so it rarely has to grow
             o.q.assign((size_t)o.delayFrames * fb, 0);   // start the delay line full of silence
             if (SUCCEEDED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&o.ac)) &&
                 SUCCEEDED(o.ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
@@ -1004,7 +994,7 @@ static DWORD WINAPI RouterProc(LPVOID p) {
                 UINT32 pre = std::min(preFrames, o.buf);
                 if (SUCCEEDED(o.rc->GetBuffer(pre, &dst))) o.rc->ReleaseBuffer(pre, AUDCLNT_BUFFERFLAGS_SILENT);
                 o.ac->Start();
-                outs.push_back(o);
+                outs.push_back(std::move(o));
             } else { if (o.rc) o.rc->Release(); if (o.ac) o.ac->Release(); }
             d->Release();
         }
@@ -1818,7 +1808,10 @@ static DWORD WINAPI GeoProc(void*) {
     if (HttpGet(L"https://ipapi.co/json/", js, L"", nullptr)) {
         auto num = [&](const char* k) { size_t p = js.find(std::string("\"") + k + "\""); if (p == std::string::npos) return 999.0; p = js.find(':', p); return p == std::string::npos ? 999.0 : atof(js.c_str() + p + 1); };
         double la = num("latitude"), lo = num("longitude");
-        if (la > -90 && la < 90 && lo > -180 && lo < 180) { g_geoLat = la; g_geoLon = lo; g_geoWhen = (long long)time(nullptr); PostMessageW(g_hwnd, WM_APP + 31, 0, 0); }
+        if (la > -90 && la < 90 && lo > -180 && lo < 180) {   // handed to the main thread, which owns these values
+            double* v = new double[2]{la, lo};
+            if (!PostMessageW(g_hwnd, WM_APP + 31, 0, (LPARAM)v)) delete[] v;
+        }
     }
     return 0;
 }
@@ -1926,11 +1919,6 @@ struct Theme {
 static Color WithAlpha(Color c, int a) { return Color((BYTE)a, c.GetR(), c.GetG(), c.GetB()); }
 static Color Hex(DWORD rgb) { return Color(255, (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255); }
 
-struct AccentPreset { const wchar_t* name; DWORD dark, light; };
-static const AccentPreset ACCENTS[7] = {
-    {L"Windows accent", 0, 0}, {L"Teal", 0x4cc2c4, 0x007a7d}, {L"Green", 0x6ccb5f, 0x0f7b0f}, {L"Amber", 0xffc057, 0x9d5d00},
-    {L"Rose", 0xff99b0, 0xb4235a}, {L"Violet", 0xc3a0ff, 0x6b2fbf}, {L"Graphite", 0xc8c8c8, 0x4a4a4a},
-};
 
 static Color Hsl(float h, float sat, float l) {   // h 0..360, sat/l 0..1
     float c = (1 - fabsf(2 * l - 1)) * sat, hp = fmodf(h, 360.f) / 60.f, x = c * (1 - fabsf(fmodf(hp, 2.f) - 1));
@@ -2002,7 +1990,7 @@ static void InitFonts() {
     if (!g_famText) {
         g_famText = PickFamily({L"Segoe UI Variable Text", L"Segoe UI", L"Tahoma"});
         g_famSemi = PickFamily({L"Segoe UI Semibold", L"Segoe UI Variable Text", L"Segoe UI", L"Tahoma"});
-        g_famIcon = PickFamily({L"Segoe Fluent Icons", L"Segoe MDL2 Assets"});
+        g_famIcon = g_famText;   // icons are drawn as shapes; the fonts below only carry their size
     }
     for (Font** f : {&g_fName, &g_fName600, &g_fSmall, &g_fSmall600, &g_fH3, &g_fTab, &g_fTab600, &g_fIcon, &g_fIconS, &g_fNum, &g_f11, &g_f11s}) { delete *f; *f = nullptr; }
     g_fName = new Font(g_famText, S(13), FontStyleRegular, UnitPixel);
@@ -2028,9 +2016,9 @@ enum : wchar_t {
 };
 
 // ---------------------------------------------------------------- layout model
-enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
+enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENUBG, H_MICALL, H_DELAYCHIP, H_UPDATE, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 78, ROWGAP = 3;
@@ -2042,17 +2030,14 @@ static int g_dragEl = -1;
 static int g_hoverSlider = -1; static DWORD g_hoverSince = 0, g_lastScroll = 0;
 static int g_ddOpen = -1;          // display index whose list is open (0 for the profile list)
 static int g_ddKind = 0;           // which list: 0 orientation, 1 refresh rate, 2 input, 3 profiles
-static bool g_menuOpen = false;    // settings menu (gear)
 static DWORD g_spinUntil = 0;      // refresh icon animation
-static bool g_saveOpen = false;    // "save profile as" list
-static int SI() { return g_view == 1 ? 3 : g_tab; }
+static int SI() { return g_tab; }
 
 static float PaneTop() { return S(TABH); }
 static float PaneBottom() { return g_H - S(FTR); }
 static float PaneX() { return S(12); }
 static float PaneW() { return g_W - S(34); }   // rows are 346 wide: the pane keeps a 10 px gutter for its scrollbar, as in the design
 
-[[maybe_unused]] static float ProfileRowHeight(float w);
 static const float APPLINE = 22;
 static const int SP_SOUND_PAGE = 1;   // Settings › Sound (where the routing lives)
 static bool OutHasApps(int i) {   // some app is sent to this speaker on its own
@@ -2067,15 +2052,7 @@ static void Layout() {
     // section label: 18 above, 8 below (the design's h3); h is taller where buttons sit beside it
     auto h3 = [&](const wchar_t* t, float h = 13) { y += S(18); g_els.push_back({E_H3, -1, RectF(x + S(10), y, w - S(16), S(h)), t}); y += S(h) + S(8); prevRow = false; };
     auto row = [&](ElKind k, int i) { if (prevRow) y += S(ROWGAP); g_els.push_back({k, i, RectF(x, y, w, S(ROWH)), L""}); y += S(ROWH); prevRow = true; };
-    if (g_view == 1) {
-        h3(L"KEYBOARD SHORTCUTS");
-        for (int i = 0; i < (int)g_sc.size(); i++) { g_els.push_back({E_HK, i, RectF(x, y, w, S(44)), L""}); y += S(44) + S(2); }
-        h3(L"OPTIONS");
-        g_els.push_back({E_OSDROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
-        g_els.push_back({E_STEPROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
-        g_els.push_back({E_RESETROW, 0, RectF(x, y, w, S(44)), L""}); y += S(46);
-        g_els.push_back({E_NOTE, -1, RectF(x + S(10), y + S(4), w - S(20), S(34)), L"Click a shortcut, then press the new keys. Esc cancels, Backspace clears it."}); y += S(40);
-    } else if (g_tab == T_SOUND) {
+    if (g_tab == T_SOUND) {
         h3(L"OUTPUT", 24);
         for (int i = 0; i < (int)g_out.size(); i++) {
             row(E_OUT, i);
@@ -2136,19 +2113,18 @@ static RectF IdentRect() { RectF g = GearRect(); return RectF(g.X - S(10) - S(32
 static RectF RefreshRect() { RectF i = IdentRect(); return RectF(i.X - S(10) - S(32), i.Y, S(32), S(32)); }
 static RectF MicAllRect() { RectF r = RefreshRect(); return RectF(r.X - S(10) - S(32), r.Y, S(32), S(32)); }
 static int g_delayOpen = -1;     // output whose sync-delay popup is open
-static bool g_dragDelay = false;
 static std::map<int, float> g_appChipW;   // measured when drawn: the chip is as wide as its label, up to a limit
 static RectF AppOutChip(const El& e) { auto it = g_appChipW.find(e.idx); float w = it != g_appChipW.end() ? it->second : S(122); return RectF(e.r.X + e.r.Width - S(8) - w, e.r.Y + S(22) - S(13), w, S(26)); }
 static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return true; return !g_appExtra.empty(); }
-[[maybe_unused]] static bool AppRouted(int i) { return i >= 0 && i < (int)g_apps.size() && !AppRoutes(g_apps[i]).empty(); }
 static RectF AppIconRect(const El& e) { float lx = e.r.X + S(10) + S(16), cy = e.r.Y + S(22); return RectF(lx - S(16), cy - S(16), S(32), S(32)); }
 static RectF AppDdAnchor(const El& e) { return g_apps[e.idx].system ? AppIconRect(e) : AppOutChip(e); }   // the list opens from the chip
 static bool NeedsSync();
-static float MeasureW(const wchar_t* s, Font* f) {   // text width outside of painting (hit testing)
+static Graphics* MeasureG() {   // one small surface for measuring text outside of painting
     static Bitmap* bm = nullptr; static Graphics* mg = nullptr;
     if (!mg) { bm = new Bitmap(4, 4, PixelFormat32bppPARGB); mg = new Graphics(bm); mg->SetTextRenderingHint(TextRenderingHintAntiAliasGridFit); }
-    RectF out; mg->MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width;
+    return mg;
 }
+static float MeasureW(const wchar_t* s, Font* f) { RectF out; MeasureG()->MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width; }
 // Sound header, right to left: Auto sync · Routing · "N speakers ×"   (the design's h3row)
 static bool ShowSyncBtns() { return SpeakersInUse() > 1; }
 static RectF AutoSyncRect(const El& e) { float w = S(11) + MeasureW(L"Auto sync", g_f11s) + S(11); return RectF(e.r.X + e.r.Width - w, e.r.Y + e.r.Height / 2 - S(12), w, S(24)); }
@@ -2176,7 +2152,6 @@ static RectF DelayPopup(const RectF& chip) {   // the design's "bstep" popup: 25
     if (y + h > PaneBottom() - S(4)) y = chip.Y - S(4) - h;
     return RectF(std::max(PaneX(), chip.X + chip.Width - w), y, w, h);
 }
-static RectF DelaySlider(const RectF& pop) { return RectF(pop.X + S(16), pop.Y + S(36), pop.Width - S(32), S(28)); }
 static RectF DlMinus(const RectF& pop) { return RectF(pop.X + S(14), pop.Y + S(37), S(34), S(34)); }
 static RectF DlPlus(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(34), pop.Y + S(37), S(34), S(34)); }
 static RectF DlSync(const RectF& pop) { float w = S(22) + MeasureW(L"Run Auto sync again", g_f11s); return RectF(pop.X + pop.Width - S(14) - w, pop.Y + pop.Height - S(12) - S(24), w, S(24)); }
@@ -2197,41 +2172,6 @@ static void NudgeDelay(int i, int ms) {   // −/+ in the delay popup: going bel
 }
 
 static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height; }
-static RectF BackRect() { return RectF(S(12), S(12), S(36), S(36)); }
-static std::vector<RectF> g_chipRel;   // profile chips (+ Save as the last one), relative to the row's top-left
-static RectF ProfileChip(const El& e, int i) { RectF r = g_chipRel[i]; r.X += e.r.X; r.Y += e.r.Y; return r; }
-static int ChipCount() { return (int)g_chipRel.size(); }
-static bool SaveAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_PROFILES && ChipCount()) { chip = ProfileChip(e, ChipCount() - 1); return true; } return false; }
-static int SaveOptCount() { return (int)g_prof.size() + 1; }   // "Save as <name>" for each + "New profile..."
-static RectF SavePopup(const RectF& chip) {
-    float w = S(220), h = S(4) * 2 + S(32) * SaveOptCount() + S(2) * (SaveOptCount() - 1);
-    float y = chip.Y + chip.Height + S(4);
-    if (y + h > PaneBottom() - S(4)) y = chip.Y - S(4) - h;
-    float x = std::max(PaneX(), std::min(chip.X, PaneX() + PaneW() - w));   // never off the panel's edge
-    return RectF(x, y, w, h);
-}
-static float ProfileRowHeight(float w) {   // flow the chips onto as many lines as needed
-    g_chipRel.clear();
-    float x = S(4), y = S(2), h = S(32), gap = S(6);
-    HDC dc = GetDC(nullptr);
-    {
-        Graphics g(dc);
-        auto place = [&](float cw) { if (x + cw > w - S(4) && x > S(4)) { x = S(4); y += h + gap; } g_chipRel.push_back(RectF(x, y, cw, h)); x += cw + gap; };
-        for (auto& p : g_prof) {
-            std::wstring t = p.v.empty() ? L"+ " + p.name : p.name;
-            RectF m; g.MeasureString(t.c_str(), -1, g_fSmall600, PointF(0, 0), &m);
-            place(std::max(S(64), std::min(w - S(8), m.Width + S(28))));
-        }
-        place(S(78));   // Save
-    }
-    ReleaseDC(nullptr, dc);
-    return y + h + S(4);
-}
-static RectF SaveOption(const RectF& pop, int i) { return RectF(pop.X + S(4), pop.Y + S(4) + i * (S(32) + S(2)), pop.Width - S(8), S(32)); }
-static RectF HkChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(176), e.r.Y + e.r.Height / 2 - S(15), S(176), S(30)); }
-static RectF StepBox(const El& e) { float bw = S(50); return RectF(e.r.X + e.r.Width - S(6) - 3 * bw - S(8), e.r.Y + e.r.Height / 2 - S(16), 3 * bw + S(8), S(32)); }
-static RectF StepBtn(const El& e, int i) { RectF box = StepBox(e); float bw = S(50); return RectF(box.X + S(3) + i * (bw + S(1)), box.Y + S(3), bw, S(26)); }
-static RectF ResetBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(150), e.r.Y + e.r.Height / 2 - S(15), S(150), S(30)); }
 
 // ---- Display tab controls and their lists (in-panel popups, styled like the panel)
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
@@ -2341,60 +2281,11 @@ static RectF DropdownOption(const RectF& pop, int i) {
     return RectF(pop.X + S(4), y + i * S(32), pop.Width - S(8), S(32));
 }
 
-// ---- settings menu (in-panel popup above the gear)
-enum MenuId { M_AWAKE = 1, M_STARTUP, M_SOUND, M_DISPLAY, M_EXIT, M_SOLID, M_GLASS, M_SHORTCUTS, M_RESTORE, M_ACC0 = 20 };
-enum MenuType { MT_SWITCH, MT_LINK, MT_ITEM, MT_LABEL, MT_SEG, MT_SWATCH, MT_VERSION, MT_NAV };
-struct MI { int id; int type; RectF r; std::wstring text; wchar_t glyph; };
-static std::vector<MI> g_menu;
-static RectF g_menuBox;
-static void BuildMenu() {
-    g_menu.clear();
-    float w = S(260), x = g_W - S(8) - w, ix = x + S(6), iw = w - S(12);
-    std::vector<MI> items;
-    float y = 0;
-    auto add = [&](int id, int type, float h, const wchar_t* t, wchar_t gl) { items.push_back({id, type, RectF(ix, y, iw, h), t, gl}); y += h; };
-    y += S(6);
-    add(M_AWAKE, MT_SWITCH, S(36), L"Keep awake", G_EYE);
-    add(M_STARTUP, MT_SWITCH, S(36), L"Start with Windows", G_POWER);
-    add(M_RESTORE, MT_SWITCH, S(36), L"Restore display brightness", G_BRIGHT);
-    add(M_SHORTCUTS, MT_NAV, S(36), L"Keyboard shortcuts", 0xE765);
-    y += S(6);
-    add(M_SOUND, MT_LINK, S(36), L"Sound settings", G_VOLUME);
-    add(M_DISPLAY, MT_LINK, S(36), L"Display settings", G_TV);
-    y += S(6);
-    add(M_EXIT, MT_ITEM, S(36), L"Exit", G_CLOSE);
-    add(0, MT_LABEL, S(24), L"Style", 0);
-    {   // segmented Solid | Glass
-        float sy = y + S(4), sw = (iw - S(8) - S(6) - S(2)) / 2;
-        items.push_back({-1, MT_LABEL, RectF(ix + S(4), sy, iw - S(8), S(34)), L"#seg", 0});
-        items.push_back({M_SOLID, MT_SEG, RectF(ix + S(4) + S(3), sy + S(3), sw, S(28)), L"Solid", 0});
-        items.push_back({M_GLASS, MT_SEG, RectF(ix + S(4) + S(3) + sw + S(2), sy + S(3), sw, S(28)), L"Glass", 0});
-        y += S(4) + S(34) + S(4);
-    }
-    std::wstring accLbl = std::wstring(L"Accent color · ") + (g_accentId ? L"Custom" : L"Windows accent");
-    items.push_back({0, MT_LABEL, RectF(ix, y, iw, S(24)), accLbl, 0}); y += S(24);
-    for (int i = 0; i < 7; i++) items.push_back({M_ACC0 + i, MT_SWATCH, RectF(ix + S(10) + i * S(28), y + S(6), S(22), S(22)), ACCENTS[i].name, 0});
-    y += S(34);
-    add(0, MT_VERSION, S(26), APP_NAME L" " APP_VERSION, 0);
-    y += S(6);
-    float top = g_H - S(50) - y;
-    for (auto& m : items) { m.r.Y += top; g_menu.push_back(m); }
-    g_menuBox = RectF(x, top, w, y);
-}
-
 static RectF CalCard();
 static RectF CalBtn(int which);   // 0 Cancel / Stop, 1 Start / Done
 static Hit HitTest(float x, float y) {
     Hit h;
-    if (g_menuOpen) {
-        BuildMenu();
-        if (InRect(g_menuBox, x, y)) {
-            h.h = H_MENUBG;
-            for (auto& m : g_menu) if (m.id > 0 && InRect(m.r, x, y)) { h.h = H_MENU; h.idx = m.id; break; }
-            return h;
-        }
-    }
-    if (g_calShow && g_tab == T_SOUND && g_view == 0 && InRect(CalCard(), x, y)) {
+    if (g_calShow && g_tab == T_SOUND && InRect(CalCard(), x, y)) {
         h.h = InRect(CalBtn(0), x, y) ? H_CALCANCEL : InRect(CalBtn(1), x, y) ? (g_calAsk ? H_CALSTART : H_CALDONE) : H_MENUBG;
         return h;
     }
@@ -2406,14 +2297,6 @@ static Hit HitTest(float x, float y) {
             return h;
         }
     }
-    RectF chip;
-    if (g_saveOpen && SaveAnchor(chip)) {
-        RectF pop = SavePopup(chip);
-        if (InRect(pop, x, y)) {
-            for (int i = 0; i < SaveOptCount(); i++) if (InRect(SaveOption(pop, i), x, y)) { h.h = H_SAVEOPT; h.idx = i; return h; }
-            h.h = H_MENUBG; return h;
-        }
-    }
     RectF btn;
     if (DropdownRect(btn)) {
         RectF pop = DropdownPopup(btn);
@@ -2423,8 +2306,7 @@ static Hit HitTest(float x, float y) {
             h.h = H_MENUBG; return h;
         }
     }
-    if (g_view == 1) { if (InRect(BackRect(), x, y)) { h.h = H_BACK; return h; } }
-    else for (int i = 0; i < 3; i++) if (InRect(TabRect(i), x, y)) { h.h = H_TAB; h.idx = i; return h; }
+    for (int i = 0; i < 3; i++) if (InRect(TabRect(i), x, y)) { h.h = H_TAB; h.idx = i; return h; }
     if (InRect(GearRect(), x, y)) { h.h = H_GEAR; return h; }
     if (InRect(IdentRect(), x, y)) { h.h = H_IDENT; return h; }
     if (InRect(RefreshRect(), x, y)) { h.h = H_REFRESH; return h; }
@@ -2461,15 +2343,6 @@ static Hit HitTest(float x, float y) {
         } else if (e.k == E_DTOP) {
             if (InRect(DTopProfile(e), x, y)) h.h = H_PROFDD;
             else if (InRect(DTopOff(e), x, y)) h.h = H_SCREENOFF;
-        } else if (e.k == E_PROFILES) {
-            for (int c = 0; c < ChipCount(); c++) if (InRect(ProfileChip(e, c), x, y)) { h.h = H_PROFILE; h.idx = c; }
-        } else if (e.k == E_HK) {
-            if (InRect(HkChip(e), x, y)) h.h = H_HKCHIP;
-        } else if (e.k == E_OSDROW) h.h = H_OSD;
-        else if (e.k == E_STEPROW) {
-            for (int c = 0; c < 3; c++) if (InRect(StepBtn(e, c), x, y)) { h.h = H_STEP; h.idx = c; }
-        } else if (e.k == E_RESETROW) {
-            if (InRect(ResetBtn(e), x, y)) h.h = H_RESET;
         }
         return h;
     }
@@ -2754,11 +2627,6 @@ static void Text(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r, Strin
     SolidBrush b(c);
     g.DrawString(s, -1, f, r, &sf, &b);
 }
-[[maybe_unused]] static int TextLines(Graphics& g, const wchar_t* s, Font* f, float w) {   // wrapped line count
-    StringFormat sf; RectF out; INT chars = 0, lines = 0;
-    g.MeasureString(s, -1, f, RectF(0, 0, w, 10000), &sf, &out, &chars, &lines);
-    return std::max(1, (int)lines);
-}
 static void TextWrap(Graphics& g, const wchar_t* s, Font* f, Color c, RectF r) {   // top-aligned, wraps, ellipsis on overflow
     StringFormat sf;
     sf.SetTrimming(StringTrimmingEllipsisWord);
@@ -2954,7 +2822,8 @@ static void Icon(Graphics& g, const char* name, float size, Color c, float cx, f
     }
     float x = floorf(cx - box / 2.f + 0.5f), y = floorf(cy - box / 2.f + 0.5f);
     InterpolationMode im = g.GetInterpolationMode(); PixelOffsetMode po = g.GetPixelOffsetMode();
-    g.SetInterpolationMode(InterpolationModeNearestNeighbor); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    Matrix wm; g.GetTransform(&wm);
+    g.SetInterpolationMode(wm.IsIdentity() ? InterpolationModeNearestNeighbor : InterpolationModeHighQualityBilinear); g.SetPixelOffsetMode(PixelOffsetModeHalf);
     g.DrawImage(bm, x, y, (REAL)box, (REAL)box);
     g.SetInterpolationMode(im); g.SetPixelOffsetMode(po);
 }
@@ -3026,8 +2895,7 @@ static void DrawSlider(Graphics& g, RectF r, float v, bool dim, int state /*0 re
 }
 static void DrawValue(Graphics& g, RectF r, int v) {
     wchar_t pct[8]; swprintf(pct, 8, L"%d", v);
-    if (true) { FillRound(g, T.valBg, r, S(8)); PillText(g, pct, g_f11, T.t2, r, StringAlignmentCenter); }
-    else Text(g, pct, g_fSmall, T.t2, RectF(r.X, r.Y, r.Width - S(4), r.Height), StringAlignmentFar);
+    FillRound(g, T.valBg, r, S(8)); PillText(g, pct, g_f11, T.t2, r, StringAlignmentCenter);
 }
 static void DrawIconBtn(Graphics& g, RectF r, wchar_t glyph, Color c, bool hover) {
     if (hover) FillRound(g, T.hover, r, S(6));
@@ -3210,60 +3078,6 @@ static void DrawEl(Graphics& g, int index) {
         return;
     }
 
-    if (e.k == E_PROFILES) {
-        int n = ChipCount();
-        for (int c = 0; c < n; c++) {
-            RectF r = ProfileChip(e, c);
-            bool save = c == n - 1;
-            bool hov = g_hover.h == H_PROFILE && g_hover.idx == c;
-            bool active = !save && ProfileActive(c), empty = !save && ProfileEmpty(c);
-            FillRound(g, hov || (save && g_saveOpen) ? T.ddBtnHover : T.ddBtn, r, S(16));
-            if (active) FillRound(g, WithAlpha(T.accent, true ? 46 : 40), r, S(16));
-            if (save) {
-                float tw = TextW(g, L"Save", g_fSmall), sx = r.X + (r.Width - (S(14) + S(6) + tw)) / 2;
-                Glyph(g, 0xE74E, g_fIconS, T.t1, sx + S(7), r.Y + r.Height / 2);
-                Text(g, L"Save", g_fSmall, T.t1, RectF(sx + S(20), r.Y, tw + S(4), r.Height));
-            } else {
-                std::wstring label = empty ? L"+ " + g_prof[c].name : g_prof[c].name;
-                Text(g, label.c_str(), active ? g_fSmall600 : g_fSmall, empty ? T.t3 : T.t1, RectF(r.X + S(10), r.Y, r.Width - S(20), r.Height), StringAlignmentCenter);
-            }
-        }
-        return;
-    }
-    if (e.k == E_HK) {
-        float cy = e.r.Y + e.r.Height / 2;
-        Text(g, HK_NAMES[g_sc[e.idx].act], g_fName, T.t1, RectF(e.r.X + S(10), cy - S(10), e.r.Width - S(200), S(20)));
-        RectF c = HkChip(e);
-        bool hov = hovEl && g_hover.h == H_HKCHIP, cap = g_capture == e.idx;
-        FillRound(g, cap ? WithAlpha(T.accent, 46) : hov ? T.ddBtnHover : T.ddBtn, c, S(8));
-        HotKey& hk = g_sc[e.idx].k;
-        std::wstring t = cap ? L"Press keys\u2026" : ComboName(hk);
-        Color tc = cap ? T.t1 : (!hk.vk ? T.t3 : (!hk.ok ? Color(255, 232, 72, 72) : T.t1));
-        if (!cap && hk.vk && !hk.ok) t += L"  (in use)";
-        Text(g, t.c_str(), g_fSmall, tc, RectF(c.X + S(8), c.Y, c.Width - S(16), c.Height), StringAlignmentCenter);
-        return;
-    }
-    if (e.k == E_OSDROW || e.k == E_STEPROW || e.k == E_RESETROW) {
-        float cy = e.r.Y + e.r.Height / 2;
-        const wchar_t* lbl = e.k == E_OSDROW ? L"Show on-screen popup" : e.k == E_STEPROW ? L"Volume step" : L"Shortcuts";
-        Text(g, lbl, g_fName, T.t1, RectF(e.r.X + S(10), cy - S(10), S(200), S(20)));
-        if (e.k == E_OSDROW) DrawSwitch(g, e.r.X + e.r.Width - S(6) - S(40), cy, g_osd);
-        else if (e.k == E_STEPROW) {
-            FillRound(g, T.tabsBg, StepBox(e), S(8));
-            const wchar_t* st[3] = {L"2%", L"5%", L"10%"}; int vals[3] = {2, 5, 10};
-            for (int c = 0; c < 3; c++) {
-                RectF r = StepBtn(e, c);
-                bool on = g_step == vals[c], hov = g_hover.h == H_STEP && g_hover.idx == c && hovEl;
-                if (on) FillRound(g, T.tabSel, r, S(6)); else if (hov) FillRound(g, T.hover, r, S(6));
-                Text(g, st[c], on ? g_fSmall600 : g_fSmall, T.t1, r, StringAlignmentCenter);
-            }
-        } else {
-            RectF r = ResetBtn(e);
-            FillRound(g, hovEl && g_hover.h == H_RESET ? T.ddBtnHover : T.ddBtn, r, S(8));
-            Text(g, L"Reset to defaults", g_fSmall, T.t1, r, StringAlignmentCenter);
-        }
-        return;
-    }
     if (e.k == E_DTOP) {
         RectF pb = DTopProfile(e), ob = DTopOff(e);
         bool open = g_ddOpen >= 0 && g_ddKind == 3;
@@ -3361,7 +3175,7 @@ static void DrawEl(Graphics& g, int index) {
 static const DWORD POP_MS = 170, TAB_MS = 240;
 struct PopAnim { long long key = LLONG_MIN; DWORD start = 0; Bitmap* snap = nullptr; RectF box; float m = 0; bool up = false, closing = false; DWORD closeStart = 0; };
 static const DWORD CLOSE_MS = 130;
-static PopAnim g_paDD, g_paDelay, g_paMenu, g_paSave, g_paSetDD;
+static PopAnim g_paDD, g_paDelay, g_paSetDD;
 static DWORD g_tabStart = 0; static float g_tabFrom = 0, g_tabTo = 0;
 
 static float PopT(PopAnim& a, long long key) {
@@ -3557,11 +3371,11 @@ static std::wstring DelayNote(int i, bool*) {
     if (tweak) s += L". Your tweak: " + std::wstring(tweak > 0 ? L"+" : L"−") + std::to_wstring(abs(tweak)) + L" ms";
     return s + L".";
 }
+static Graphics* MeasureG();
 static float DelayNoteLines() {
-    Bitmap b(4, 4); Graphics g(&b);
     StringFormat sf; RectF out; INT chars = 0, lines = 0;
     std::wstring t = DelayNote(g_delayOpen);
-    g.MeasureString(t.c_str(), -1, g_fSmall, RectF(0, 0, S(228), 1000), &sf, &out, &chars, &lines);
+    MeasureG()->MeasureString(t.c_str(), -1, g_fSmall, RectF(0, 0, S(228), 1000), &sf, &out, &chars, &lines);
     return (float)std::max(1, (int)lines);
 }
 static void DrawDelayPopupBody(Graphics& g) {
@@ -3593,72 +3407,6 @@ static void DrawDelayPopupBody(Graphics& g) {
     GhostBtn(g, DlSync(pop), L"Run Auto sync again", g_hover.h == H_DLSYNC, false, !g_calibrating);
 }
 
-static void DrawSavePopupBody(Graphics& g) {
-    RectF chip;
-    if (!g_saveOpen || !SaveAnchor(chip)) return;
-    RectF pop = SavePopup(chip);
-    float rad = S(true ? 12 : 8);
-    Shadow(g, pop, rad);
-    FillRound(g, T.popup, pop, rad);
-    for (int i = 0; i < SaveOptCount(); i++) {
-        RectF r = SaveOption(pop, i);
-        if (g_hover.h == H_SAVEOPT && g_hover.idx == i) FillRound(g, T.subtle2, r, S(true ? 8 : 5));
-        bool isNew = i == (int)g_prof.size();
-        std::wstring t = isNew ? std::wstring(L"New profile\u2026") : L"Save as " + g_prof[i].name;
-        if (isNew) { Glyph(g, 0xE710, g_fIconS, T.t1, r.X + S(18), r.Y + r.Height / 2); Text(g, t.c_str(), g_fName, T.t1, RectF(r.X + S(34), r.Y, r.Width - S(38), r.Height)); }
-        else Text(g, t.c_str(), g_fName, T.t1, RectF(r.X + S(12), r.Y, r.Width - S(16), r.Height));
-    }
-}
-
-static void DrawMenuBody(Graphics& g) {
-    float rad = S(10);
-    Shadow(g, g_menuBox, rad);
-    FillRound(g, T.popup, g_menuBox, rad);
-    for (auto& m : g_menu) {
-        bool hov = g_hover.h == H_MENU && g_hover.idx == m.id;
-        float cy = m.r.Y + m.r.Height / 2;
-        switch (m.type) {
-        case MT_SWITCH: case MT_LINK: case MT_ITEM: case MT_NAV: {
-            if (hov) FillRound(g, T.subtle, m.r, S(6));
-            Glyph(g, m.glyph, g_fIconS, T.t1, m.r.X + S(10) + S(8), cy);
-            Text(g, m.text.c_str(), g_fName, T.t1, RectF(m.r.X + S(10) + S(16) + S(12), m.r.Y, m.r.Width - S(100), m.r.Height));
-            if (m.type == MT_SWITCH) DrawSwitch(g, m.r.X + m.r.Width - S(10) - S(40), cy, m.id == M_AWAKE ? g_keepAwake : m.id == M_RESTORE ? g_restoreBright : StartupEnabled());
-            if (m.type == MT_LINK) Glyph(g, G_OPEN, g_fIconS, T.t2, m.r.X + m.r.Width - S(10) - S(8), cy);
-            if (m.type == MT_NAV) Glyph(g, 0xE76C, g_fIconS, T.t2, m.r.X + m.r.Width - S(10) - S(8), cy);
-            break;
-        }
-        case MT_LABEL:
-            if (m.text == L"#seg") FillRound(g, T.subtle, m.r, S(8));
-            else Text(g, m.text.c_str(), g_fSmall, T.t3, RectF(m.r.X + S(10), m.r.Y + S(6), m.r.Width - S(10), m.r.Height - S(6)));
-            break;
-        case MT_SEG: {
-            bool on = (m.id == M_SOLID) == (g_style == 0);
-            if (on) {
-                if (!T.dark) FillRound(g, Color(30, 0, 0, 0), RectF(m.r.X, m.r.Y + S(1), m.r.Width, m.r.Height), S(6));
-                FillRound(g, T.dark ? T.subtle3 : Color(255, 255, 255, 255), m.r, S(6));
-            } else if (hov) FillRound(g, T.subtle, m.r, S(6));
-            Text(g, m.text.c_str(), on ? g_fSmall600 : g_fSmall, on ? T.t1 : T.t2, m.r, StringAlignmentCenter);
-            break;
-        }
-        case MT_SWATCH: {
-            int i = m.id - M_ACC0;
-            RectF r = m.r;
-            if (i == g_accentId) {
-                SolidBrush ring(T.t1); g.FillEllipse(&ring, r.X - S(4), r.Y - S(4), r.Width + S(8), r.Height + S(8));
-                SolidBrush gap(T.popup.GetA() == 255 ? T.popup : (T.dark ? Color(255, 40, 40, 40) : Color(255, 249, 249, 249)));
-                g.FillEllipse(&gap, r.X - S(2), r.Y - S(2), r.Width + S(4), r.Height + S(4));
-            }
-            if (i == 0) {   // Windows accent: multicolor
-                Color cs[4] = {Hex(0x60cdff), Hex(0xc3a0ff), Hex(0xff8fa8), Hex(0x6ccb5f)};
-                for (int q = 0; q < 4; q++) { SolidBrush b(cs[q]); g.FillPie(&b, r, -90.f + q * 90.f, 90.f); }
-            } else { SolidBrush b(Hex(T.dark ? ACCENTS[i].dark : ACCENTS[i].light)); g.FillEllipse(&b, r); }
-            break;
-        }
-        case MT_VERSION: Text(g, m.text.c_str(), g_fSmall, T.t3, RectF(m.r.X + S(10), m.r.Y, m.r.Width, m.r.Height)); break;
-        }
-    }
-}
-
 static void DrawDropdown(Graphics& g) {
     RectF btn;
     if (!DropdownRect(btn)) { ClosePop(g, g_paDD); return; }
@@ -3673,31 +3421,19 @@ static void DrawDelayPopup(Graphics& g) {
     float t = PopT(g_paDelay, g_delayOpen);
     DrawPopAnimated(g, g_paDelay, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawDelayPopupBody(gg); });
 }
-static void DrawSavePopup(Graphics& g) {
-    RectF chip;
-    if (!g_saveOpen || !SaveAnchor(chip)) { ClosePop(g, g_paSave); return; }
-    RectF pop = SavePopup(chip);
-    float t = PopT(g_paSave, 1);
-    DrawPopAnimated(g, g_paSave, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawSavePopupBody(gg); });
-}
-static void DrawMenu(Graphics& g) {
-    if (!g_menuOpen) { ClosePop(g, g_paMenu); return; }
-    BuildMenu();
-    float t = PopT(g_paMenu, 1);
-    DrawPopAnimated(g, g_paMenu, g_menuBox, t, true, [&](Graphics& gg) { DrawMenuBody(gg); });
-}
 
 static bool g_dwmRound = false;
 
 // Smooth changes: when the theme, style or accent changes, both windows fade from the old look to the new one.
-struct Fade { std::vector<BYTE> last, from; int w = 0, h = 0; DWORD start = 0; bool on = false; int top = 0; };
+struct Fade { std::vector<BYTE> last, from, scratch; int w = 0, h = 0; DWORD start = 0; bool on = false; int top = 0; };
 static Fade g_fadeFly, g_fadeSet;
 static const DWORD FADE_MS = 220;
 enum { TIMER_FADE = 11 };
 static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after drawing, before showing
     BYTE* bits = (BYTE*)bitsV; size_t n = (size_t)w * h * 4;
-    std::vector<BYTE> fresh(bits, bits + n);
-    if (f.on) {
+    if (!f.on) { f.last.assign(bits, bits + n); f.w = w; f.h = h; return; }   // reuses its memory
+    std::vector<BYTE>& fresh = f.scratch; fresh.assign(bits, bits + n);
+    {
         float t = (GetTickCount() - f.start) / (float)FADE_MS;
         if (t >= 1 || f.w != w || f.h != h || f.from.size() != n) f.on = false;
         else {
@@ -3708,6 +3444,7 @@ static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after draw
     }
     f.last.swap(fresh); f.w = w; f.h = h;
 }
+static void FadeFree(Fade& f) { std::vector<BYTE>().swap(f.last); std::vector<BYTE>().swap(f.from); std::vector<BYTE>().swap(f.scratch); f.on = false; }
 static void StartFade() {
     for (Fade* f : {&g_fadeFly, &g_fadeSet}) if (!f->last.empty()) { f->from = f->last; f->start = GetTickCount(); f->on = true; f->top = 0; }
     if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
@@ -3717,13 +3454,25 @@ static void StartPaneFade() {   // tab switch: cross-fade the content under the 
     g_fadeFly.from = g_fadeFly.last; g_fadeFly.start = GetTickCount(); g_fadeFly.on = true; g_fadeFly.top = (int)S(54);
     if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
 }
+// One 32-bit drawing surface per window, kept between frames (animations paint ~60 times a second)
+struct Canvas { HBITMAP dib = nullptr; void* bits = nullptr; int w = 0, h = 0; };
+static Canvas g_cvFly, g_cvSet;
+static HBITMAP CanvasFor(Canvas& c, HDC hdc, int w, int h, void** bits) {
+    if (!c.dib || c.w != w || c.h != h) {
+        if (c.dib) DeleteObject(c.dib);
+        BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        c.bits = nullptr; c.dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &c.bits, nullptr, 0); c.w = w; c.h = h;
+        if (!c.dib) { c.w = c.h = 0; c.bits = nullptr; }
+    }
+    *bits = c.bits; return c.dib;
+}
+static void CanvasFree(Canvas& c) { if (c.dib) DeleteObject(c.dib); c = Canvas(); }
 static void Paint(HDC hdc) {
     if (g_W <= 0 || g_H <= 0) return;
     // 32-bit premultiplied canvas: alpha is honoured by DWM when Glass (acrylic) is on
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = g_W; bi.bmiHeader.biHeight = -g_H;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP dib = CanvasFor(g_cvFly, hdc, g_W, g_H, &bits);
     if (!dib) return;
     HDC mdc = CreateCompatibleDC(hdc);
     HGDIOBJ old = SelectObject(mdc, dib);
@@ -3761,20 +3510,13 @@ static void Paint(HDC hdc) {
         { SolidBrush sb(T.surface); g.FillRectangle(&sb, RectF(0, 0, (float)g_W, PaneTop())); g.FillRectangle(&sb, RectF(0, PaneBottom(), (float)g_W, S(FTR))); }
         g.SetCompositingMode(CompositingModeSourceOver);
 
-        if (g_view == 1) {   // shortcuts page header
-            RectF b = BackRect();
-            if (g_hover.h == H_BACK) FillRound(g, T.hover, b, S(6));
-            Glyph(g, 0xE72B, g_fIcon, T.t1, b.X + b.Width / 2, b.Y + b.Height / 2);
-            Font hf(g_famSemi, S(15), FontStyleRegular, UnitPixel);
-            Text(g, L"Keyboard shortcuts", &hf, T.t1, RectF(b.X + b.Width + S(8), b.Y, S(260), b.Height));
-        } else {
+        {
         // tabs
         FillRound(g, T.tabsBg, RectF(S(12), S(12), g_W - S(24), S(38)), S(8));
         const wchar_t* names[3] = {L"Sound", L"Apps", L"Display"};
         {   // the selected pill glides from tab to tab
             RectF r0 = TabRect(0), r1 = TabRect(1);
             RectF pr(r0.X + TabPos() * (r1.X - r0.X), r0.Y, r0.Width, r0.Height);
-            if (false) FillRound(g, Color(T.dark ? 40 : 30, 0, 0, 0), RectF(pr.X, pr.Y + S(1), pr.Width, pr.Height), S(6));
             FillRound(g, T.tabSel, pr, S(6));
         }
         for (int i = 0; i < 3; i++) {
@@ -3830,20 +3572,17 @@ static void Paint(HDC hdc) {
         }
         if (g_hover.h == H_IDENT) FillRound(g, T.hover, IdentRect(), S(6));
         Icon(g, "identify", S(18), T.t1, IdentRect().X + S(16), IdentRect().Y + S(16));
-        DrawIconBtn(g, GearRect(), G_SETTINGS, T.t1, g_hover.h == H_GEAR || g_menuOpen);
+        DrawIconBtn(g, GearRect(), G_SETTINGS, T.t1, g_hover.h == H_GEAR);
 
         // popups on top
         DrawDropdown(g);
-        DrawSavePopup(g);
         DrawDelayPopup(g);
         if (g_tab == T_SOUND) DrawCalCard(g);
-        DrawMenu(g);
         if (!g_dwmRound) { Pen bp(T.subtle3, S(1)); g.DrawRectangle(&bp, RectF(0, 0, g_W - 1.f, g_H - 1.f)); }
     }
     FadeApply(g_fadeFly, bits, g_W, g_H);
     BitBlt(hdc, 0, 0, g_W, g_H, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, old);
-    DeleteObject(dib);
     DeleteDC(mdc);
 }
 
@@ -4091,6 +3830,7 @@ static void StartAnim() { if (g_visible && g_tab == T_APPS) SetTimer(g_hwnd, TIM
 
 static void ShowFlyout() {
     if (g_pairHidden) { PairShow(true); return; }   // Settings is open: bring the pair back
+    KillTimer(g_hwnd, TIMER_TRIM);
     LoadEndpoints(eRender, g_out);
     LoadEndpoints(eCapture, g_in);
     LoadApps();
@@ -4110,7 +3850,7 @@ static void HideFlyout() {
     if (!g_visible) return;
     if (g_set) return;   // the panel stays while Settings is open (Esc, clicking away, tray and shortcut all wait)
     g_visible = false;
-    g_dragEl = -1; g_menuOpen = false; g_ddOpen = -1; g_saveOpen = false; g_view = 0; g_delayOpen = -1; g_dragDelay = false;
+    g_dragEl = -1; g_ddOpen = -1; g_delayOpen = -1;
     SaveSettings();
     if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
     if (GetCapture() == g_hwnd) ReleaseCapture();
@@ -4119,6 +3859,7 @@ static void HideFlyout() {
     ShowWindow(g_hwnd, SW_HIDE);
     g_hideTick = GetTickCount();
     FreeApps();
+    SetTimer(g_hwnd, TIMER_TRIM, 60000, nullptr);   // hidden for a minute: give back the memory used for drawing
 }
 
 static void SetTab(int t) {
@@ -4126,7 +3867,7 @@ static void SetTab(int t) {
     g_tabFrom = TabPos(); g_tabTo = (float)t; g_tabStart = GetTickCount();
     g_tab = t;
     StartPaneFade(); KickAnim();
-    g_hover = Hit(); g_ddOpen = -1; g_menuOpen = false; g_saveOpen = false; g_delayOpen = -1;
+    g_hover = Hit(); g_ddOpen = -1; g_delayOpen = -1;
     if (t == T_APPS) { LoadApps(); UpdatePeaks(); }
     if (t == T_DISPLAY) BrightRequest(!g_monsLoaded, g_monsLoaded);
     SaveSettings();
@@ -4205,6 +3946,7 @@ static void BlackoutStart() {
     g_blackPrev.assign(g_mons.size(), -1);   // dim every display we control to 0, remember where it was
     for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }
 }
+static void ClickOutput(int i);
 static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
     std::set<std::wstring> now; for (auto& o : g_out) now.insert(o.id);
     if (g_prevOutKnown && g_autoSwitch) {
@@ -4213,39 +3955,25 @@ static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play t
             if (!pick || (IsCallEndpoint(*pick) && !IsCallEndpoint(o))) pick = &o;
         if (pick) {
             std::wstring id = pick->id; bool isDef = pick->isDefault;
-            if (g_multi) g_mirror.insert(id);   // Play together: add it to the group
-            else if (!isDef) {
+            if (!isDef || !g_mirror.empty()) {   // the headphones alone, like clicking them; remember what played before
                 for (auto& d : g_out) if (d.isDefault) g_autoPrev = d.id;
+                g_autoPrevMirror = g_mirror;
                 g_autoTarget = id;
-                SetDefaultDevice(id);
-                LoadEndpoints(eRender, g_out);
+                for (int k = 0; k < (int)g_out.size(); k++) if (g_out[k].id == id) { ClickOutput(k); break; }
             }
         }
         if (!g_autoTarget.empty() && !now.count(g_autoTarget)) {   // they disconnected
-            if (!g_multi && now.count(g_autoPrev)) { SetDefaultDevice(g_autoPrev); LoadEndpoints(eRender, g_out); }
+            if (now.count(g_autoPrev)) {
+                SetDefaultDevice(g_autoPrev); LoadEndpoints(eRender, g_out);
+                for (auto& m : g_autoPrevMirror) if (now.count(m) && m != g_autoPrev) g_mirror.insert(m);   // the speakers that played together before
+                if (!g_mirror.empty()) { SaveSettings(); RestartRouter(); }
+            }
+            g_autoPrevMirror.clear();
             g_autoTarget.clear(); g_autoPrev.clear();
         }
     }
     g_prevOutIds.clear(); for (auto& o : g_out) g_prevOutIds.insert(o.id);
     g_prevOutKnown = true;
-}
-static void SetMulti(bool on) {
-    if (on == g_multi) return;
-    g_multi = on;
-    if (!on) {   // back to just the main output; sync delays start fresh next time
-        if (!g_mirror.empty()) g_mirrorSaved = g_mirror;
-        for (auto& id : g_mirrorSaved) g_delay.erase(id);
-        for (auto& o : g_out) g_delay.erase(o.id);
-        g_mirror.clear();
-        g_calStatus.clear();
-    }
-    else {   // bring the last group back
-        int di = DefaultOut();
-        for (auto& id : g_mirrorSaved) if (di < 0 || g_out[di].id != id) for (auto& o : g_out) if (o.id == id) g_mirror.insert(id);
-    }
-    SaveSettings();
-    RestartRouter();
-    UpdateTrayTip();
 }
 static void ClickOutput(int i) {   // a click switches to that speaker alone, like Windows; several speakers live in Settings › Sound
     bool had = !g_mirror.empty();
@@ -4309,28 +4037,6 @@ static void ShowTrayMenu() {
     }
 }
 
-static void MenuCommand(int id) {
-    switch (id) {
-    case M_AWAKE: g_keepAwake = !g_keepAwake; ApplyKeepAwake(); SaveSettings(); break;
-    case M_STARTUP: SetStartup(!StartupEnabled()); break;
-    case M_RESTORE: g_restoreBright = !g_restoreBright; SaveSettings(); break;
-    case M_SOUND: HideFlyout(); ShellExecuteW(nullptr, L"open", L"ms-settings:sound", nullptr, nullptr, SW_SHOWNORMAL); return;
-    case M_DISPLAY: HideFlyout(); ShellExecuteW(nullptr, L"open", L"ms-settings:display", nullptr, nullptr, SW_SHOWNORMAL); return;
-    case M_EXIT: DestroyWindow(g_hwnd); return;
-    case M_SHORTCUTS: g_menuOpen = false; g_view = 1; g_scroll[3] = 0; g_hover = Hit(); break;
-    case M_SOLID: g_style = 0; SaveSettings(); ApplyStyle(); break;
-    case M_GLASS: g_style = 1; SaveSettings(); ApplyStyle(); break;
-    default:
-        if (id >= M_ACC0 && id < M_ACC0 + 7) {
-            static const int hues[7] = {0, 181, 113, 37, 346, 262, 0};
-            int k = id - M_ACC0; g_accentId = k ? 1 : 0;
-            if (k) { g_accentHue = hues[k]; g_accentSat = k == 6 ? 0 : 85; }
-            SaveSettings(); LoadTheme();
-        }
-        break;
-    }
-    InvalidateRect(g_hwnd, nullptr, FALSE);
-}
 
 // ---------------------------------------------------------------- refresh everything
 static void RefreshAll() {
@@ -4651,11 +4357,10 @@ static void DrawLinesAt(Graphics& g, const std::vector<std::wstring>& ls, Font* 
 
 static void PaintSettings(HDC hdc) {
     if (g_setW <= 0 || g_setH <= 0) return;
-    std::swap(T, g_setTheme);
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = g_setW; bi.bmiHeader.biHeight = -g_setH;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP dib = CanvasFor(g_cvSet, hdc, g_setW, g_setH, &bits);
+    if (!dib) return;
+    std::swap(T, g_setTheme);
     HDC mdc = CreateCompatibleDC(hdc);
     HGDIOBJ old = SelectObject(mdc, dib);
     RectF editRect;
@@ -5154,7 +4859,6 @@ static void PaintSettings(HDC hdc) {
     FadeApply(g_fadeSet, bits, g_setW, g_setH);
     BitBlt(hdc, 0, 0, g_setW, g_setH, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, old);
-    DeleteObject(dib);
     DeleteDC(mdc);
     std::swap(T, g_setTheme);
     if (g_edit) {   // keep the rename box on top of the profile's name
@@ -5207,7 +4911,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 77) { KillTimer(h, 77); InvalidateRect(h, nullptr, FALSE); return 0; }   // sliding pill frame
         if (wp == 78) {   // Settings › Sound: the apps playing right now, without opening the Apps tab
-            if (g_setPage != SP_SOUND || !IsWindowVisible(h) || g_rtDrag != RT_NONE) return 0;
+            if (g_setPage != SP_SOUND || !IsWindowVisible(h) || g_rtDrag != RT_NONE || g_dragEl >= 0 || g_ddOpen >= 0) return 0;   // never while something holds an app's place in the list
             static int tick = 0;
             if (++tick % 4 == 0 || g_apps.empty()) {
                 std::wstring selKey = g_rtSel >= 0 && g_rtSel < (int)g_apps.size() ? g_apps[g_rtSel].key : L"";
@@ -5295,11 +4999,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
         }
         case SK_SWITCH:
-            if (it.id == 10) { SetMulti(!g_multi); SettingsChanged(); }
-            else if (it.id == 11) { g_autoSwitch = !g_autoSwitch; g_newSeen |= 1 << 2; }
+            if (it.id == 11) { g_autoSwitch = !g_autoSwitch; g_newSeen |= 1 << 2; }
             else if (it.id == 12) { AudioRegSet(L"AccessibilityMonoMixState", MonoOn() ? 0 : 1); g_newSeen |= 1 << 3; }
             else if (it.id >= 100 && it.id - 100 < (int)g_mons.size()) { int mi = it.id - 100; g_dispStatus = SetHdr(mi, !g_mons[mi].hdr) ? L"" : L"Windows didn't change HDR for this screen"; BrightRequest(true, false); }
-            if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
+            else if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
             else if (it.id == 3) g_restoreBright = !g_restoreBright;
             else if (it.id == 4) g_osd = !g_osd;
@@ -5411,6 +5114,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
         if (g_edit) CommitRename(true);
         g_set = nullptr;
+        CanvasFree(g_cvSet); FadeFree(g_fadeSet);   // Settings closed: its frame buffers aren't needed
+        if (!g_visible && !g_pairHidden) FreeApps();   // the routing board's app list
         if (g_pairHidden) { g_pairHidden = false; HideFlyout(); }   // it was tucked away: close it properly
         else if (g_visible) SetForegroundWindow(g_hwnd);   // hand focus back so the panel closes normally again
         return 0;
@@ -5535,7 +5240,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_HOTKEY: if (wp >= 100 && (int)wp < 100 + (int)g_sc.size()) RunHotkey(g_sc[wp - 100].act, g_sc[wp - 100].param); return 0;
     case WM_APP_AUDIOCHANGED: SetTimer(h, TIMER_AUDIODEBOUNCE, 200, nullptr); return 0;
-    case WM_APP + 31: SaveSettings(); ApplyNight(); return 0;   // location for sunset to sunrise arrived
+    case WM_APP + 31:   // location for sunset to sunrise arrived
+        if (double* v = (double*)lp) { g_geoLat = v[0]; g_geoLon = v[1]; g_geoWhen = (long long)time(nullptr); delete[] v; }
+        SaveSettings(); ApplyNight(); return 0;
     case WM_APP_MONITORS: {
         if (!g_demo) CountScreens();
         MonMsg* m = (MonMsg*)lp;
@@ -5626,6 +5333,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             TrayPinSync(ticks <= 3);   // first ~20 s after start: restore your choice; afterwards: follow your changes
             SetTimer(h, TIMER_TRAYPIN, ticks < 3 ? 6000 : 60000, nullptr);
             return 0;
+        } else if (wp == TIMER_TRIM) {
+            KillTimer(h, TIMER_TRIM);
+            if (!g_visible && !g_set) {   // nothing on screen: free the frame buffers and let Windows reclaim idle memory
+                CanvasFree(g_cvFly); FadeFree(g_fadeFly);
+                SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+            }
+            return 0;
         } else if (wp == TIMER_UPDCHECK) {
             SetTimer(h, TIMER_UPDCHECK, 6 * 60 * 60 * 1000, nullptr);   // then every 6 hours
             CheckForUpdates();
@@ -5661,26 +5375,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (msg == WM_SYSKEYDOWN) return DefWindowProcW(h, msg, wp, lp);
         if (wp == VK_ESCAPE) {
-            if (g_menuOpen || g_ddOpen >= 0 || g_saveOpen || g_delayOpen >= 0) { g_menuOpen = false; g_ddOpen = -1; g_saveOpen = false; g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE); }
-            else if (g_view == 1) { g_view = 0; InvalidateRect(h, nullptr, FALSE); }
+            if (g_ddOpen >= 0 || g_delayOpen >= 0) { g_ddOpen = -1; g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE); }
+            else if (g_calShow && !g_calibrating) { g_calShow = false; g_calAsk = false; InvalidateRect(h, nullptr, FALSE); }   // Esc closes the Auto sync card first
             else HideFlyout();
-        } else if (wp == VK_TAB && g_view == 0) SetTab((g_tab + (GetKeyState(VK_SHIFT) < 0 ? 2 : 1)) % 3);
+        } else if (wp == VK_TAB) SetTab((g_tab + (GetKeyState(VK_SHIFT) < 0 ? 2 : 1)) % 3);
         else if (wp == VK_F5) RefreshAll();
         return 0;
     case WM_MOUSEMOVE: {
         float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
         if (g_dragEl >= 0 && g_dragEl < (int)g_els.size()) {
             SetElValue(g_els[g_dragEl], SliderValueAt(g_els[g_dragEl], x));
-            InvalidateRect(h, nullptr, FALSE);
-            return 0;
-        }
-        if (g_dragDelay) {
-            Layout();
-            RectF chip;
-            if (g_delayOpen >= 0 && DelayAnchor(chip)) {
-                RectF sl = DelaySlider(DelayPopup(chip));
-                g_delay[g_out[g_delayOpen].id] = (int)lround(std::max(0.f, std::min(1.f, (x - sl.X) / sl.Width)) * 50) * 10;
-            }
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
@@ -5702,17 +5406,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Layout();
         Hit ht = HitTest(x, y);
         // an open popup swallows the click that closes it
-        if (g_menuOpen && ht.h != H_MENU && ht.h != H_MENUBG) { g_menuOpen = false; InvalidateRect(h, nullptr, FALSE); return 0; }
         if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLSYNC && ht.h != H_DLRESET && ht.h != H_MENUBG) {
             bool same = ht.h == H_DELAYCHIP && ht.idx == g_delayOpen;
             g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE);
             if (same || ht.h != H_DELAYCHIP) return 0;
         }
-        if (g_capture >= 0 && ht.h != H_HKCHIP) { g_capture = -1; RegisterHotkeys(); InvalidateRect(h, nullptr, FALSE); }
-        if (g_saveOpen && ht.h != H_SAVEOPT && ht.h != H_MENUBG) {
-            g_saveOpen = false; InvalidateRect(h, nullptr, FALSE);
-            if (ht.h == H_PROFILE && ht.idx == ChipCount() - 1) return 0;
-        }
+        if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); InvalidateRect(h, nullptr, FALSE); }
         if (g_ddOpen >= 0 && ht.h != H_DDOPT && ht.h != H_MENUBG) {
             int btnKind = ht.h == H_DROPDOWN ? 0 : ht.h == H_RATEDD ? 1 : ht.h == H_INPUTDD ? 2 : ht.h == H_PROFDD ? 3 : ht.h == H_APPOUT ? 4 : ht.h == H_MODEDD ? 5 : -1;
             bool sameBtn = btnKind == g_ddKind && (btnKind == 3 || ht.idx == g_ddOpen);
@@ -5720,7 +5419,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (sameBtn || btnKind < 0) return 0;
         }
         switch (ht.h) {
-        case H_MENU: MenuCommand(ht.idx); return 0;
         case H_MENUBG: return 0;
         case H_DDOPT: {
             int idx = g_ddOpen, kind = g_ddKind, k = ht.idx;
@@ -5785,29 +5483,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_CALSTART: g_calAsk = false; StartAutoSync(); break;
         case H_CALCANCEL: if (g_calAsk) { g_calAsk = false; g_calShow = false; } else InterlockedExchange(&g_calCancel, 1); break;
         case H_CALDONE: g_calShow = false; g_calStatus.clear(); break;
-        case H_DELAYSL: {
-            RectF chip; if (!DelayAnchor(chip)) break;
-            RectF sl = DelaySlider(DelayPopup(chip));
-            g_dragDelay = true; SetCapture(h);
-            int ms = (int)lround(std::max(0.f, std::min(1.f, (x - sl.X) / sl.Width)) * 50) * 10;
-            g_delay[g_out[g_delayOpen].id] = ms;
-            break;
-        }
-        case H_BACK: g_view = 0; g_hover = Hit(); break;
-        case H_HKCHIP: g_capture = ht.idx; UnregisterHotkeys(); break;   // free all combos while recording
-        case H_OSD: g_osd = !g_osd; SaveSettings(); if (g_osd) ShowOsd(OSD_VOL, DefaultOut() >= 0 ? (int)lround(g_out[DefaultOut()].level * 100) : 0, false); break;
-        case H_STEP: { int vals[3] = {2, 5, 10}; g_step = vals[ht.idx]; SaveSettings(); break; }
-        case H_RESET: g_sc.clear(); RegisterHotkeys(); SaveSettings(); break;
-        case H_PROFILE:
-            if (ht.idx == ChipCount() - 1) g_saveOpen = true;
-            else if (ProfileEmpty(ht.idx)) SaveProfile(ht.idx);   // first click on an empty profile stores the current setup
-            else ApplyProfile(ht.idx);
-            break;
-        case H_SAVEOPT:
-            g_saveOpen = false;
-            if (ht.idx < (int)g_prof.size()) SaveProfile(ht.idx);
-            else { OpenSettings(2, true); return 0; }   // name a new profile in Settings
-            break;
         case H_GEAR:   // open Settings, or bring it to the front if it's already open
             if (g_set) PairShow(true);
             else OpenSettings(0, false);
@@ -5821,7 +5496,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SetElValue(g_els[ht.el], SliderValueAt(g_els[ht.el], x));
             break;
         case H_MUTE: ToggleMute(g_els[ht.el]); break;
-        case H_MULTI: SetMulti(!g_multi); break;
         case H_ROW: {
             El& e = g_els[ht.el];
             if (e.k == E_OUT) ClickOutput(e.idx);
@@ -5838,13 +5512,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_dragEl < (int)g_els.size() && g_els[g_dragEl].k == E_MONNL) SaveSettings();
             g_dragEl = -1; ReleaseCapture(); InvalidateRect(h, nullptr, FALSE);
         }
-        if (g_dragDelay) { g_dragDelay = false; ReleaseCapture(); SaveSettings(); RestartRouter(); InvalidateRect(h, nullptr, FALSE); }
         return 0;
     case WM_CAPTURECHANGED:
         if (g_dragEl >= 0 && (HWND)lp != h) { g_dragEl = -1; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     case WM_MOUSEWHEEL: {
-        if (g_menuOpen || g_ddOpen >= 0 || g_saveOpen || g_delayOpen >= 0) return 0;
+        if (g_ddOpen >= 0 || g_delayOpen >= 0) return 0;
         POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(h, &pt);
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
