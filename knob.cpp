@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.38.0"
+#define APP_VERSION L"1.38.1"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4547,6 +4547,7 @@ static void PaintSettings(HDC hdc) {
             float ih = S(32), ph = ih * ddPopOpts.size() + S(8);
             RectF pop(ddPopBtn.X, ddPopBtn.Y + ddPopBtn.Height + S(4), ddPopBtn.Width, ph);
             if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
+            if (pop.Y < S(8)) pop.Y = std::max(S(8), g_setH - S(8) - ph);              // no room either way: as much of the window as it needs
             for (int i = 0; i < (int)ddPopOpts.size(); i++) add(SK_DDOPT, ddPopId * 100 + i, RectF(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih));
             float pt = PopT(g_paSetDD, ddPopId);
             DrawPopAnimated(g, g_paSetDD, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
