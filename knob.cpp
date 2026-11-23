@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.7"
+#define APP_VERSION L"1.39.8"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -182,6 +182,7 @@ struct AppGroup {
     BOOL mute = FALSE;
     float peak = 0;
     bool onMain = false;   // has a session on the main speaker: what Windows' own volume mixer lists
+    bool active = false;   // Windows says its sound is running right now
 };
 struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
@@ -842,6 +843,7 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
                                 }
                                 g_apps[it->second].vols.push_back(sv);
                                 if (isMain) g_apps[it->second].onMain = true;
+                                if (st == AudioSessionStateActive) g_apps[it->second].active = true;
                                 if (!sys && std::find(g_apps[it->second].pids.begin(), g_apps[it->second].pids.end(), pid) == g_apps[it->second].pids.end())
                                     g_apps[it->second].pids.push_back(pid);
                                 Meter* mi = nullptr;
@@ -875,10 +877,23 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
     }
     if (gone) RestartAppRouters();
     if (all) return;
-    // same list as Windows' volume mixer: apps on the main speaker (playing or paused). Apps you sent to another speaker stay too.
+    // same list as Windows' volume mixer: apps on the main speaker that are playing, or paused with a window open
+    // (a paused browser stays; background helpers like Biometric Enrollment Host don't). Apps you sent to another speaker stay too.
+    std::set<std::wstring> withWindow;   // programs that have a window on screen
+    { std::map<DWORD, bool> seen;
+      struct C { std::set<std::wstring>* w; std::map<DWORD, bool>* seen; } c{&withWindow, &seen};
+      EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+          auto* c = (C*)lp;
+          if (!IsWindowVisible(w) || GetWindow(w, GW_OWNER)) return TRUE;
+          DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+          if ((*c->seen)[pid]) return TRUE;
+          (*c->seen)[pid] = true;
+          std::wstring path = ProcPath(pid); if (!path.empty()) c->w->insert(ToLower(path));
+          return TRUE; }, (LPARAM)&c); }
     for (size_t i = g_apps.size(); i-- > 0;) {
         AppGroup& a = g_apps[i];
-        if (a.system || a.onMain || !a.outId.empty() || g_appExtra.count(a.key)) continue;
+        if (a.system || !a.outId.empty() || g_appExtra.count(a.key)) continue;
+        if (a.onMain && (a.active || withWindow.count(a.key))) continue;
         for (auto* v : a.vols) v->Release();
         for (auto* m : a.meters) m->Release();
         g_apps.erase(g_apps.begin() + i);
@@ -3618,9 +3633,15 @@ static void PairHide() {   // Settings lost the foreground to another app: tuck 
     g_pairHidden = true;
     ShowWindow(g_hwnd, SW_HIDE);
 }
+static void PairBack() {   // you clicked another app: panel and Settings both stay on screen, behind that app like normal windows
+    if (!g_set || !g_visible || g_pairHidden) return;
+    SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(g_set, g_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // Settings sits right under the panel
+}
 static void PairShow(bool activateSettings) {   // Settings came back: bring the panel back beside it
     if (!g_set) return;
     if (g_pairHidden) { g_pairHidden = false; ShowWindow(g_hwnd, SW_SHOWNOACTIVATE); InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (g_visible) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     if (activateSettings) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
 }
 static void HideFlyout();
@@ -4971,7 +4992,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         g_setW = LOWORD(lp); g_setH = HIWORD(lp); SetPageScroll(g_setScroll); InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_ACTIVATE:   // the panel follows Settings: back when Settings comes forward, away when another app takes over
         if (LOWORD(wp) != WA_INACTIVE) PairShow(false);
-        else if ((HWND)lp != g_hwnd) PairHide();
+        else if ((HWND)lp != g_hwnd) PairBack();
         break;
     case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); PaintSettings(dc); EndPaint(h, &ps); return 0; }
     case WM_ERASEBKGND: return 1;
@@ -5405,7 +5426,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE && g_visible) {
             if (!g_set) HideFlyout();
-            else if ((HWND)lp != g_set) PairHide();   // clicked another app: panel and Settings step back together
+            else if ((HWND)lp != g_set) PairBack();   // clicked another app: panel and Settings step back together, both still visible
         }
         return 0;
     case WM_SYSKEYDOWN:
