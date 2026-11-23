@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.0"
+#define APP_VERSION L"1.37.1"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -1221,7 +1221,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
                 if (CalRound(outDev, micDev, k, chirp, oSecond) == 0 && fabs(oSecond - off) < 15) off = (off + oSecond) / 2;
                 int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
                 if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
-                if (nd < -10 && g_calPass) notes += t.name + L" is still slower than the main output. ";
+                if (nd < -10 && g_calPass) notes += t.name + L" couldn't be lined up fully. ";
                 nd = std::max(0, std::min(500, nd));
                 res->delays.push_back({t.id, nd});
                 ok++;
@@ -1231,9 +1231,9 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
         }
         if (res->status.empty() && worst < -10 && !g_calPass) {   // let Knob make the slowest speaker the main output, then sync again
             res->swapTo = worstId; res->swapName = worstName; res->delays.clear();
-            res->status = L"Making " + worstName + L" the main output, then syncing again\u2026";
+            res->status = L"Syncing\u2026 keep the room quiet";   // the slowest speaker quietly becomes the one Windows plays on, then a second pass
         }
-        if (res->status.empty()) res->status = ok ? (std::wstring(g_calPass ? L"Made the slowest speaker the main output. " : L"") + L"Synced " + std::to_wstring(ok) + (ok == 1 ? L" output. " : L" outputs. ") + notes) : notes;
+        if (res->status.empty()) res->status = ok ? L"In sync \u00b7 " + std::to_wstring(ok + 1) + L" speakers lined up. " + notes : notes;
     } while (0);
     if (micDev) micDev->Release();
     if (outDev) outDev->Release();
@@ -4286,7 +4286,7 @@ static void PaintSettings(HDC hdc) {
                         FillRound(g, isHover(SK_RTDELAY, i) || g_editDelay == i ? T.subtle3 : T.subtle2, pr, S(11));
                         if (g_editDelay != i) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", DelayFor(o.id)); PillText(g, t, g_fSmall600, T.accent, pr, StringAlignmentCenter); }
                     }
-                    std::wstring sub = (SelectedOutCount() > 1 && o.isDefault ? L"Main \u00b7 " : L"") + (o.bt ? std::wstring(L"Bluetooth") : o.detail);
+                    std::wstring sub = o.bt ? std::wstring(L"Bluetooth") : o.detail;
                     Text(g, OutLabel(o).c_str(), &fBody, T.t1, RectF(r.X + S(48), r.Y + S(5), r.Width - S(56) - right, S(22)));
                     Text(g, sub.c_str(), &fDesc, T.t3, RectF(r.X + S(48), r.Y + S(25), r.Width - S(56) - right, S(18)));
                     SolidBrush db(used ? T.accent : T.t3); PointF d = dotL(i); g.FillEllipse(&db, d.X - S(5), d.Y - S(5), S(10), S(10));
