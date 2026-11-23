@@ -44,8 +44,8 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.32.0"
-#define APP_VERNUM  ((1 << 16) | (32 << 8) | 0)
+#define APP_VERSION L"1.33.0"
+#define APP_VERNUM  ((1 << 16) | (33 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1660,10 +1660,15 @@ static RectF RefreshRect() { RectF i = IdentRect(); return RectF(i.X - S(10) - S
 static RectF MicAllRect() { RectF r = RefreshRect(); return RectF(r.X - S(10) - S(32), r.Y, S(32), S(32)); }
 static int g_delayOpen = -1;     // output whose sync-delay popup is open
 static bool g_dragDelay = false;
-static RectF AppOutChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(156), e.r.Y + S(8), S(156), S(26)); }
+static std::map<int, float> g_appChipW;   // measured when drawn: the chip is as wide as its label, up to a limit
+static RectF AppOutChip(const El& e) { auto it = g_appChipW.find(e.idx); float w = it != g_appChipW.end() ? it->second : S(150); return RectF(e.r.X + e.r.Width - S(6) - w, e.r.Y + S(8), w, S(26)); }
 static bool AnyAppRouted() { for (auto& a : g_apps) if (!a.outId.empty()) return true; return false; }
 static RectF ResetOutRect(const El& e) { return RectF(e.r.X + e.r.Width - S(110), e.r.Y - S(5), S(106), e.r.Height + S(10)); }
-static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return o.name; return L"Default output"; }
+static std::wstring OutLabel(const Endpoint& o) {   // the device's name; add its type when two devices share a name
+    int same = 0; for (auto& x : g_out) if (x.name == o.name) same++;
+    return same > 1 && !o.detail.empty() ? o.name + L" \u00b7 " + o.detail : o.name;
+}
+static std::wstring OutName(const std::wstring& id) { for (auto& o : g_out) if (o.id == id) return OutLabel(o); return L"Default output"; }
 static RectF DelayChip(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(104), e.r.Y + S(8), S(104), S(26)); }
 static bool DelayAnchor(RectF& chip) { for (auto& e : g_els) if (e.k == E_OUT && e.idx == g_delayOpen) { chip = DelayChip(e); return true; } return false; }
 static RectF DelayPopup(const RectF& chip) {
@@ -1740,7 +1745,7 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
     if (g_ddKind == 4) {   // where an app plays
         if (g_ddOpen < 0 || g_ddOpen >= (int)g_apps.size()) return o;
         o.push_back(L"Default output"); cur = 0;
-        for (size_t i = 0; i < g_out.size(); i++) { o.push_back(g_out[i].name); if (g_out[i].id == g_apps[g_ddOpen].outId) cur = (int)i + 1; }
+        for (size_t i = 0; i < g_out.size(); i++) { o.push_back(OutLabel(g_out[i])); if (g_out[i].id == g_apps[g_ddOpen].outId) cur = (int)i + 1; }
         return o;
     }
     if (g_ddOpen < 0 || g_ddOpen >= (int)g_mons.size()) return o;
@@ -2346,10 +2351,14 @@ static void DrawEl(Graphics& g, int index) {
         }
         float nx = e.r.X + S(8) + S(32) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
         if (e.k == E_APP && !g_apps[e.idx].system && AppRouteReady()) {   // where this app plays
+            bool routed = !g_apps[e.idx].outId.empty();
+            {
+                std::wstring lbl = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
+                g_appChipW[e.idx] = std::max(S(96), std::min(S(170), S(32) + TextW(g, lbl.c_str(), g_fSmall) + S(14)));
+            }
             RectF c = AppOutChip(e);
             maxW = c.X - S(8) - nx;
             bool hov = hovEl && g_hover.h == H_APPOUT, open = g_ddOpen == e.idx && g_ddKind == 4;
-            bool routed = !g_apps[e.idx].outId.empty();
             FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, c, c.Height / 2);
             Glyph(g, G_VOLUME, g_fIconS, routed ? T.accent : T.t2, c.X + S(17), c.Y + c.Height / 2);
             std::wstring on = routed ? OutName(g_apps[e.idx].outId) : L"Default output";
@@ -2504,7 +2513,50 @@ static void DrawEl(Graphics& g, int index) {
     DrawValue(g, CtlVal(e, cy), (int)lround(v * 100));
 }
 
-static void DrawDropdown(Graphics& g) {
+// ---- small motion: popups open with a short fade + slide, the tab pill glides between tabs
+enum { TIMER_POP = 12 };
+static const DWORD POP_MS = 170, TAB_MS = 240;
+struct PopAnim { long long key = LLONG_MIN; DWORD start = 0; };
+static PopAnim g_paDD, g_paDelay, g_paMenu, g_paSave, g_paSetDD;
+static bool g_animating = false;
+static DWORD g_tabStart = 0; static float g_tabFrom = 0, g_tabTo = 0;
+static void KickAnim() { if (g_hwnd) SetTimer(g_hwnd, TIMER_POP, 15, nullptr); }
+static float PopT(PopAnim& a, long long key) {
+    if (key != a.key) { a.key = key; a.start = GetTickCount(); KickAnim(); }
+    float t = (GetTickCount() - a.start) / (float)POP_MS;
+    if (t < 1) { g_animating = true; return t; }
+    return 1.f;
+}
+static float TabPos() {
+    if (!g_tabStart) return (float)g_tab;
+    float t = (GetTickCount() - g_tabStart) / (float)TAB_MS;
+    if (t >= 1) return g_tabTo;
+    g_animating = true;
+    float e = t < 0.5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2;   // ease in-out
+    return g_tabFrom + (g_tabTo - g_tabFrom) * e;
+}
+template <class F> static void DrawPopAnimated(Graphics& g, RectF box, float t, bool opensUp, F draw) {
+    if (t >= 1) { draw(g); return; }
+    float e = 1 - (1 - t) * (1 - t) * (1 - t);   // ease out
+    float m = S(20);
+    int bw = (int)ceilf(box.Width + 2 * m), bh = (int)ceilf(box.Height + 2 * m);
+    Bitmap bmp(bw, bh, PixelFormat32bppPARGB);
+    {
+        Graphics bg(&bmp);
+        bg.SetSmoothingMode(SmoothingModeAntiAlias);
+        bg.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        bg.TranslateTransform(m - box.X, m - box.Y);
+        draw(bg);
+    }
+    ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, e, 0}, {0, 0, 0, 0, 1}}};
+    ImageAttributes ia; ia.SetColorMatrix(&cm);
+    float sc = 0.95f + 0.05f * e, slide = (1 - e) * S(8) * (opensUp ? 1 : -1);
+    float dw = bw * sc, dh = bh * sc;
+    float ax = box.X - m + bw / 2.f, ay = opensUp ? box.Y - m + bh : box.Y - m;   // grows from the edge next to its button
+    g.DrawImage(&bmp, RectF(ax - dw / 2, (opensUp ? ay - dh : ay) + slide, dw, dh), 0, 0, (REAL)bw, (REAL)bh, UnitPixel, &ia);
+}
+
+static void DrawDropdownBody(Graphics& g) {
     RectF btn;
     if (!DropdownRect(btn)) return;
     RectF pop = DropdownPopup(btn);
@@ -2524,7 +2576,7 @@ static void DrawDropdown(Graphics& g) {
     }
 }
 
-static void DrawDelayPopup(Graphics& g) {
+static void DrawDelayPopupBody(Graphics& g) {
     RectF chip;
     if (g_delayOpen < 0 || !DelayAnchor(chip)) return;
     RectF pop = DelayPopup(chip);
@@ -2538,7 +2590,7 @@ static void DrawDelayPopup(Graphics& g) {
     Text(g, L"Delays this output so it lines up with the others", g_fSmall, T.t3, RectF(pop.X + S(16), pop.Y + S(66), pop.Width - S(32), S(22)));
 }
 
-static void DrawSavePopup(Graphics& g) {
+static void DrawSavePopupBody(Graphics& g) {
     RectF chip;
     if (!g_saveOpen || !SaveAnchor(chip)) return;
     RectF pop = SavePopup(chip);
@@ -2555,9 +2607,7 @@ static void DrawSavePopup(Graphics& g) {
     }
 }
 
-static void DrawMenu(Graphics& g) {
-    if (!g_menuOpen) return;
-    BuildMenu();
+static void DrawMenuBody(Graphics& g) {
     float rad = S(10);
     Shadow(g, g_menuBox, rad);
     FillRound(g, T.popup, g_menuBox, rad);
@@ -2606,10 +2656,38 @@ static void DrawMenu(Graphics& g) {
     }
 }
 
+static void DrawDropdown(Graphics& g) {
+    RectF btn;
+    if (!DropdownRect(btn)) { g_paDD.key = LLONG_MIN; return; }
+    RectF pop = DropdownPopup(btn);
+    float t = PopT(g_paDD, (long long)g_ddKind * 100000 + g_ddOpen);
+    DrawPopAnimated(g, pop, t, pop.Y < btn.Y, [&](Graphics& gg) { DrawDropdownBody(gg); });
+}
+static void DrawDelayPopup(Graphics& g) {
+    RectF chip;
+    if (g_delayOpen < 0 || !DelayAnchor(chip)) { g_paDelay.key = LLONG_MIN; return; }
+    RectF pop = DelayPopup(chip);
+    float t = PopT(g_paDelay, g_delayOpen);
+    DrawPopAnimated(g, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawDelayPopupBody(gg); });
+}
+static void DrawSavePopup(Graphics& g) {
+    RectF chip;
+    if (!g_saveOpen || !SaveAnchor(chip)) { g_paSave.key = LLONG_MIN; return; }
+    RectF pop = SavePopup(chip);
+    float t = PopT(g_paSave, 1);
+    DrawPopAnimated(g, pop, t, pop.Y < chip.Y, [&](Graphics& gg) { DrawSavePopupBody(gg); });
+}
+static void DrawMenu(Graphics& g) {
+    if (!g_menuOpen) { g_paMenu.key = LLONG_MIN; return; }
+    BuildMenu();
+    float t = PopT(g_paMenu, 1);
+    DrawPopAnimated(g, g_menuBox, t, true, [&](Graphics& gg) { DrawMenuBody(gg); });
+}
+
 static bool g_dwmRound = false;
 
 // Smooth changes: when the theme, style or accent changes, both windows fade from the old look to the new one.
-struct Fade { std::vector<BYTE> last, from; int w = 0, h = 0; DWORD start = 0; bool on = false; };
+struct Fade { std::vector<BYTE> last, from; int w = 0, h = 0; DWORD start = 0; bool on = false; int top = 0; };
 static Fade g_fadeFly, g_fadeSet;
 static const DWORD FADE_MS = 220;
 enum { TIMER_FADE = 11 };
@@ -2622,13 +2700,18 @@ static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after draw
         else {
             t = t * t * (3 - 2 * t);   // ease in-out
             int a = (int)(t * 256);
-            for (size_t i = 0; i < n; i++) bits[i] = (BYTE)(f.from[i] + (((int)bits[i] - (int)f.from[i]) * a >> 8));
+            for (size_t i = (size_t)std::max(0, std::min(h, f.top)) * w * 4; i < n; i++) bits[i] = (BYTE)(f.from[i] + (((int)bits[i] - (int)f.from[i]) * a >> 8));
         }
     }
     f.last.swap(fresh); f.w = w; f.h = h;
 }
 static void StartFade() {
-    for (Fade* f : {&g_fadeFly, &g_fadeSet}) if (!f->last.empty()) { f->from = f->last; f->start = GetTickCount(); f->on = true; }
+    for (Fade* f : {&g_fadeFly, &g_fadeSet}) if (!f->last.empty()) { f->from = f->last; f->start = GetTickCount(); f->on = true; f->top = 0; }
+    if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
+}
+static void StartPaneFade() {   // tab switch: cross-fade the content under the tabs only
+    if (g_fadeFly.last.empty()) return;
+    g_fadeFly.from = g_fadeFly.last; g_fadeFly.start = GetTickCount(); g_fadeFly.on = true; g_fadeFly.top = (int)S(54);
     if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
 }
 static void Paint(HDC hdc) {
@@ -2679,13 +2762,16 @@ static void Paint(HDC hdc) {
         FillRound(g, T.tabsBg, RectF(S(12), S(12), g_W - S(24), S(38)), S(8));
         const wchar_t* names[3] = {L"Sound", L"Apps", L"Display"};
         wchar_t glyphs[3] = {G_VOLUME, G_APPS, G_BRIGHT};
+        {   // the selected pill glides from tab to tab
+            RectF r0 = TabRect(0), r1 = TabRect(1);
+            RectF pr(r0.X + TabPos() * (r1.X - r0.X), r0.Y, r0.Width, r0.Height);
+            if (!T.glass) FillRound(g, Color(T.dark ? 40 : 30, 0, 0, 0), RectF(pr.X, pr.Y + S(1), pr.Width, pr.Height), S(6));
+            FillRound(g, T.tabSel, pr, S(6));
+        }
         for (int i = 0; i < 3; i++) {
             RectF r = TabRect(i);
             bool sel = g_tab == i, hov = g_hover.h == H_TAB && g_hover.idx == i;
-            if (sel) {
-                if (!T.glass) FillRound(g, Color(T.dark ? 40 : 30, 0, 0, 0), RectF(r.X, r.Y + S(1), r.Width, r.Height), S(6));
-                FillRound(g, T.tabSel, r, S(6));
-            } else if (hov) FillRound(g, T.hover, r, S(6));
+            if (!sel && hov && fabsf(TabPos() - i) > 0.5f) FillRound(g, T.hover, r, S(6));
             Font* f = sel ? g_fTab600 : g_fTab;
             float tw = TextW(g, names[i], f), total = S(15) + S(8) + tw, sx = r.X + (r.Width - total) / 2;
             Glyph(g, glyphs[i], g_fIconS, T.t1, sx + S(7.5f), r.Y + r.Height / 2);
@@ -2962,7 +3048,9 @@ static void HideFlyout() {
 
 static void SetTab(int t) {
     if (t == g_tab) return;
+    g_tabFrom = TabPos(); g_tabTo = (float)t; g_tabStart = GetTickCount();
     g_tab = t;
+    StartPaneFade(); KickAnim();
     g_hover = Hit(); g_ddOpen = -1; g_menuOpen = false; g_saveOpen = false; g_delayOpen = -1;
     if (t == T_APPS) { LoadApps(); UpdatePeaks(); }
     if (t == T_DISPLAY) BrightRequest(!g_monsLoaded, g_monsLoaded);
@@ -3685,16 +3773,19 @@ static void PaintSettings(HDC hdc) {
             float ih = S(32), ph = ih * ddPopOpts.size() + S(8);
             RectF pop(ddPopBtn.X, ddPopBtn.Y + ddPopBtn.Height + S(4), ddPopBtn.Width, ph);
             if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
-            FillRound(g, Color(60, 0, 0, 0), RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height), S(8));
-            FillRound(g, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
-            for (int i = 0; i < (int)ddPopOpts.size(); i++) {
-                RectF it(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih);
-                add(SK_DDOPT, ddPopId * 100 + i, it);
-                if (i == ddPopCur) { FillRound(g, T.subtle, it, S(5)); FillRound(g, T.accent, RectF(it.X, it.Y + S(9), S(3), S(14)), S(1.5f)); }
-                else if (isHover(SK_DDOPT, ddPopId * 100 + i)) FillRound(g, T.subtle2, it, S(5));
-                Text(g, ddPopOpts[i].c_str(), &fDesc, T.t1, RectF(it.X + S(12), it.Y, it.Width - S(16), it.Height));
-            }
-        }
+            for (int i = 0; i < (int)ddPopOpts.size(); i++) add(SK_DDOPT, ddPopId * 100 + i, RectF(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih));
+            float pt = PopT(g_paSetDD, ddPopId);
+            DrawPopAnimated(g, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
+                FillRound(gg, Color(60, 0, 0, 0), RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height), S(8));
+                FillRound(gg, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
+                for (int i = 0; i < (int)ddPopOpts.size(); i++) {
+                    RectF it(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih);
+                    if (i == ddPopCur) { FillRound(gg, T.subtle, it, S(5)); FillRound(gg, T.accent, RectF(it.X, it.Y + S(9), S(3), S(14)), S(1.5f)); }
+                    else if (isHover(SK_DDOPT, ddPopId * 100 + i)) FillRound(gg, T.subtle2, it, S(5));
+                    Text(gg, ddPopOpts[i].c_str(), &fDesc, T.t1, RectF(it.X + S(12), it.Y, it.Width - S(16), it.Height));
+                }
+            });
+        } else g_paSetDD.key = LLONG_MIN;
         g_setContentH = y + g_setScroll + S(24);
         g.ResetClip();
         float view = (float)g_setH;
@@ -4028,6 +4119,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TIMER_POP) {
+            bool still = g_animating; g_animating = false;
+            if (!still) { KillTimer(h, TIMER_POP); return 0; }
+            if (g_visible) InvalidateRect(h, nullptr, FALSE);
+            if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+            return 0;
+        }
         if (wp == TIMER_FADE) {
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
