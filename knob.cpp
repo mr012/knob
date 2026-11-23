@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.4"
+#define APP_VERSION L"1.39.5"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4192,6 +4192,8 @@ static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"
 static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
 enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT, SK_HKDEL, SK_HKADD, SK_RTSRC, SK_RTDST, SK_RTDELAY, SK_NLSL };
 static int g_sddOpen = -1;
+static float g_sddScroll = 0, g_sddMax = 0;   // an open list taller than the window scrolls on its own
+static RectF g_sddRect;
 static float g_segPos[3] = {-1, -1, -1};   // animated pill position: theme, style, accent
 static float SegPos(int which, int target) {   // eases towards the selected option; keeps repainting until it gets there
     float& p = g_segPos[which];
@@ -4834,22 +4836,37 @@ static void PaintSettings(HDC hdc) {
         }
         }
         if (ddPopId >= 0) {   // open dropdown list, on top of everything
-            float ih = S(32), ph = ih * ddPopOpts.size() + S(8);
+            float ih = S(32), full = ih * ddPopOpts.size() + S(8);
+            static int lastPop = -1; if (lastPop != ddPopId) { lastPop = ddPopId; g_sddScroll = 0; }
+            float ph = std::min(full, g_setH - S(16));
+            g_sddMax = full - ph; g_sddScroll = std::max(0.f, std::min(g_sddScroll, g_sddMax));
+            float sc = g_sddScroll;
             float pw = ddPopBtn.Width; for (auto& o : ddPopOpts) pw = std::max(pw, S(28) + tw(o.c_str(), &fDesc));
             pw = std::min(pw, cw);
             RectF pop(std::min(ddPopBtn.X, x0 + cw - pw), ddPopBtn.Y + ddPopBtn.Height + S(4), pw, ph);
             if (pop.Y + pop.Height > g_setH - S(8)) pop.Y = ddPopBtn.Y - S(4) - ph;   // no room below: open upwards
             if (pop.Y < S(8)) pop.Y = std::max(S(8), g_setH - S(8) - ph);              // no room either way: as much of the window as it needs
-            for (int i = 0; i < (int)ddPopOpts.size(); i++) add(SK_DDOPT, ddPopId * 100 + i, RectF(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih));
+            g_sddRect = pop;
+            for (int i = 0; i < (int)ddPopOpts.size(); i++) {
+                RectF it(pop.X + S(4), pop.Y + S(4) + i * ih - sc, pop.Width - S(8), ih);
+                if (it.Y + it.Height > pop.Y && it.Y < pop.Y + pop.Height) add(SK_DDOPT, ddPopId * 100 + i, it);   // only rows you can see are clickable
+            }
             float pt = PopT(g_paSetDD, ddPopId);
             DrawPopAnimated(g, g_paSetDD, pop, pt, pop.Y < ddPopBtn.Y, [&](Graphics& gg) {
                 FillRound(gg, Color(70, 0, 0, 0), RectF(pop.X - S(1), pop.Y + S(3), pop.Width + S(2), pop.Height + S(2)), S(9));
                 FillRound(gg, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), pop, S(8));
+                Region keep; gg.GetClip(&keep);
+                gg.IntersectClip(RectF(pop.X, pop.Y + S(2), pop.Width, pop.Height - S(4)));
                 for (int i = 0; i < (int)ddPopOpts.size(); i++) {
-                    RectF it(pop.X + S(4), pop.Y + S(4) + i * ih, pop.Width - S(8), ih);
+                    RectF it(pop.X + S(4), pop.Y + S(4) + i * ih - sc, pop.Width - S(8), ih);
                     if (i == ddPopCur) { FillRound(gg, T.subtle, it, S(5)); FillRound(gg, T.accent, RectF(it.X, it.Y + S(9), S(3), S(14)), S(1.5f)); }
                     else if (isHover(SK_DDOPT, ddPopId * 100 + i)) FillRound(gg, T.subtle2, it, S(5));
                     Text(gg, ddPopOpts[i].c_str(), &fDesc, T.t1, RectF(it.X + S(12), it.Y, it.Width - S(16), it.Height));
+                }
+                gg.SetClip(&keep);
+                if (g_sddMax > 0) {   // thin bar showing where you are in the list
+                    float th = std::max(S(24), pop.Height * pop.Height / full), ty = pop.Y + S(4) + (pop.Height - S(8) - th) * (sc / g_sddMax);
+                    FillRound(gg, T.t3, RectF(pop.X + pop.Width - S(5), ty, S(3), th), S(1.5f));
                 }
             });
         } else ClosePop(g, g_paSetDD);
@@ -5087,6 +5104,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_sDragNl >= 0) { g_sDragNl = -1; ReleaseCapture(); SaveSettings(); SettingsChanged(); }
         return 0;
     case WM_MOUSEWHEEL:
+        if (g_sddOpen >= 0) {   // a list is open: the wheel moves the list (if it scrolls), never the page behind it
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; ScreenToClient(h, &pt);
+            if (g_sddMax > 0 && g_sddRect.Contains((float)pt.x, (float)pt.y)) {
+                g_sddScroll = std::max(0.f, std::min(g_sddMax, g_sddScroll - GET_WHEEL_DELTA_WPARAM(wp) / 120.f * S(64)));
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        }
         SetPageScroll(g_setScroll - GET_WHEEL_DELTA_WPARAM(wp) / 120.f * S(60));
         InvalidateRect(h, nullptr, FALSE);
         return 0;
