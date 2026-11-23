@@ -44,13 +44,13 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.36.0"
+#define APP_VERSION L"1.37.0"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -87,7 +87,7 @@ static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open or close Knob", L"Open on Sou
 static const wchar_t* HK_KEYS[HK_COUNT] = {L"open", L"tabsound", L"tabapps", L"tabdisplay", L"nextout", L"volup", L"voldown", L"mute", L"mic",
     L"appmute", L"briup", L"bridown", L"nextprof", L"screenoff", L"sync"};
 static const HotKey HK_DEFAULT[HK_COUNT] = {};   // no shortcut until the user picks one
-static bool HkShown(int i) { return i <= HK_TABDISPLAY; }   // the open-on actions always have a row; others once added
+static bool HkShown(int) { return false; }   // a shortcut has a row only once it has keys (or is waiting for them); delete removes the row
 static bool g_noSave = false, g_restartAfterExit = false;
 static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
 static int g_openOn = 0;             // where the panel opens: 0 main display (like Windows' own flyouts), 1 the screen with the mouse
@@ -113,6 +113,9 @@ static bool g_restoreBright = true;                                // put each m
 static std::map<std::wstring, std::pair<int, int>> g_lastMon;       // monitor name -> last brightness / contrast
 static std::map<std::wstring, int> g_delay;                         // output id -> sync delay (ms)
 static bool g_restoreAllNext = false;                               // after resume: treat every monitor as reconnected
+struct NightCfg { bool on = false; int str = 40; };
+static std::map<std::wstring, NightCfg> g_night;   // monitor name -> night light
+static int g_nightAuto = 0;                        // 0 whenever it's switched on, 1 evenings only (7 pm - 7 am)
 
 static int g_dpi = 96;
 static float g_scale = 1.f;
@@ -188,6 +191,7 @@ static std::set<std::wstring> g_mirrorSaved;   // the group to bring back when M
 static bool g_multi = false;   // Multi on: clicking outputs adds/removes them; off: clicking switches output
 
 struct MonUI { std::wstring name, detail, gdi; int pct = 0, con = 50, orient = 0; bool ok = false, hasCon = false, internal = false; RECT rc{};
+               int cloneOf = -1; LUID adapter{}; UINT32 target = 0; bool hdrOk = false, hdr = false;   // duplicate of another screen; HDR
                std::vector<int> rates; int rate = 0; std::vector<int> inputs; int input = -1; };
 struct MonMsg { int gen; bool fromEnum; std::vector<MonUI> mons; };
 static std::vector<MonUI> g_mons;
@@ -314,6 +318,7 @@ static void LoadSettings() {
     g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
     g_openOn = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"openon", 0, g_iniPath.c_str())));
     g_autoSwitch = GetPrivateProfileIntW(L"main", L"autoswitch", 1, g_iniPath.c_str()) != 0;
+    g_nightAuto = GetPrivateProfileIntW(L"main", L"nightauto", 0, g_iniPath.c_str()) ? 1 : 0;
     { wchar_t cb[512] = {}; GetPrivateProfileStringW(L"main", L"calldev", L"", cb, 512, g_iniPath.c_str()); g_callDev = cb; }
     {   // sections stored as key=value lists
         auto readSection = [&](const wchar_t* sec, auto fn) {
@@ -325,6 +330,8 @@ static void LoadSettings() {
             }
         };
         readSection(L"delay", [](const std::wstring& k, const std::wstring& v) { g_delay[k] = _wtoi(v.c_str()); });
+        readSection(L"nightlight", [](const std::wstring& k, const std::wstring& v) {
+            int on = 0, st = 40; if (swscanf(v.c_str(), L"%d,%d", &on, &st) >= 1) g_night[k] = {on != 0, std::max(0, std::min(100, st))}; });
         readSection(L"lastdisplay", [](const std::wstring& k, const std::wstring& v) {
             int b = -1, c = -1; if (swscanf(v.c_str(), L"%d,%d", &b, &c) >= 1) g_lastMon[k] = {b, c}; });
     }
@@ -372,6 +379,9 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"theme", std::to_wstring(g_themeMode).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"openon", std::to_wstring(g_openOn).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"nightauto", g_nightAuto ? L"1" : L"0", g_iniPath.c_str());
+    { std::wstring n; for (auto& kv : g_night) { n += kv.first + L"=" + (kv.second.on ? L"1," : L"0,") + std::to_wstring(kv.second.str); n.push_back(0); } n.push_back(0);
+      WritePrivateProfileSectionW(L"nightlight", n.c_str(), g_iniPath.c_str()); }
     WritePrivateProfileStringW(L"main", L"calldev", g_callDev.c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"keepawake", g_keepAwake ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"tab", std::to_wstring(g_tab).c_str(), g_iniPath.c_str());
@@ -1251,6 +1261,7 @@ static void StartAutoSync() {
 // ---------------------------------------------------------------- display worker (DDC/CI + WMI + orientation)
 struct Mon {
     std::wstring name, detail, gdi; HANDLE phys = nullptr; bool wmi = false, internal = false, ok = false, hasCon = false;
+    int cloneOf = -1; LUID adapter{}; UINT32 target = 0; bool hdrOk = false, hdr = false;
     DWORD mn = 0, mx = 100, cur = 50, cmn = 0, cmx = 100, ccur = 50; int orient = 0; RECT rc{};
     bool vcpB = false, vcpC = false;   // fall back to raw VCP codes 0x10 / 0x12 when the high-level API fails
     std::vector<int> inputs; int input = -1;   // VCP 0x60 input sources the monitor lists
@@ -1352,9 +1363,9 @@ static bool WmiSet(int pct) {
     return ok;
 }
 
-struct DcName { std::wstring friendly, tech; bool internal; };
-static std::map<std::wstring, DcName> QueryDisplayNames() {
-    std::map<std::wstring, DcName> r;
+struct DcName { std::wstring friendly, tech; bool internal; LUID adapter; UINT32 target; bool hdrOk, hdr; };
+static std::map<std::wstring, std::vector<DcName>> QueryDisplayNames() {   // GDI source -> its screens (more than one when duplicated)
+    std::map<std::wstring, std::vector<DcName>> r;
     UINT32 np = 0, nm = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return r;
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
@@ -1381,7 +1392,12 @@ static std::map<std::wstring, DcName> QueryDisplayNames() {
         case DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST: tech = L"Wireless"; break;
         default: if (internal) tech = L"Laptop panel"; break;
         }
-        r[src.viewGdiDeviceName] = {tgt.monitorFriendlyDeviceName, tech, internal};
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO ac = {};   // HDR: can this screen do it, is it on
+        ac.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO; ac.header.size = sizeof(ac);
+        ac.header.adapterId = paths[i].targetInfo.adapterId; ac.header.id = paths[i].targetInfo.id;
+        bool hdrOk = false, hdr = false;
+        if (DisplayConfigGetDeviceInfo(&ac.header) == ERROR_SUCCESS) { hdrOk = ac.advancedColorSupported && !ac.advancedColorForceDisabled && !ac.wideColorEnforced; hdr = hdrOk && ac.advancedColorEnabled; }
+        r[src.viewGdiDeviceName].push_back({tgt.monitorFriendlyDeviceName, tech, internal, paths[i].targetInfo.adapterId, paths[i].targetInfo.id, hdrOk, hdr});
     }
     return r;
 }
@@ -1397,49 +1413,57 @@ static void WorkerEnum() {
     for (HMONITOR h : hms) {
         MONITORINFOEXW mi = {}; mi.cbSize = sizeof(mi);
         GetMonitorInfoW(h, &mi);
-        Mon m;
-        m.gdi = mi.szDevice; m.rc = mi.rcMonitor;
+        int orient = 0;
+        { DEVMODEW dm = {}; dm.dmSize = sizeof(dm); if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) orient = (int)dm.dmDisplayOrientation; }
         auto it = names.find(mi.szDevice);
-        if (it != names.end()) { m.name = it->second.friendly; m.internal = it->second.internal; m.detail = it->second.tech; }
-        DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
-        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) m.orient = (int)dm.dmDisplayOrientation;
-        DWORD np = 0;
-        if (GetNumberOfPhysicalMonitorsFromHMONITOR(h, &np) && np) {
-            std::vector<PHYSICAL_MONITOR> pm(np);
-            if (GetPhysicalMonitorsFromHMONITOR(h, np, pm.data())) {
-                m.phys = pm[0].hPhysicalMonitor;
-                for (DWORD k = 1; k < np; k++) DestroyPhysicalMonitor(pm[k].hPhysicalMonitor);
-                if (m.name.empty() && !m.internal) m.name = pm[0].szPhysicalMonitorDescription;
-                if (!m.internal) {
-                    DWORD a = 0, b = 0, c = 0;
-                    bool ok = GetMonitorBrightness(m.phys, &a, &b, &c);
-                    if (!ok) { Sleep(60); ok = GetMonitorBrightness(m.phys, &a, &b, &c); }
-                    if (ok && c > a) { m.mn = a; m.cur = b; m.mx = c; m.ok = true; }
-                    if (!m.ok) {   // many monitors only answer raw VCP requests (what PowerToys uses)
-                        DWORD cur = 0, mx = 0;
-                        if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x10, nullptr, &cur, &mx) && mx > 0) { m.mn = 0; m.cur = cur; m.mx = mx; m.ok = true; m.vcpB = true; }
-                    }
-                    {   // input sources (HDMI / DisplayPort / USB-C), asked once per monitor
-                        auto ic = w_inputCache.find(m.name + m.gdi);
-                        if (ic == w_inputCache.end()) ic = w_inputCache.emplace(m.name + m.gdi, ReadInputs(m.phys)).first;
-                        m.inputs = ic->second;
-                        if (m.inputs.size() >= 2) { DWORD cur = 0, mx = 0; if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x60, nullptr, &cur, &mx)) m.input = (int)(cur & 0xFF); }
-                        else m.inputs.clear();
-                    }
-                    {
-                        DWORD ca = 0, cb = 0, ccx = 0;
-                        if (GetMonitorContrast(m.phys, &ca, &cb, &ccx) && ccx > ca) { m.cmn = ca; m.ccur = cb; m.cmx = ccx; m.hasCon = true; }
-                        else {
-                            Sleep(40);
-                            DWORD cur = 0, mx = 0;
-                            if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x12, nullptr, &cur, &mx) && mx > 0) { m.cmn = 0; m.ccur = cur; m.cmx = mx; m.hasCon = true; m.vcpC = true; }
-                        }
-                    }
-                }
+        std::vector<DcName> nm; if (it != names.end()) nm = it->second;
+        auto readPhys = [&](Mon& m) {   // brightness, contrast and inputs of one physical screen
+            if (m.internal || !m.phys) return;
+            DWORD a = 0, b = 0, c = 0;
+            bool ok = GetMonitorBrightness(m.phys, &a, &b, &c);
+            if (!ok) { Sleep(60); ok = GetMonitorBrightness(m.phys, &a, &b, &c); }
+            if (ok && c > a) { m.mn = a; m.cur = b; m.mx = c; m.ok = true; }
+            if (!m.ok) {   // many monitors only answer raw VCP requests (what PowerToys uses)
+                DWORD cur = 0, mx = 0;
+                if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x10, nullptr, &cur, &mx) && mx > 0) { m.mn = 0; m.cur = cur; m.mx = mx; m.ok = true; m.vcpB = true; }
             }
+            {   // input sources (HDMI / DisplayPort / USB-C), asked once per monitor
+                auto ic = w_inputCache.find(m.name + m.gdi);
+                if (ic == w_inputCache.end()) ic = w_inputCache.emplace(m.name + m.gdi, ReadInputs(m.phys)).first;
+                m.inputs = ic->second;
+                if (m.inputs.size() >= 2) { DWORD cur = 0, mx = 0; if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x60, nullptr, &cur, &mx)) m.input = (int)(cur & 0xFF); }
+                else m.inputs.clear();
+            }
+            DWORD ca = 0, cb = 0, ccx = 0;
+            if (GetMonitorContrast(m.phys, &ca, &cb, &ccx) && ccx > ca) { m.cmn = ca; m.ccur = cb; m.cmx = ccx; m.hasCon = true; }
+            else {
+                Sleep(40);
+                DWORD cur = 0, mx = 0;
+                if (GetVCPFeatureAndVCPFeatureReply(m.phys, 0x12, nullptr, &cur, &mx) && mx > 0) { m.cmn = 0; m.ccur = cur; m.cmx = mx; m.hasCon = true; m.vcpC = true; }
+            }
+        };
+        auto makeMon = [&](size_t k) {   // screen k of this source (k > 0: it shows the same picture as screen 0)
+            Mon m;
+            m.gdi = mi.szDevice; m.rc = mi.rcMonitor; m.orient = orient;
+            if (k < nm.size()) { m.name = nm[k].friendly; m.internal = nm[k].internal; m.detail = nm[k].tech; m.adapter = nm[k].adapter; m.target = nm[k].target; m.hdrOk = nm[k].hdrOk; m.hdr = nm[k].hdr; }
+            return m;
+        };
+        size_t first = w_mons.size();
+        DWORD np = 0;
+        std::vector<PHYSICAL_MONITOR> pm;
+        if (GetNumberOfPhysicalMonitorsFromHMONITOR(h, &np) && np) { pm.resize(np); if (!GetPhysicalMonitorsFromHMONITOR(h, np, pm.data())) pm.clear(); }
+        size_t count = std::max<size_t>(1, std::max(pm.size(), nm.size()));
+        for (size_t k = 0; k < count; k++) {
+            Mon m = makeMon(k);
+            if (k < pm.size()) {
+                m.phys = pm[k].hPhysicalMonitor;
+                if (m.name.empty() && !m.internal) m.name = pm[k].szPhysicalMonitorDescription;
+                readPhys(m);
+            }
+            if (m.name.empty()) m.name = m.internal ? L"Built-in display" : L"Display";
+            if (k > 0) m.cloneOf = (int)first;
+            w_mons.push_back(m);
         }
-        if (m.name.empty()) m.name = m.internal ? L"Built-in display" : L"Display";
-        w_mons.push_back(m);
     }
     int cand = -1;
     for (int i = 0; i < (int)w_mons.size(); i++) if (!w_mons[i].ok && w_mons[i].internal) { cand = i; break; }
@@ -1476,6 +1500,7 @@ static void WorkerPost(bool fromEnum) {
         u.hasCon = m.hasCon; u.orient = m.orient; u.rc = m.rc;
         u.pct = Pct(m.mn, m.mx, m.cur); u.con = Pct(m.cmn, m.cmx, m.ccur);
         u.inputs = m.inputs; u.input = m.input;
+        u.cloneOf = m.cloneOf; u.adapter = m.adapter; u.target = m.target; u.hdrOk = m.hdrOk; u.hdr = m.hdr;
         {   // refresh rates offered at the current resolution
             DEVMODEW cur = {}; cur.dmSize = sizeof(cur);
             if (EnumDisplaySettingsW(m.gdi.c_str(), ENUM_CURRENT_SETTINGS, &cur)) {
@@ -1592,6 +1617,117 @@ static void SetOrientation(int idx, int orient) {
         g_mons[idx].orient = orient;
 }
 
+// ---- HDR, Extend / Duplicate, night light and "dim further" (per screen)
+static bool SetHdr(int idx, bool on) {
+    if (idx < 0 || idx >= (int)g_mons.size() || !g_mons[idx].hdrOk) return false;
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE st = {};
+    st.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE; st.header.size = sizeof(st);
+    st.header.adapterId = g_mons[idx].adapter; st.header.id = g_mons[idx].target;
+    st.enableAdvancedColor = on ? 1 : 0;
+    if (DisplayConfigSetDeviceInfo(&st.header) != ERROR_SUCCESS) return false;
+    g_mons[idx].hdr = on;
+    return true;
+}
+static bool KeepDisplayChange() {   // like Windows: keep the new layout, or go back by itself after 15 seconds
+    typedef int (WINAPI* PFN_MBT)(HWND, LPCWSTR, LPCWSTR, UINT, WORD, DWORD);
+    static auto mbt = (PFN_MBT)(void*)GetProcAddress(GetModuleHandleW(L"user32.dll"), "MessageBoxTimeoutW");
+    const wchar_t* t = L"Keep these display settings?\n\nIf you don't answer, the previous settings come back in 15 seconds.";
+    int r = mbt ? mbt(nullptr, t, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND, 0, 15000)
+                : MessageBoxW(nullptr, t, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
+    return r == IDYES;
+}
+static std::wstring g_dispStatus;   // shown under the Display tab when Windows refuses a layout
+static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else show the same picture as screen dupOf
+    if (idx < 0 || idx >= (int)g_mons.size()) return;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(np), oldP; std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm), oldM;
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), nullptr) != ERROR_SUCCESS) return;
+    paths.resize(np); modes.resize(nm); oldP = paths; oldM = modes;
+    LONG r;
+    g_dispStatus.clear();
+    if (dupOf < 0) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+    else {
+        if (dupOf >= (int)g_mons.size()) return;
+        auto find = [&](const MonUI& m) { for (UINT32 i = 0; i < np; i++) if (paths[i].targetInfo.id == m.target && paths[i].targetInfo.adapterId.LowPart == m.adapter.LowPart && paths[i].targetInfo.adapterId.HighPart == m.adapter.HighPart) return (int)i; return -1; };
+        int a = find(g_mons[dupOf]), b = find(g_mons[idx]);
+        if (a < 0 || b < 0) return;
+        paths[b].sourceInfo = paths[a].sourceInfo;   // both screens show the same desktop
+        paths[b].targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        r = SetDisplayConfig(np, paths.data(), nm, modes.data(), SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+        if (r != ERROR_SUCCESS) {   // let Windows pick the modes for this topology
+            for (auto& pth : paths) { pth.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID; pth.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID; }
+            r = SetDisplayConfig(np, paths.data(), 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES);
+        }
+    }
+    if (r != ERROR_SUCCESS) { g_dispStatus = dupOf < 0 ? L"Windows couldn't extend the screens" : L"Your graphics card can't show these two screens the same picture"; return; }
+    if (!KeepDisplayChange())
+        SetDisplayConfig((UINT32)oldP.size(), oldP.data(), (UINT32)oldM.size(), oldM.data(), SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+}
+
+// night light: a warm tint through the screen's gamma ramp; strength 0-100
+static std::set<std::wstring> g_gammaSet;          // GDI sources Knob has tinted (put back on exit)
+static bool NightActive(const std::wstring& name) {
+    auto it = g_night.find(name); if (it == g_night.end() || !it->second.on || it->second.str <= 0) return false;
+    if (g_nightAuto == 1) { SYSTEMTIME t; GetLocalTime(&t); return t.wHour >= 19 || t.wHour < 7; }
+    return true;
+}
+static bool SetGamma(const std::wstring& gdi, int str) {
+    HDC dc = CreateDCW(L"DISPLAY", gdi.c_str(), nullptr, nullptr);
+    if (!dc) return false;
+    bool ok = false;
+    for (float k : {1.f, 0.6f, 0.35f}) {   // Windows refuses ramps too far from normal: back off until it takes
+        float s = str / 100.f * k;
+        float mul[3] = {1.f, 1.f - 0.28f * s, 1.f - 0.62f * s};
+        WORD ramp[3][256];
+        for (int c = 0; c < 3; c++) for (int i = 0; i < 256; i++) ramp[c][i] = (WORD)std::min(65535.f, i * 257 * mul[c]);
+        if (SetDeviceGammaRamp(dc, ramp)) { ok = true; break; }
+        if (str == 0) break;
+    }
+    DeleteDC(dc);
+    if (ok) { if (str > 0) g_gammaSet.insert(gdi); else g_gammaSet.erase(gdi); }
+    return ok;
+}
+static void ApplyNight() {   // every screen gets its tint (or none); duplicates share their source's
+    std::set<std::wstring> done;
+    for (auto& m : g_mons) {
+        if (m.cloneOf >= 0 || done.count(m.gdi)) continue;
+        done.insert(m.gdi);
+        int str = NightActive(m.name) ? g_night[m.name].str : 0;
+        if (str > 0 || g_gammaSet.count(m.gdi)) SetGamma(m.gdi, str);
+    }
+}
+static void ResetGamma() { auto all = g_gammaSet; for (auto& gdi : all) SetGamma(gdi, 0); }
+
+// dim further: a dark, click-through layer over one screen, below what the monitor itself can do
+static std::map<std::wstring, int> g_dim;           // monitor name -> 0-80 % darker (not saved)
+static std::map<std::wstring, HWND> g_dimWnds;
+static LRESULT CALLBACK DimProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_PAINT) { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); FillRect(dc, &ps.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH)); EndPaint(h, &ps); return 0; }
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void ApplyDim() {
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = DimProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"KnobDim"; RegisterClassW(&wc); reg = true; }
+    std::set<std::wstring> want;
+    for (auto& m : g_mons) {
+        auto it = g_dim.find(m.name);
+        if (it == g_dim.end() || it->second <= 0 || m.cloneOf >= 0) continue;
+        want.insert(m.name);
+        HWND& w = g_dimWnds[m.name];
+        if (!w) w = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"KnobDim", L"", WS_POPUP,
+                                    0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!w) continue;
+        SetLayeredWindowAttributes(w, 0, (BYTE)std::min(230, it->second * 255 / 100), LWA_ALPHA);
+        SetWindowPos(w, HWND_TOPMOST, m.rc.left, m.rc.top, m.rc.right - m.rc.left, m.rc.bottom - m.rc.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (g_hwnd && IsWindowVisible(g_hwnd)) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // the panel stays readable
+    }
+    for (auto it = g_dimWnds.begin(); it != g_dimWnds.end();) {
+        if (!want.count(it->first)) { if (it->second) DestroyWindow(it->second); it = g_dimWnds.erase(it); } else ++it;
+    }
+}
+
 // ---------------------------------------------------------------- theme + fonts
 struct Theme {
     bool dark = true, taskbarLight = false, glass = false;   // glass = Glass style is active (Windows 11 acrylic available)
@@ -1701,9 +1837,9 @@ enum : wchar_t {
 };
 
 // ---------------------------------------------------------------- layout model
-enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
+enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_PROFILES, E_HK, E_OSDROW, E_STEPROW, E_RESETROW, E_DTOP };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENU, H_MENUBG, H_BACK, H_HKCHIP, H_OSD, H_STEP, H_RESET, H_PROFILE, H_SAVEOPT, H_MICALL, H_DELAYCHIP, H_DELAYSL, H_UPDATE, H_MULTI, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 76, ROWGAP = 4;
@@ -1764,14 +1900,18 @@ static void Layout() {
         y += S(10);
         g_els.push_back({E_DTOP, 0, RectF(x, y, w, S(40)), L""}); y += S(40);   // profile list + turn off displays
         h3(L"DISPLAYS");
+        if (!g_dispStatus.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y, w - S(20), S(20)), g_dispStatus}); y += S(24); }
         if (g_mons.empty()) { g_els.push_back({E_NOTE, -1, RectF(x + S(10), y + S(6), w, S(24)), g_monsLoaded ? L"No displays found" : L"Looking for displays…"}); y += S(36); }
         for (int i = 0; i < (int)g_mons.size(); i++) {
             if (i) y += S(14);
             y += S(4);
             g_els.push_back({E_MONHEAD, i, RectF(x, y, w, S(30)), L""}); y += S(30);
             g_els.push_back({E_MONB, i, RectF(x, y, w, S(36)), L""}); y += S(36);
+            bool dimRow = g_mons[i].ok && (g_mons[i].pct == 0 || (g_dim.count(g_mons[i].name) && g_dim[g_mons[i].name] > 0)) && g_mons[i].cloneOf < 0;
+            if (dimRow) { g_els.push_back({E_MONDIM, i, RectF(x, y, w, S(36)), L""}); y += S(36); }   // only at 0%: go darker than the monitor can
             if (g_mons[i].hasCon) { g_els.push_back({E_MONC, i, RectF(x, y, w, S(36)), L""}); y += S(36); }
-            g_els.push_back({E_MONO, i, RectF(x, y, w, S(36)), L""}); y += S(36);
+            if (g_night.count(g_mons[i].name) && g_night[g_mons[i].name].on) { g_els.push_back({E_MONNL, i, RectF(x, y, w, S(36)), L""}); y += S(36); }   // night light strength
+            g_els.push_back({E_MONO, i, RectF(x, y + S(2), w, S(36)), L""}); y += S(40);
             y += S(2);
         }
     }
@@ -1869,10 +2009,25 @@ static RectF ResetBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(1
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
 static RectF DTopOff(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(146), e.r.Y + S(4), S(146), S(32)); }
 static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(6), e.r.Y + S(4), o.X - S(8) - e.r.X - S(6), S(32)); }
-static RectF InputBtn(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(140), e.r.Y + e.r.Height / 2 - S(14), S(140), S(28)); }
 static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
-static RectF RateBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); float w = S(96); return RectF(sl.X + sl.Width - w, sl.Y, w, sl.Height); }
-static RectF OrientBtn(const El& e) { RectF sl = CtlSlider(e, SliderCy(e)); if (HasRates(e.idx)) sl.Width -= S(96) + S(8); return sl; }
+// header pills, right to left: night light, HDR (screens that can), refresh rate
+static RectF MoonPill(const El& e) { return RectF(e.r.X + e.r.Width - S(6) - S(30), e.r.Y + e.r.Height / 2 - S(11), S(30), S(22)); }
+static RectF HdrPill(const El& e) { RectF m = MoonPill(e); return RectF(m.X - S(6) - S(42), m.Y, S(42), m.Height); }
+static RectF RateBtn(const El& e) { RectF l = g_mons[e.idx].hdrOk ? HdrPill(e) : MoonPill(e); return RectF(l.X - S(6) - S(72), l.Y, S(72), l.Height); }
+// bottom row, full width: orientation · input · extend / duplicate
+static bool HasInputs(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].inputs.empty(); }
+static bool HasMode(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].internal && g_mons.size() > 1; }
+static RectF MonoBtn(const El& e, int which) {   // 0 orientation, 1 input, 2 extend/duplicate; empty if not shown
+    float wts[3] = {1.2f, HasInputs(e.idx) ? 0.85f : 0, HasMode(e.idx) ? 1.25f : 0};
+    if (!wts[which]) return RectF();
+    int n = (wts[1] > 0) + (wts[2] > 0) + 1;
+    float gap = S(8), avail = e.r.Width - S(12) - gap * (n - 1), sum = wts[0] + wts[1] + wts[2], x = e.r.X + S(6);
+    for (int k = 0; k < which; k++) if (wts[k]) x += avail * wts[k] / sum + gap;
+    return RectF(x, e.r.Y + S(2), avail * wts[which] / sum, S(32));
+}
+static RectF OrientBtn(const El& e) { return MonoBtn(e, 0); }
+static RectF InputBtn(const El& e) { return MonoBtn(e, 1); }
+static std::vector<int> g_ddModeMap;   // Extend / Duplicate list row -> screen (-1 extend)
 static bool ProfileActive(int p);
 static void ApplyProfile(int p);
 static std::vector<int> g_ddProfMap;   // list row -> profile index (-1 new, -2 manage)
@@ -1894,6 +2049,15 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
     }
     if (g_ddOpen < 0 || g_ddOpen >= (int)g_mons.size()) return o;
     MonUI& m = g_mons[g_ddOpen];
+    if (g_ddKind == 5) {   // extend, or show the same picture as another screen
+        g_ddModeMap = {-1}; o.push_back(L"Extend"); cur = 0;
+        for (int k = 0; k < (int)g_mons.size(); k++) {
+            if (k == g_ddOpen) continue;
+            o.push_back(L"Duplicate " + std::to_wstring(k + 1) + L" \u00b7 " + g_mons[k].name); g_ddModeMap.push_back(k);
+            if (m.cloneOf == k || (g_mons[k].cloneOf >= 0 && g_mons[k].cloneOf == m.cloneOf && m.cloneOf >= 0)) cur = (int)o.size() - 1;
+        }
+        return o;
+    }
     if (g_ddKind == 0) { for (int i = 0; i < 4; i++) o.push_back(ORIENT_NAMES[i]); cur = m.orient; }
     else if (g_ddKind == 1) { for (size_t i = 0; i < m.rates.size(); i++) { o.push_back(std::to_wstring(m.rates[i]) + L" Hz"); if (m.rates[i] == m.rate) cur = (int)i; } }
     else if (g_ddKind == 2) { for (size_t i = 0; i < m.inputs.size(); i++) { o.push_back(InputName(m.inputs[i], m.inputs)); if (m.inputs[i] == m.input) cur = (int)i; } }
@@ -1906,15 +2070,16 @@ static bool DropdownRect(RectF& btn) {
         if (g_ddKind == 4) { if (e.k == E_APP && e.idx == g_ddOpen) { btn = AppDdAnchor(e); return true; } continue; }
         if (e.idx != g_ddOpen) continue;
         if (g_ddKind == 0 && e.k == E_MONO) { btn = OrientBtn(e); return true; }
-        if (g_ddKind == 1 && e.k == E_MONO) { btn = RateBtn(e); return true; }
-        if (g_ddKind == 2 && e.k == E_MONHEAD) { btn = InputBtn(e); return true; }
+        if (g_ddKind == 1 && e.k == E_MONHEAD) { btn = RateBtn(e); return true; }
+        if (g_ddKind == 2 && e.k == E_MONO) { btn = InputBtn(e); return true; }
+        if (g_ddKind == 5 && e.k == E_MONO) { btn = MonoBtn(e, 2); return true; }
     }
     return false;
 }
 static RectF DropdownPopup(const RectF& btn) {
     int cur; int n = (int)DropdownOptions(cur).size();
     float h = S(4) * 2 + S(32) * n + S(2) * std::max(0, n - 1);
-    float w = std::max(btn.Width, g_ddKind == 3 ? S(240) : g_ddKind == 4 ? S(220) : S(150));
+    float w = std::max(btn.Width, g_ddKind == 3 ? S(240) : g_ddKind == 4 || g_ddKind == 5 ? S(230) : S(150));
     float x = g_ddKind == 3 ? btn.X : btn.X + btn.Width - w;   // small buttons open towards the left
     if (g_ddKind == 4 && !AppRouted(g_ddOpen)) x = btn.X;          // from the app's icon: open to the right
     x = std::max(PaneX(), std::min(x, PaneX() + PaneW() - w));
@@ -2023,14 +2188,17 @@ static Hit HitTest(float x, float y) {
             else if (InRect(CtlMute(e, cy2), x, y)) h.h = H_MUTE;
             else if (InRect(RectF(sl.X, cy2 - S(18), sl.Width, S(36)), x, y)) h.h = H_SLIDER;
             else h.h = (e.k == E_OUT || e.k == E_IN) ? H_ROW : H_NONE;
-        } else if (e.k == E_MONB || e.k == E_MONC) {
+        } else if (e.k == E_MONB || e.k == E_MONC || e.k == E_MONDIM || e.k == E_MONNL) {
             RectF sl = CtlSlider(e, SliderCy(e)); sl.X -= S(10); sl.Width += S(20);
-            if (InRect(sl, x, y) && g_mons[e.idx].ok) h.h = H_SLIDER;
+            if (InRect(sl, x, y) && (g_mons[e.idx].ok || e.k == E_MONNL || e.k == E_MONDIM)) h.h = H_SLIDER;
         } else if (e.k == E_MONO) {
             if (InRect(OrientBtn(e), x, y)) h.h = H_DROPDOWN;
-            else if (HasRates(e.idx) && InRect(RateBtn(e), x, y)) h.h = H_RATEDD;
+            else if (HasInputs(e.idx) && InRect(InputBtn(e), x, y)) h.h = H_INPUTDD;
+            else if (HasMode(e.idx) && InRect(MonoBtn(e, 2), x, y)) h.h = H_MODEDD;
         } else if (e.k == E_MONHEAD) {
-            if (!g_mons[e.idx].inputs.empty() && InRect(InputBtn(e), x, y)) h.h = H_INPUTDD;
+            if (InRect(MoonPill(e), x, y)) h.h = H_NIGHT;
+            else if (g_mons[e.idx].hdrOk && InRect(HdrPill(e), x, y)) h.h = H_HDR;
+            else if (HasRates(e.idx) && InRect(RateBtn(e), x, y)) h.h = H_RATEDD;
         } else if (e.k == E_DTOP) {
             if (InRect(DTopProfile(e), x, y)) h.h = H_PROFDD;
             else if (InRect(DTopOff(e), x, y)) h.h = H_SCREENOFF;
@@ -2057,6 +2225,8 @@ static float ElValue(const El& e) {
     case E_APP: return g_apps[e.idx].level;
     case E_MASTER: { int d = DefaultOut(); return d >= 0 ? g_out[d].level : 0; }
     case E_MONB: return g_mons[e.idx].pct / 100.f;
+    case E_MONDIM: { auto it = g_dim.find(g_mons[e.idx].name); return it == g_dim.end() ? 0.f : it->second / 80.f; }
+    case E_MONNL: { auto it = g_night.find(g_mons[e.idx].name); return it == g_night.end() ? 0.4f : it->second.str / 100.f; }
     case E_MONC: return g_mons[e.idx].con / 100.f;
     default: return 0;
     }
@@ -2097,7 +2267,11 @@ static void SetElValue(const El& e, float v) {
         a.level = v; a.mute = FALSE;
         break;
     }
-    case E_MONB: { int p = (int)lround(v * 100); if (p != g_mons[e.idx].pct) { g_mons[e.idx].pct = p; MonSet(e.idx, 0, p); } break; }
+    case E_MONB: { int p = (int)lround(v * 100); if (p != g_mons[e.idx].pct) { g_mons[e.idx].pct = p; MonSet(e.idx, 0, p); }
+                   if (p > 0 && g_dim.count(g_mons[e.idx].name)) { g_dim.erase(g_mons[e.idx].name); ApplyDim(); }   // brighter again: no extra dimming
+                   break; }
+    case E_MONDIM: { g_dim[g_mons[e.idx].name] = (int)lround(v * 80); ApplyDim(); break; }
+    case E_MONNL: { auto& n = g_night[g_mons[e.idx].name]; n.str = (int)lround(v * 100); ApplyNight(); break; }
     case E_MONC: { int p = (int)lround(v * 100); if (p != g_mons[e.idx].con) { g_mons[e.idx].con = p; MonSet(e.idx, 1, p); } break; }
     default: break;
     }
@@ -2638,39 +2812,68 @@ static void DrawEl(Graphics& g, int index) {
         Pen pen(T.t1, S(1.5f)); g.DrawPath(&pen, &p);
         wchar_t num[4]; swprintf(num, 4, L"%d", e.idx + 1);
         Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter);
-        float nx = e.r.X + S(8) + S(28) + S(10), maxW = e.r.X + e.r.Width - S(6) - nx;
-        if (!m.inputs.empty()) {   // input switch, aligned right on the name row
-            RectF ib = InputBtn(e);
-            maxW = ib.X - S(8) - nx;
-            bool open = g_ddOpen == e.idx && g_ddKind == 2;
-            FillRound(g, open || (hovEl && g_hover.h == H_INPUTDD) ? T.ddBtnHover : T.ddBtn, ib, S(T.glass ? 8 : 5));
-            Glyph(g, G_TV, g_fIconS, T.t2, ib.X + S(17), ib.Y + ib.Height / 2);
-            std::wstring in = m.input >= 0 ? InputName(m.input, m.inputs) : L"Input";
-            PillText(g, in.c_str(), g_fSmall, T.t1, RectF(ib.X + S(32), ib.Y, ib.Width - S(32) - S(34), ib.Height));
-            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, ib.X + ib.Width - S(18), ib.Y + ib.Height / 2);
+        float nx = e.r.X + S(8) + S(28) + S(10);
+        auto pill = [&](RectF r, bool on, bool hov) {   // small outlined pill; filled with the accent when on
+            if (on) FillRound(g, T.accent, r, r.Height / 2);
+            else { if (hov) FillRound(g, T.subtle, r, r.Height / 2); Pen op(WithAlpha(T.t1, 70), S(1)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), r.Height / 2); g.DrawPath(&op, &gp); }
+        };
+        bool nOn = g_night.count(m.name) && g_night[m.name].on;
+        RectF mp = MoonPill(e); pill(mp, nOn, hovEl && g_hover.h == H_NIGHT);
+        Glyph(g, 0xE708, g_fIconS, nOn ? T.onAccent : T.t2, mp.X + mp.Width / 2, mp.Y + mp.Height / 2);   // moon
+        float left = mp.X;
+        if (m.hdrOk) {
+            RectF hp = HdrPill(e); pill(hp, m.hdr, hovEl && g_hover.h == H_HDR);
+            PillText(g, L"HDR", g_fSmall600, m.hdr ? T.onAccent : T.t2, hp, StringAlignmentCenter); left = hp.X;
         }
-        float nw = std::min(TextW(g, m.name.c_str(), g_fName), maxW * 0.7f);
-        Text(g, m.name.c_str(), g_fName, T.t1, RectF(nx, cy - S(10), nw + S(2), S(20)));
-        if (!m.detail.empty()) Text(g, m.detail.c_str(), g_fSmall, T.t3, RectF(nx + nw + S(8), cy - S(9), std::max(0.f, maxW - nw - S(8)), S(18)));
+        if (HasRates(e.idx)) {
+            RectF rp = RateBtn(e); bool open = g_ddOpen == e.idx && g_ddKind == 1;
+            pill(rp, false, open || (hovEl && g_hover.h == H_RATEDD));
+            std::wstring r = std::to_wstring(m.rate) + L" Hz";
+            PillText(g, r.c_str(), g_fSmall600, T.t1, RectF(rp.X + S(9), rp.Y, rp.Width - S(26), rp.Height));
+            Glyph(g, open ? 0xE70E : G_CHEVDOWN, g_fIconS, T.t2, rp.X + rp.Width - S(12), rp.Y + rp.Height / 2);
+            left = rp.X;
+        }
+        float maxW = left - S(8) - nx;
+        Text(g, m.name.c_str(), g_fName, T.t1, RectF(nx, cy - S(10), maxW, S(20)));   // the connection is on the input button below
+        return;
+    }
+    if (e.k == E_MONO) {   // orientation · input · extend / duplicate, across the whole row
+        auto ddBtn = [&](RectF b, const std::wstring& label, bool open, bool hov, int badge) {
+            float bcy = b.Y + b.Height / 2;
+            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, b, S(T.glass ? 9 : 6));
+            float tx = b.X + S(10);
+            if (badge > 0) {   // the screen it copies, by its number
+                RectF nb(tx, bcy - S(7), S(18), S(14)); GraphicsPath gp; AddRound(gp, nb, S(3)); Pen pp(T.t1, S(1.3f)); g.DrawPath(&pp, &gp);
+                wchar_t num[4]; swprintf(num, 4, L"%d", badge); Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter); tx += S(24);
+            }
+            PillText(g, label.c_str(), g_fSmall, T.t1, RectF(tx, b.Y, b.X + b.Width - S(26) - tx, b.Height));
+            float gx = b.X + b.Width - S(14);
+            if (open) { g.TranslateTransform(gx, bcy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t2, 0, 0); g.ResetTransform(); }
+            else Glyph(g, G_CHEVDOWN, g_fIconS, T.t2, gx, bcy);
+        };
+        int o = std::max(0, std::min(3, m.orient));
+        ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN, 0);
+        if (HasInputs(e.idx)) ddBtn(InputBtn(e), m.input >= 0 ? InputName(m.input, m.inputs) : L"Input", g_ddOpen == e.idx && g_ddKind == 2, hovEl && g_hover.h == H_INPUTDD, 0);
+        if (HasMode(e.idx)) {
+            bool dup = m.cloneOf >= 0 && m.cloneOf < (int)g_mons.size();
+            ddBtn(MonoBtn(e, 2), dup ? g_mons[m.cloneOf].name : L"Extend", g_ddOpen == e.idx && g_ddKind == 5, hovEl && g_hover.h == H_MODEDD, dup ? m.cloneOf + 1 : 0);
+        }
         return;
     }
     if (e.k == E_MONC) {   // contrast: a circle, half filled
         float ccx = e.r.X + S(6) + S(16), rr = S(7);
         Pen cp(T.t1, S(1.5f)); g.DrawEllipse(&cp, ccx - rr, cy - rr, 2 * rr, 2 * rr);
         SolidBrush cb(T.t1); g.FillPie(&cb, ccx - rr, cy - rr, 2 * rr, 2 * rr, -90.f, 180.f);
-    } else Glyph(g, e.k == E_MONB ? G_BRIGHT : G_ROTATE, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
+    } else if (e.k == E_MONDIM) Glyph(g, 0xEC8A, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);   // lower brightness
+    else if (e.k == E_MONNL) Glyph(g, 0xE708, g_fIcon, Color(255, 255, 154, 60), e.r.X + S(6) + S(16), cy);   // moon, warm
+    else Glyph(g, G_BRIGHT, g_fIcon, T.t1, e.r.X + S(6) + S(16), cy);
     RectF sl = CtlSlider(e, cy);
-    if (e.k == E_MONO) {   // orientation and refresh rate, side by side
-        auto ddBtn = [&](RectF b, const wchar_t* label, bool open, bool hov) {
-            FillRound(g, hov || open ? T.ddBtnHover : T.ddBtn, b, S(T.glass ? 9 : 6));
-            PillText(g, label, g_fName, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(40), b.Height));
-            float gx = b.X + b.Width - S(18);
-            if (open) { g.TranslateTransform(gx, cy); g.RotateTransform(180); Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, 0, 0); g.ResetTransform(); }
-            else Glyph(g, G_CHEVDOWN, g_fIconS, T.t1, gx, cy);
-        };
-        int o = std::max(0, std::min(3, m.orient));
-        ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN);
-        if (HasRates(e.idx)) { std::wstring r = std::to_wstring(m.rate) + L" Hz"; ddBtn(RateBtn(e), r.c_str(), g_ddOpen == e.idx && g_ddKind == 1, hovEl && g_hover.h == H_RATEDD); }
+    if (e.k == E_MONDIM || e.k == E_MONNL) {   // Knob's own controls: always available
+        float v = ElValue(e);
+        int st = g_dragEl == index ? 2 : (hovEl && g_hover.h == H_SLIDER ? 1 : 0);
+        DrawSlider(g, sl, v, false, st);
+        if (e.k == E_MONDIM && v <= 0.001f) { RectF vr = CtlVal(e, cy); FillRound(g, T.valBg, vr, S(5)); Text(g, L"Off", g_fSmall600, T.t3, vr, StringAlignmentCenter); }
+        else DrawValue(g, CtlVal(e, cy), (int)lround(v * (e.k == E_MONDIM ? 80 : 100)));
         return;
     }
     if (!m.ok) { Text(g, L"Not available — turn on DDC/CI in the monitor menu", g_fSmall, T.t3, RectF(sl.X - S(8), sl.Y, sl.Width + S(46), sl.Height)); return; }
@@ -3621,7 +3824,7 @@ static void StartUpdate() {
 enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_APPEAR, SP_ABOUT, SP_COUNT };
 static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Appearance", L"About"};
 static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
-enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT, SK_HKDEL, SK_HKADD, SK_RTSRC, SK_RTDST, SK_RTDELAY };
+enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT, SK_HKDEL, SK_HKADD, SK_RTSRC, SK_RTDST, SK_RTDELAY, SK_NLSL };
 static int g_sddOpen = -1;
 static float g_segPos[3] = {-1, -1, -1};   // animated pill position: theme, style, accent
 static float SegPos(int which, int target) {   // eases towards the selected option; keeps repainting until it gets there
@@ -3639,6 +3842,7 @@ static WNDPROC g_editProc;
 static HFONT g_editFont;
 static HBRUSH g_editBrush;
 static int g_setPage = SP_GENERAL, g_editProfile = -1, g_sDragDelay = -1, g_sDragColor = 0;   // 1 hue, 2 intensity
+static int g_sDragNl = -1;   // night light strength slider being dragged (screen index)
 static int g_setW = 0, g_setH = 0;
 static float g_setScroll = 0, g_setContentH = 0;
 static std::vector<SItem> g_sItems;
@@ -4109,6 +4313,39 @@ static void PaintSettings(HDC hdc) {
         }
         case SP_DISPLAY:
             switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
+            section(L"Colour");
+            y -= S(4);
+            para(L"Per screen. Night light adds a warm tint that's easier on the eyes; switch it on with the moon button in the Display tab. HDR shows only for screens that support it.", S(10));
+            for (int i = 0; i < (int)g_mons.size(); i++) {
+                MonUI& m = g_mons[i];
+                if (m.cloneOf >= 0) continue;   // a duplicate shares its source's colour
+                RectF r = cardRect(m.hdrOk ? S(140) : S(100)); FillRound(g, card, r, S(6));
+                wchar_t num[4]; swprintf(num, 4, L"%d", i + 1);
+                RectF nb(r.X + S(18), r.Y + S(14), S(22), S(18)); GraphicsPath gp; AddRound(gp, nb, S(4)); Pen pp(T.t1, S(1.3f)); g.DrawPath(&pp, &gp);
+                Text(g, num, g_fNum, T.t1, nb, StringAlignmentCenter);
+                Text(g, m.name.c_str(), &fBody600, T.t1, RectF(r.X + S(50), r.Y + S(10), r.Width - S(70), S(26)));
+                float ry = r.Y + S(46);
+                if (m.hdrOk) {
+                    RectF hr(r.X + S(8), ry, r.Width - S(16), S(40));
+                    add(SK_SWITCH, 100 + i, hr);
+                    if (isHover(SK_SWITCH, 100 + i)) FillRound(g, cardHover, hr, S(5));
+                    Text(g, L"HDR", &fBody, T.t1, RectF(hr.X + S(10), hr.Y, S(120), hr.Height));
+                    Text(g, m.hdr ? L"Brighter highlights for HDR games and video" : L"Off", &fDesc, T.t3, RectF(hr.X + S(130), hr.Y, hr.Width - S(240), hr.Height));
+                    Text(g, m.hdr ? L"On" : L"Off", &fBody, T.t1, RectF(hr.X + hr.Width - S(102), hr.Y, S(40), hr.Height), StringAlignmentFar);
+                    DrawSwitch(g, hr.X + hr.Width - S(10) - S(40), hr.Y + hr.Height / 2, m.hdr);
+                    ry += S(44);
+                }
+                {   // night light strength
+                    int str = g_night.count(m.name) ? g_night[m.name].str : 40;
+                    Text(g, L"Night light", &fBody, T.t1, RectF(r.X + S(18), ry, S(120), S(36)));
+                    RectF sl(r.X + S(140), ry + S(4), r.Width - S(140) - S(80), S(28));
+                    add(SK_NLSL, i, RectF(sl.X - S(10), sl.Y, sl.Width + S(20), sl.Height));
+                    DrawSlider(g, sl, str / 100.f, false, g_sDragNl == i ? 2 : (isHover(SK_NLSL, i) ? 1 : 0));
+                    wchar_t t[8]; swprintf(t, 8, L"%d", str);
+                    Text(g, t, g_fSmall600, T.t1, RectF(r.X + r.Width - S(70), ry, S(52), S(36)), StringAlignmentFar);
+                }
+            }
+            ddCard(5, L"Turn night light on automatically", L"Screens with night light switched on follow this", {L"Whenever it's switched on", L"Evenings only (7 pm \u2013 7 am)"}, g_nightAuto);
             section(L"Profiles");
             y -= S(4);
             para(L"Save the brightness and contrast of every display, then switch with one click from the Display tab.", S(10));
@@ -4213,6 +4450,14 @@ static void SettingsColorAt(float x) {   // drag on the hue / intensity track
         return;
     }
 }
+static void SettingsNlAt(float x) {   // night light strength slider in Settings › Display
+    for (auto& it : g_sItems) if (it.kind == SK_NLSL && it.id == g_sDragNl && g_sDragNl < (int)g_mons.size()) {
+        RectF sl(it.r.X + S(10), it.r.Y, it.r.Width - S(20), it.r.Height);
+        g_night[g_mons[g_sDragNl].name].str = (int)lround(std::max(0.f, std::min(1.f, (x - sl.X) / sl.Width)) * 100);
+        ApplyNight(); SettingsChanged();
+        return;
+    }
+}
 static void SettingsDelayAt(float x) {
     for (auto& it : g_sItems) if (it.kind == SK_DELAY && it.id == g_sDragDelay) {
         RectF sl(it.r.X + S(10), it.r.Y, it.r.Width - S(20), it.r.Height);
@@ -4240,6 +4485,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
         if (g_sDragDelay >= 0) { SettingsDelayAt(x); return 0; }
         if (g_sDragColor) { SettingsColorAt(x); return 0; }
+        if (g_sDragNl >= 0) { SettingsNlAt(x); return 0; }
         if (g_rtDrag != RT_NONE) { g_rtMouse = PointF(x, y); InvalidateRect(h, nullptr, FALSE); return 0; }
         if (g_setPage == SP_SOUND) { int ln = SettingsHit(x, y) < 0 ? RtLineAt(x, y) : -1; if (ln != g_rtHoverLine) { g_rtHoverLine = ln; InvalidateRect(h, nullptr, FALSE); } }
         int hv = SettingsHit(x, y);
@@ -4283,12 +4529,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (dd == 2) AudioRegSet(L"UserDuckingPreference", (DWORD)k);
             if (dd == 3) { g_openOn = k ? 1 : 0; SaveSettings(); }
             if (dd == 4 && k < (int)g_hkAddMap.size()) { g_capture = g_hkAddMap[k]; UnregisterHotkeys(); }   // new shortcut: wait for its keys
+            if (dd == 5) { g_nightAuto = k ? 1 : 0; SaveSettings(); ApplyNight(); }
             g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
         }
         case SK_SWITCH:
             if (it.id == 10) { SetMulti(!g_multi); SettingsChanged(); }
             else if (it.id == 11) g_autoSwitch = !g_autoSwitch;
             else if (it.id == 12) AudioRegSet(L"AccessibilityMonoMixState", MonoOn() ? 0 : 1);
+            else if (it.id >= 100 && it.id - 100 < (int)g_mons.size()) { int mi = it.id - 100; g_dispStatus = SetHdr(mi, !g_mons[mi].hdr) ? L"" : L"Windows didn't change HDR for this screen"; BrightRequest(true, false); }
             if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
             else if (it.id == 3) g_restoreBright = !g_restoreBright;
@@ -4333,6 +4581,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_DELAY: g_sDragDelay = it.id; SetCapture(h); SettingsDelayAt(x); return 0;
         case SK_HKDEL: g_hk[it.id].mods = 0; g_hk[it.id].vk = 0; if (g_capture == it.id) g_capture = -1; RegisterHotkeys(); SaveSettings(); break;
         case SK_HKADD: g_sddOpen = g_sddOpen == 4 ? -1 : 4; InvalidateRect(h, nullptr, FALSE); return 0;
+        case SK_NLSL: g_sDragNl = it.id; SetCapture(h); SettingsNlAt(x); return 0;
         case SK_RTSRC: g_rtSel = it.id; g_rtDrag = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_RTDST: break;
         case SK_RTDELAY: StartDelayEdit(it.id); return 0;
@@ -4355,6 +4604,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (g_sDragDelay >= 0) { g_sDragDelay = -1; ReleaseCapture(); SaveSettings(); RestartRouter(); SettingsChanged(); }
         if (g_sDragColor) { g_sDragColor = 0; ReleaseCapture(); SaveSettings(); UpdateTrayIcon(); SettingsChanged(); }
+        if (g_sDragNl >= 0) { g_sDragNl = -1; ReleaseCapture(); SaveSettings(); SettingsChanged(); }
         return 0;
     case WM_MOUSEWHEEL:
         SetPageScroll(g_setScroll - GET_WHEEL_DELTA_WPARAM(wp) / 120.f * S(60));
@@ -4526,7 +4776,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_mons[i].hasCon && it->second.second >= 0 && it->second.second != g_mons[i].con) { g_mons[i].con = it->second.second; MonSet(i, 1, it->second.second); }
                 }
             }
-            if (m->fromEnum) g_restoreAllNext = false;
+            if (m->fromEnum) { g_restoreAllNext = false; ApplyNight(); ApplyDim(); }
             if (g_ddOpen >= (int)g_mons.size()) g_ddOpen = -1;
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
         }
@@ -4541,6 +4791,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             return 0;
         }
+        if (wp == TIMER_NIGHT) { ApplyNight(); return 0; }
         if (wp == TIMER_FADE) {
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
@@ -4676,7 +4927,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (ht.h == H_PROFILE && ht.idx == ChipCount() - 1) return 0;
         }
         if (g_ddOpen >= 0 && ht.h != H_DDOPT && ht.h != H_MENUBG) {
-            int btnKind = ht.h == H_DROPDOWN ? 0 : ht.h == H_RATEDD ? 1 : ht.h == H_INPUTDD ? 2 : ht.h == H_PROFDD ? 3 : ht.h == H_APPOUT ? 4 : -1;
+            int btnKind = ht.h == H_DROPDOWN ? 0 : ht.h == H_RATEDD ? 1 : ht.h == H_INPUTDD ? 2 : ht.h == H_PROFDD ? 3 : ht.h == H_APPOUT ? 4 : ht.h == H_MODEDD ? 5 : -1;
             bool sameBtn = btnKind == g_ddKind && (btnKind == 3 || ht.idx == g_ddOpen);
             g_ddOpen = -1; InvalidateRect(h, nullptr, FALSE);
             if (sameBtn || btnKind < 0) return 0;
@@ -4691,6 +4942,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (kind == 0) SetOrientation(idx, k);
             else if (kind == 1 && idx < (int)g_mons.size() && k < (int)g_mons[idx].rates.size()) SetRefreshRate(idx, g_mons[idx].rates[k]);
             else if (kind == 2 && idx < (int)g_mons.size() && k < (int)g_mons[idx].inputs.size()) SetMonitorInput(idx, g_mons[idx].inputs[k]);
+            else if (kind == 5 && idx < (int)g_mons.size() && k < (int)g_ddModeMap.size()) {   // extend / duplicate, then confirm
+                InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
+                SetDisplayMode(idx, g_ddModeMap[k]);
+                BrightRequest(true, false);
+            }
             else if (kind == 4 && idx < (int)g_apps.size()) {
                 AppGroup& a = g_apps[idx];
                 if (k == 0) AppRouteClear(a);
@@ -4712,6 +4968,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_RESETOUT: AppOutputResetAll(); for (auto& a : g_apps) a.outId.clear(); g_appExtra.clear(); RestartAppRouters(); break;
         case H_ROUTING: OpenSettings(SP_SOUND_PAGE, false); return 0;
         case H_INPUTDD: g_ddOpen = ht.idx; g_ddKind = 2; break;
+        case H_MODEDD: g_ddOpen = ht.idx; g_ddKind = 5; break;
+        case H_NIGHT: if (ht.idx >= 0 && ht.idx < (int)g_mons.size()) { auto& n = g_night[g_mons[ht.idx].name]; n.on = !n.on; SaveSettings(); ApplyNight(); } break;
+        case H_HDR:
+            if (ht.idx >= 0 && ht.idx < (int)g_mons.size()) {
+                g_dispStatus = SetHdr(ht.idx, !g_mons[ht.idx].hdr) ? L"" : L"Windows didn't change HDR for this screen";
+                BrightRequest(true, false);
+            }
+            break;
         case H_PROFDD: g_ddOpen = 0; g_ddKind = 3; break;
         case H_SCREENOFF: HideFlyout(); SetTimer(h, TIMER_SCREENOFF, 500, nullptr); return 0;   // after the click settles, or the mouse wakes them
         case H_TAB: SetTab(ht.idx); return 0;
@@ -4767,7 +5031,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_LBUTTONUP:
-        if (g_dragEl >= 0) { g_dragEl = -1; ReleaseCapture(); InvalidateRect(h, nullptr, FALSE); }
+        if (g_dragEl >= 0) {
+            if (g_dragEl < (int)g_els.size() && g_els[g_dragEl].k == E_MONNL) SaveSettings();
+            g_dragEl = -1; ReleaseCapture(); InvalidateRect(h, nullptr, FALSE);
+        }
         if (g_dragDelay) { g_dragDelay = false; ReleaseCapture(); SaveSettings(); RestartRouter(); InvalidateRect(h, nullptr, FALSE); }
         return 0;
     case WM_CAPTURECHANGED:
@@ -4934,6 +5201,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     UpdateTrayTip();
     RegisterHotkeys();
     SetTimer(g_hwnd, TIMER_UPDCHECK, 15000, nullptr);   // first check 15 s after start
+    SetTimer(g_hwnd, TIMER_NIGHT, 60000, nullptr);      // night light: follow the evening schedule, and come back if Windows resets it
     SetTimer(g_hwnd, TIMER_TRAYPIN, 3000, nullptr);
     if (cmd && wcsstr(cmd, L"--show")) PostMessageW(g_hwnd, WM_APP_SHOW, 0, 0);   // just installed / updated: show it
 
@@ -4943,6 +5211,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     SaveSettings();
     StopRouter();
     g_appExtra.clear(); RestartAppRouters();   // stop every app copy
+    ResetGamma(); g_dim.clear(); ApplyDim();     // screens back to normal colour, no dark layer
     UnregisterHotkeys();
     CloseIdentify();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);

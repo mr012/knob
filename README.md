@@ -17,7 +17,9 @@ A tiny Windows 10/11 tray app for sound and screens: one ~400 KB exe, no install
 
 **Display**
 - Brightness and contrast for external monitors (DDC/CI), brightness for the laptop panel
-- Orientation for each display, plus an "identify displays" button
+- Orientation, refresh rate and input for each display, plus an "identify displays" button
+- Extend or duplicate a screen (with a 15-second "keep these settings?" safety), HDR on/off for screens that support it
+- Night light per screen (warm tint, optional evening schedule) and "Dim further" below the monitor's 0%
 - Named profiles (for example Day / Night) and automatic restore when a monitor reconnects
 
 **Also**
