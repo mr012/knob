@@ -44,7 +44,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.37.2"
+#define APP_VERSION L"1.37.3"
 #define APP_VERNUM  ((1 << 16) | (35 << 8) | 0)
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
@@ -709,14 +709,17 @@ typedef HRESULT (STDMETHODCALLTYPE* PFN_ClearAll)(void* self);
 static void** ApcfVtbl() { return *(void***)g_apcf; }
 static std::wstring AppOutputGet(DWORD pid) {   // endpoint id the app is pinned to, or empty
     if (!AppRouteReady()) return L"";
-    void* hs = nullptr;
     std::wstring r;
-    if (SUCCEEDED(((PFN_GetPersisted)ApcfVtbl()[26])(g_apcf, pid, eRender, eMultimedia, &hs)) && hs) {
-        UINT32 n = 0; PCWSTR b = pWGB(hs, &n);
-        std::wstring full(b ? b : L"", n);
-        size_t a = full.find(L"MMDEVAPI#"), z = full.rfind(L"#{");
-        if (a != std::wstring::npos && z != std::wstring::npos && z > a + 9) r = full.substr(a + 9, z - a - 9);
-        pWDS(hs);
+    for (ERole role : {eMultimedia, eConsole}) {
+        void* hs = nullptr;
+        if (SUCCEEDED(((PFN_GetPersisted)ApcfVtbl()[26])(g_apcf, pid, eRender, role, &hs)) && hs) {
+            UINT32 n = 0; PCWSTR b = pWGB(hs, &n);
+            std::wstring full(b ? b : L"", n);
+            size_t a = full.find(L"MMDEVAPI#"), z = full.rfind(L"#{");
+            if (a != std::wstring::npos && z != std::wstring::npos && z > a + 9) r = full.substr(a + 9, z - a - 9);
+            pWDS(hs);
+        }
+        if (!r.empty()) break;
     }
     return r;
 }
@@ -812,7 +815,7 @@ static void LoadApps() {
         if (a.system != b.system) return b.system;
         return lstrcmpiW(a.name.c_str(), b.name.c_str()) < 0;
     });
-    for (auto& a : g_apps) if (!a.system && !a.pids.empty()) a.outId = AppOutputGet(a.pids[0]);   // where each app is sent
+    for (auto& a : g_apps) if (!a.system) for (DWORD pid : a.pids) { a.outId = AppOutputGet(pid); if (!a.outId.empty()) break; }   // where each app is sent (any of its processes)
     bool gone = false;   // copies for apps that have closed stop here
     for (auto it = g_appExtra.begin(); it != g_appExtra.end();) {
         HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, it->second.pid); DWORD code = 0;
@@ -2176,7 +2179,7 @@ static Hit HitTest(float x, float y) {
     if (y < PaneTop() || y >= PaneBottom()) return h;
     for (int i = 0; i < (int)g_els.size(); i++) {
         El& e = g_els[i];
-        if (e.k == E_H3 && e.text == L"APPS" && AnyAppRouted() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
+        if (e.k == E_H3 && e.text == L"APPS" && AppRouteReady() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(RoutingRect(e), x, y)) { h.h = H_ROUTING; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
@@ -2608,7 +2611,7 @@ static void DrawEl(Graphics& g, int index) {
         SpacedText(g, e.text.c_str(), g_fH3, T.t3, e.r.X, e.r.Y + e.r.Height / 2, S(1));
         if (e.text == L"APPS") {   // put every app back with everything else; always there so nothing jumps, faded when there's nothing to reset
             RectF r = ResetOutRect(e); bool can = AnyAppRouted();
-            Text(g, L"Reset outputs", g_fSmall600, !can ? WithAlpha(T.t3, 110) : g_hover.h == H_RESETOUT ? T.t1 : T.accent, RectF(r.X, r.Y, r.Width - S(6), r.Height), StringAlignmentFar);
+            Text(g, L"Reset outputs", g_fSmall600, g_hover.h == H_RESETOUT ? T.t1 : can ? T.accent : T.t3, RectF(r.X, r.Y, r.Width - S(6), r.Height), StringAlignmentFar);
         }
         if (e.text == L"OUTPUT") {   // how many speakers play, and the way to Settings › Sound
             RectF rr = RoutingRect(e);
