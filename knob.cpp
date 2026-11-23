@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.0"
+#define APP_VERSION L"1.39.1"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -879,6 +879,11 @@ static void LoadApps() {
     if (gone) RestartAppRouters();
 }
 
+static bool AppPlayedWithin(const AppGroup& a, DWORD ms) {
+    if (g_demo) return a.name == L"Brave" || a.name == L"Spotify";
+    auto it = g_live.find(a.key);
+    return it != g_live.end() && it->second.lastActive && GetTickCount() - it->second.lastActive < ms;
+}
 static bool AppPlaying(const AppGroup& a) {
     if (g_demo) return a.name == L"Brave" || a.name == L"Spotify";
     auto it = g_live.find(a.key);
@@ -1754,7 +1759,17 @@ static bool KeepDisplayChange() {   // like Windows: keep the new layout, or go 
                 : MessageBoxW(nullptr, t, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
     return r == IDYES;
 }
-static std::wstring g_dispStatus;   // shown under the Display tab when Windows refuses a layout
+static std::wstring g_dispStatus;
+static int g_connScreens = 0;   // screens plugged in, including ones switched off by "Only this screen"
+static void CountScreens() {   // every screen plugged in, active or not
+    UINT32 np = 0, nm = 0; g_connScreens = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &np, &nm) != ERROR_SUCCESS) return;
+    std::vector<DISPLAYCONFIG_PATH_INFO> p(np); std::vector<DISPLAYCONFIG_MODE_INFO> m(nm);
+    if (QueryDisplayConfig(QDC_ALL_PATHS, &np, p.data(), &nm, m.data(), nullptr) != ERROR_SUCCESS) return;
+    std::set<unsigned long long> seen;
+    for (UINT32 i = 0; i < np; i++) if (p[i].targetInfo.targetAvailable) seen.insert(((unsigned long long)p[i].targetInfo.adapterId.LowPart << 32) ^ p[i].targetInfo.id ^ ((unsigned long long)p[i].targetInfo.adapterId.HighPart << 48));
+    g_connScreens = (int)seen.size();
+}   // shown under the Display tab when Windows refuses a layout
 static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else show the same picture as screen dupOf
     if (idx < 0 || idx >= (int)g_mons.size()) return;
     UINT32 np = 0, nm = 0;
@@ -1764,7 +1779,18 @@ static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else sh
     paths.resize(np); modes.resize(nm); oldP = paths; oldM = modes;
     LONG r;
     g_dispStatus.clear();
-    if (dupOf < 0) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND);
+    auto findP = [&](const MonUI& m) { for (UINT32 i = 0; i < np; i++) if (paths[i].targetInfo.id == m.target && paths[i].targetInfo.adapterId.LowPart == m.adapter.LowPart && paths[i].targetInfo.adapterId.HighPart == m.adapter.HighPart) return (int)i; return -1; };
+    if (dupOf == -1) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_SAVE_TO_DATABASE);
+    else if (dupOf == -2) {   // this screen only; the others switch off (Extend brings them back)
+        int b = findP(g_mons[idx]);
+        if (b < 0) return;
+        DISPLAYCONFIG_PATH_INFO one = paths[b];
+        r = SetDisplayConfig(1, &one, nm, modes.data(), SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+        if (r != ERROR_SUCCESS) { one.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID; one.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                                  r = SetDisplayConfig(1, &one, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES); }
+        if (r != ERROR_SUCCESS) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | (g_mons[idx].internal ? SDC_TOPOLOGY_INTERNAL : SDC_TOPOLOGY_EXTERNAL));
+    }
+    else if (np == 2) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_CLONE | SDC_SAVE_TO_DATABASE);   // two screens: Windows' own Duplicate
     else {
         if (dupOf >= (int)g_mons.size()) return;
         auto find = [&](const MonUI& m) { for (UINT32 i = 0; i < np; i++) if (paths[i].targetInfo.id == m.target && paths[i].targetInfo.adapterId.LowPart == m.adapter.LowPart && paths[i].targetInfo.adapterId.HighPart == m.adapter.HighPart) return (int)i; return -1; };
@@ -1778,7 +1804,7 @@ static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else sh
             r = SetDisplayConfig(np, paths.data(), 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES);
         }
     }
-    if (r != ERROR_SUCCESS) { g_dispStatus = dupOf < 0 ? L"Windows couldn't extend the screens" : L"Your graphics card can't show these two screens the same picture"; return; }
+    if (r != ERROR_SUCCESS) { g_dispStatus = dupOf == -1 ? L"Windows couldn't extend the screens" : dupOf == -2 ? L"Windows couldn't switch the other screens off" : L"Your graphics card can't show these two screens the same picture"; return; }
     if (!KeepDisplayChange())
         SetDisplayConfig((UINT32)oldP.size(), oldP.data(), (UINT32)oldM.size(), oldM.data(), SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
 }
@@ -2223,7 +2249,7 @@ static RectF RateBtn(const El& e) {
 }
 // bottom row, full width: orientation · input · extend / duplicate
 static bool HasInputs(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].inputs.empty(); }
-static bool HasMode(int i) { return i >= 0 && i < (int)g_mons.size() && !g_mons[i].internal && g_mons.size() > 1; }
+static bool HasMode(int i) { return i >= 0 && i < (int)g_mons.size() && (g_mons.size() > 1 || g_connScreens > 1); }
 static RectF MonoBtn(const El& e, int which) {   // 0 orientation, 1 input, 2 extend/duplicate; empty if not shown
     float wts[3] = {1.24f, HasInputs(e.idx) ? 0.88f : 0, HasMode(e.idx) ? 1.04f : 0};   // the widths the design ends up with
     if (!wts[which]) return RectF();
@@ -2255,13 +2281,14 @@ static std::vector<std::wstring> DropdownOptions(int& cur) {
     }
     if (g_ddOpen < 0 || g_ddOpen >= (int)g_mons.size()) return o;
     MonUI& m = g_mons[g_ddOpen];
-    if (g_ddKind == 5) {   // extend, or show the same picture as another screen
-        g_ddModeMap = {-1}; o.push_back(L"Extend"); cur = 0;
+    if (g_ddKind == 5) {   // extend, show the same picture as another screen, or this screen only
+        g_ddModeMap = {-1}; o.push_back(L"Extend"); cur = (g_mons.size() == 1 && g_connScreens > 1) ? -1 : 0;
         for (int k = 0; k < (int)g_mons.size(); k++) {
             if (k == g_ddOpen) continue;
             o.push_back(g_mons[k].name); g_ddModeMap.push_back(k);
             if (m.cloneOf == k || (g_mons[k].cloneOf >= 0 && g_mons[k].cloneOf == m.cloneOf && m.cloneOf >= 0)) cur = (int)o.size() - 1;
         }
+        o.push_back(L"Only this screen"); g_ddModeMap.push_back(-2); if (g_mons.size() == 1 && g_connScreens > 1) cur = (int)o.size() - 1;
         return o;
     }
     if (g_ddKind == 0) { for (int i = 0; i < 4; i++) o.push_back(ORIENT_NAMES[i]); cur = m.orient; }
@@ -2283,6 +2310,7 @@ static bool DropdownRect(RectF& btn) {
     return false;
 }
 static float DdExtraBefore(int i) {   // a line (and a "Duplicate" heading) inside some lists, as in the design
+    if (g_ddKind == 5 && i < (int)g_ddModeMap.size() && g_ddModeMap[i] == -2) return S(9);   // line above "Only this screen"
     if (g_ddKind == 5 && i == 1) return S(9) + S(19);
     if (g_ddKind == 4 && i == 1) return S(9);
     if (g_ddKind == 3 && i < (int)g_ddProfMap.size() && g_ddProfMap[i] == -1 && i > 0) return S(9);
@@ -2293,7 +2321,7 @@ static RectF DropdownPopup(const RectF& btn) {
     int cur; auto opts = DropdownOptions(cur); int n = (int)opts.size();
     float h = S(4) * 2 + S(32) * n; for (int i = 0; i < n; i++) h += DdExtraBefore(i);
     float content = 0;   // as wide as the longest item ("max-content"), never narrower than its button
-    for (int i = 0; i < n; i++) content = std::max(content, MeasureW(opts[i].c_str(), g_fName) + S(24) + (g_ddKind == 5 && i > 0 ? S(26) : 0) + (g_ddKind == 3 && g_ddProfMap[i] == -1 ? S(19) : 0));
+    for (int i = 0; i < n; i++) content = std::max(content, MeasureW(opts[i].c_str(), g_fName) + S(24) + (g_ddKind == 5 && i > 0 && g_ddModeMap[i] >= 0 ? S(26) : 0) + (g_ddKind == 3 && g_ddProfMap[i] == -1 ? S(19) : 0));
     content += S(8);
     float w = g_ddKind == 1 ? S(110) : g_ddKind == 4 ? S(244) : g_ddKind == 3 ? std::max(S(230), content) : std::max(btn.Width, content);
     w = std::min(w, PaneW());
@@ -3268,7 +3296,8 @@ static void DrawEl(Graphics& g, int index) {
         float left = mp.X;
         if (m.hdrOk) {
             RectF hp = HdrPill(e); bool hh = hovEl && g_hover.h == H_HDR; pill(hp, m.hdr, false);
-            SpacedText(g, L"HDR", g_fH3, m.hdr ? T.onAccent : hh ? T.t1 : T.t3, hp.X + (hp.Width - MeasureW(L"HDR", g_fH3) - S(2)) / 2, hp.Y + hp.Height / 2, S(0.4f)); left = hp.X;
+            Text(g, L"HDR", g_fH3, m.hdr ? T.onAccent : hh ? T.t1 : T.t3, RectF(hp.X, hp.Y, hp.Width, hp.Height), StringAlignmentCenter);   // centred, equal gaps
+            left = hp.X;
         }
         if (HasRates(e.idx)) {
             RectF rp = RateBtn(e); bool open = g_ddOpen == e.idx && g_ddKind == 1, rh = open || (hovEl && g_hover.h == H_RATEDD);
@@ -3299,8 +3328,8 @@ static void DrawEl(Graphics& g, int index) {
         ddBtn(OrientBtn(e), ORIENT_NAMES[o], g_ddOpen == e.idx && g_ddKind == 0, hovEl && g_hover.h == H_DROPDOWN, 0, false);
         if (HasInputs(e.idx)) ddBtn(InputBtn(e), m.input >= 0 ? InputName(m.input, m.inputs) : L"Input", g_ddOpen == e.idx && g_ddKind == 2, hovEl && g_hover.h == H_INPUTDD, 0, true);
         if (HasMode(e.idx)) {
-            bool dup = m.cloneOf >= 0 && m.cloneOf < (int)g_mons.size();
-            ddBtn(MonoBtn(e, 2), dup ? g_mons[m.cloneOf].name : L"Extend", g_ddOpen == e.idx && g_ddKind == 5, hovEl && g_hover.h == H_MODEDD, dup ? m.cloneOf + 1 : 0, false);
+            bool dup = m.cloneOf >= 0 && m.cloneOf < (int)g_mons.size(), only = g_mons.size() == 1 && g_connScreens > 1;
+            ddBtn(MonoBtn(e, 2), dup ? g_mons[m.cloneOf].name : only ? L"Only this screen" : L"Extend", g_ddOpen == e.idx && g_ddKind == 5, hovEl && g_hover.h == H_MODEDD, dup ? m.cloneOf + 1 : 0, false);
         }
         return;
     }
@@ -3399,7 +3428,7 @@ static void DrawDropdownBody(Graphics& g) {
         if (ex > 0) {   // the line (and heading) above this item
             float ly = r.Y - ex + S(4);
             SolidBrush lb(T.subtle2); g.FillRectangle(&lb, pop.X + S(10), ly, pop.Width - S(20), S(1));
-            if (g_ddKind == 5) Text(g, L"Duplicate", g_f11, T.t3, RectF(r.X + S(12), ly + S(4), r.Width, S(19)));
+            if (g_ddKind == 5 && i == 1 && g_ddModeMap[i] >= 0) Text(g, L"Duplicate", g_f11, T.t3, RectF(r.X + S(12), ly + S(4), r.Width, S(19)));
         }
         bool cur = curIdx == i && g_ddKind != 4, hov = g_hover.h == H_DDOPT && g_hover.idx == i;
         if (cur) FillRound(g, WithAlpha(T.accent, 36), r, S(8));
@@ -3418,7 +3447,7 @@ static void DrawDropdownBody(Graphics& g) {
                         g.DrawLines(&cp, pts, 3); }
             tx = bx.X + bx.Width + S(10);
         }
-        if (g_ddKind == 5 && i > 0 && i < (int)g_ddModeMap.size()) {   // the screen's number in a small box
+        if (g_ddKind == 5 && i > 0 && i < (int)g_ddModeMap.size() && g_ddModeMap[i] >= 0) {   // the screen's number in a small box
             RectF nb(tx, r.Y + r.Height / 2 - S(8), S(18), S(16)); GraphicsPath gp; AddRound(gp, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(3.5f));
             Pen pp(WithAlpha(T.t1, 217), S(1.5f)); g.DrawPath(&pp, &gp);
             wchar_t num[4]; swprintf(num, 4, L"%d", g_ddModeMap[i] + 1); Text(g, num, g_fNum, WithAlpha(T.t1, 217), nb, StringAlignmentCenter);
@@ -4474,7 +4503,7 @@ static std::vector<SItem> g_sItems;
 static int g_sHover = -1;
 static Theme g_setTheme;
 static RectF g_editRect;
-static const float NAVW = 200;
+static const float NAVW = 220;
 // routing board (Settings › Sound): sounds on the left, speakers on the right, a line = "plays there"
 struct RtLine { int src, dst; PointF p[4]; };
 static std::vector<RtLine> g_rtLines;
@@ -4655,7 +4684,7 @@ static void PaintSettings(HDC hdc) {
         Icon(g, "mixer", S(16), T.t1, S(28), S(27));
         Text(g, L"Knob", &fBody600, T.t1, RectF(S(47), S(17), S(140), S(20)));
         for (int i = 0; i < SP_COUNT; i++) {
-            RectF r(S(8), S(51) + i * S(38), S(184), S(36));
+            RectF r(S(8), S(51) + i * S(38), S(NAVW) - S(16), S(36));
             add(SK_NAV, i, r);
             bool sel = g_setPage == i;
             if (sel) { FillRound(g, T.subtle2, r, S(6)); FillRound(g, T.accent, RectF(r.X, r.Y + S(10), S(3), S(16)), S(1.5f)); }
@@ -4858,7 +4887,7 @@ static void PaintSettings(HDC hdc) {
                 SpacedText(g, L"SPEAKERS", &fRhd, T.t3, rx + S(4), by + S(7), S(0.66f));
                 float ly = by + S(22), ry = ly;
                 std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
-                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlaying(g_apps[i]) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
+                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system && (AppPlayedWithin(g_apps[i], 4000) || !AppRoutes(g_apps[i]).empty())) srcs.push_back(i);
                 for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; }
                 for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, S(48)); ry += S(48) + gap; }
                 if (srcs.empty()) { Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), ly + S(6), lw, S(18))); ly += S(36); }
@@ -5177,6 +5206,18 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
         if (wp == 77) { KillTimer(h, 77); InvalidateRect(h, nullptr, FALSE); return 0; }   // sliding pill frame
+        if (wp == 78) {   // Settings › Sound: the apps playing right now, without opening the Apps tab
+            if (g_setPage != SP_SOUND || !IsWindowVisible(h) || g_rtDrag != RT_NONE) return 0;
+            static int tick = 0;
+            if (++tick % 4 == 0 || g_apps.empty()) {
+                std::wstring selKey = g_rtSel >= 0 && g_rtSel < (int)g_apps.size() ? g_apps[g_rtSel].key : L"";
+                LoadApps();
+                g_rtSel = RT_NONE; for (int i = 0; i < (int)g_apps.size(); i++) if (!selKey.empty() && g_apps[i].key == selKey) g_rtSel = i;
+            }
+            UpdatePeaks();
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         break;
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) { PairHide(); return 0; }
@@ -5221,7 +5262,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (hi < 0) { InvalidateRect(h, nullptr, FALSE); return 0; }
         SItem it = g_sItems[hi];
         switch (it.kind) {
-        case SK_NAV: g_setPage = it.id; g_setScroll = 0; g_sddOpen = -1; break;
+        case SK_NAV: g_setPage = it.id; g_setScroll = 0; g_sddOpen = -1; if (it.id == SP_SOUND) { LoadApps(); UpdatePeaks(); } break;
         case SK_THEME:
             if (g_themeMode == it.id) break;
             StartFade();
@@ -5281,7 +5322,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 DestroyWindow(g_hwnd); return 0;
             }
             break;
-        case SK_STYLE: if (g_style == it.id) break; StartFade(); g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle(); break;
+        case SK_STYLE: if (g_style == it.id) break; g_style = it.id; SaveSettings(); ApplyStyle(); BuildSettingsTheme(); ApplySettingsStyle();
+            g_fadeFly.on = false; g_fadeFly.last.clear(); if (g_visible) { InvalidateRect(g_hwnd, nullptr, FALSE); UpdateWindow(g_hwnd); } break;
         case SK_SWATCH: break;
         case SK_ACCMODE: if (g_accentId == it.id) break; StartFade(); g_accentId = it.id; SaveSettings(); LoadTheme(); BuildSettingsTheme(); UpdateTrayIcon(); SettingsChanged(); break;
         case SK_COLOR: g_sDragColor = it.id + 1; SetCapture(h); SettingsColorAt(x); return 0;
@@ -5390,7 +5432,7 @@ static void OpenSettings(int page, bool newProfile) {
         UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
-        RECT r = {0, 0, (LONG)S(680), (LONG)S(526)};   // the design's Settings window
+        RECT r = {0, 0, (LONG)S(820), (LONG)S(600)};
         DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;   // fixed size, close button only
         AdjustWindowRectExForDpi(&r, style, FALSE, 0, dx);
         int w = r.right - r.left, hgt = r.bottom - r.top;
@@ -5410,6 +5452,8 @@ static void OpenSettings(int page, bool newProfile) {
         SendMessageW(g_set, WM_SETICON, ICON_SMALL, (LPARAM)titleIcon);
     }
     g_setPage = page; g_setScroll = 0;
+    SetTimer(g_set, 78, 500, nullptr);
+    if (page == SP_SOUND) { LoadApps(); UpdatePeaks(); }
     ShowWindow(g_set, IsIconic(g_set) ? SW_RESTORE : SW_SHOW);
     SetForegroundWindow(g_set);
     InvalidateRect(g_set, nullptr, FALSE);
@@ -5493,6 +5537,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_AUDIOCHANGED: SetTimer(h, TIMER_AUDIODEBOUNCE, 200, nullptr); return 0;
     case WM_APP + 31: SaveSettings(); ApplyNight(); return 0;   // location for sunset to sunrise arrived
     case WM_APP_MONITORS: {
+        if (!g_demo) CountScreens();
         MonMsg* m = (MonMsg*)lp;
         if (g_demo) {   // the design's two screens
             m->mons.clear();
@@ -5552,7 +5597,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_REFRESH && g_visible && g_dragEl < 0) {
             RefreshEndpointLevels(g_out);
             RefreshEndpointLevels(g_in);
-            if (g_tab == T_APPS) { LoadApps(); UpdatePeaks(); }
+            if (g_tab == T_APPS || g_tab == T_SOUND) { LoadApps(); UpdatePeaks(); }
             static int tick = 0;
             if (g_tab == T_DISPLAY && ++tick % 4 == 0) BrightRequest(false, true);   // picks up changes made with monitor buttons / laptop keys
             InvalidateRect(h, nullptr, FALSE);
@@ -5684,9 +5729,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (kind == 0) SetOrientation(idx, k);
             else if (kind == 1 && idx < (int)g_mons.size() && k < (int)g_mons[idx].rates.size()) SetRefreshRate(idx, g_mons[idx].rates[k]);
             else if (kind == 2 && idx < (int)g_mons.size() && k < (int)g_mons[idx].inputs.size()) SetMonitorInput(idx, g_mons[idx].inputs[k]);
-            else if (kind == 5 && idx < (int)g_mons.size() && k < (int)g_ddModeMap.size()) {   // extend / duplicate, then confirm
-                InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
+            else if (kind == 5 && idx < (int)g_mons.size() && k < (int)g_ddModeMap.size()) {   // extend / duplicate / only, then confirm
+                HideFlyout();   // so the "Keep these display settings?" box isn't hidden behind the panel
                 SetDisplayMode(idx, g_ddModeMap[k]);
+                CountScreens();
                 BrightRequest(true, false);
             }
             else if (kind == 4 && idx < (int)g_apps.size()) {
