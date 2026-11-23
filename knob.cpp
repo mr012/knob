@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.5"
+#define APP_VERSION L"1.39.6"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -181,7 +181,7 @@ struct AppGroup {
     float level = 1;
     BOOL mute = FALSE;
     float peak = 0;
-    bool active = false;   // Windows says it has sound going right now (what its volume mixer lists)
+    bool onMain = false;   // has a session on the main speaker: what Windows' own volume mixer lists
 };
 struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
@@ -793,10 +793,15 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
     DWORD self = GetCurrentProcessId();
     IMMDeviceCollection* c = nullptr;
     if (FAILED(g_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &c))) return;
+    std::wstring mainId;   // Windows' mixer shows the apps on the speaker you picked; old sessions left on other speakers stay hidden
+    { IMMDevice* dd = nullptr; LPWSTR id = nullptr;
+      if (SUCCEEDED(g_enum->GetDefaultAudioEndpoint(eRender, eConsole, &dd)) && dd) { if (SUCCEEDED(dd->GetId(&id)) && id) { mainId = id; CoTaskMemFree(id); } dd->Release(); } }
     UINT n = 0; c->GetCount(&n);
     for (UINT i = 0; i < n; i++) {
         IMMDevice* dev = nullptr;
         if (FAILED(c->Item(i, &dev))) continue;
+        bool isMain = false;
+        { LPWSTR id = nullptr; if (SUCCEEDED(dev->GetId(&id)) && id) { isMain = mainId == id; CoTaskMemFree(id); } }
         IAudioSessionManager2* mgr = nullptr;
         if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
             IAudioSessionEnumerator* se = nullptr;
@@ -835,7 +840,7 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
                                     it = idx.find(key);
                                 }
                                 g_apps[it->second].vols.push_back(sv);
-                                if (st == AudioSessionStateActive) g_apps[it->second].active = true;
+                                if (isMain) g_apps[it->second].onMain = true;
                                 if (!sys && std::find(g_apps[it->second].pids.begin(), g_apps[it->second].pids.end(), pid) == g_apps[it->second].pids.end())
                                     g_apps[it->second].pids.push_back(pid);
                                 Meter* mi = nullptr;
@@ -869,10 +874,10 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
     }
     if (gone) RestartAppRouters();
     if (all) return;
-    // same list as Windows' volume mixer: only apps with sound going right now. Apps with a speaker you set stay, so you can change it back.
+    // same list as Windows' volume mixer: apps on the main speaker (playing or paused). Apps you sent to another speaker stay too.
     for (size_t i = g_apps.size(); i-- > 0;) {
         AppGroup& a = g_apps[i];
-        if (a.system || a.active || !a.outId.empty() || g_appExtra.count(a.key)) continue;
+        if (a.system || a.onMain || !a.outId.empty() || g_appExtra.count(a.key)) continue;
         for (auto* v : a.vols) v->Release();
         for (auto* m : a.meters) m->Release();
         g_apps.erase(g_apps.begin() + i);
