@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.6"
+#define APP_VERSION L"1.39.7"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -674,6 +674,7 @@ static void RefreshEndpointLevels(std::vector<Endpoint>& v) {
 
 static void SetDefaultDevice(const std::wstring& id) {
     if (g_demo) { g_demoDefault = id; return; }
+    for (auto& o : g_out) if (o.id == id && o.isDefault) return;   // already the main speaker: no switch, so apps aren't disturbed
     IPolicyConfig* pc = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_PolicyConfigClient, nullptr, CLSCTX_ALL, IID_IPolicyConfig, (void**)&pc)) && pc) {
         pc->SetDefaultEndpoint(id.c_str(), eConsole);
@@ -1110,15 +1111,23 @@ static void RestartMirror();
 static void RestartRouter() { RestartMirror(); RestartAppRouters(); }
 static std::vector<std::wstring> AppRoutes(const AppGroup& a) {
     std::vector<std::wstring> r;
-    if (!a.outId.empty()) r.push_back(a.outId);
     auto it = g_appExtra.find(a.key);
+    if (!a.outId.empty()) r.push_back(a.outId);
+    else if (it != g_appExtra.end() && !it->second.ids.empty()) { int di = DefaultOut(); if (di >= 0) r.push_back(g_out[di].id); }   // still on the main speaker, plus copies
     if (it != g_appExtra.end()) for (auto& id : it->second.ids) if (std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id);
     return r;
 }
 static void AppRouteAdd(AppGroup& a, const std::wstring& id) {   // also play this app on that speaker
     if (a.system || a.pids.empty()) return;
-    if (a.outId.empty() || !ProcLoopbackOk()) { if (AppOutputSet(a, id)) a.outId = id; if (!ProcLoopbackOk()) g_appExtra.erase(a.key); }
-    else if (a.outId != id) {   // Windows 11: a copy of just this app's sound
+    int di = DefaultOut();
+    std::wstring here = !a.outId.empty() ? a.outId : (di >= 0 ? g_out[di].id : L"");
+    if (!ProcLoopbackOk()) { if (AppOutputSet(a, id)) a.outId = id; g_appExtra.erase(a.key); }
+    else if (a.outId.empty() && id != here) {   // leave the app playing where it is (moving it makes browsers drop their sound) and add a copy
+        AppExtra& x = g_appExtra[a.key];
+        x.pid = a.pids[0]; x.primary.clear();
+        if (std::find(x.ids.begin(), x.ids.end(), id) == x.ids.end()) x.ids.push_back(id);
+    }
+    else if (!a.outId.empty() && a.outId != id) {   // Windows 11: a copy of just this app's sound
         AppExtra& x = g_appExtra[a.key];
         x.pid = a.pids[0]; x.primary = a.outId;
         if (std::find(x.ids.begin(), x.ids.end(), id) == x.ids.end()) x.ids.push_back(id);
@@ -1127,7 +1136,13 @@ static void AppRouteAdd(AppGroup& a, const std::wstring& id) {   // also play th
 }
 static void AppRouteRemove(AppGroup& a, const std::wstring& id) {
     auto it = g_appExtra.find(a.key);
-    if (id == a.outId) {   // its own speaker goes: the first copy takes over, or it plays with everything else again
+    int di = DefaultOut();
+    if (a.outId.empty() && it != g_appExtra.end() && di >= 0 && id == g_out[di].id) {   // off the main speaker: it has to move to one of its copies
+        std::wstring next = it->second.ids.empty() ? L"" : it->second.ids[0];
+        if (!next.empty()) it->second.ids.erase(it->second.ids.begin());
+        if (AppOutputSet(a, next)) a.outId = next;
+        it->second.primary = a.outId;
+    } else if (id == a.outId) {   // its own speaker goes: the first copy takes over, or it plays with everything else again
         std::wstring next;
         if (it != g_appExtra.end() && !it->second.ids.empty()) { next = it->second.ids[0]; it->second.ids.erase(it->second.ids.begin()); }
         if (AppOutputSet(a, next)) a.outId = next;
