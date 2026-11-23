@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.8"
+#define APP_VERSION L"1.39.9"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -5209,8 +5209,12 @@ static void OpenSettings(int page, bool newProfile) {
         UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
         ApplyDpi((int)dx);
         MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
-        RECT r = {0, 0, (LONG)S(820), (LONG)S(600)};
         DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;   // fixed size, close button only
+        // roomy by default (960 x 720), shrinking only as far as needed to fit beside the panel on smaller screens
+        RECT pad = {0, 0, 0, 0}; AdjustWindowRectExForDpi(&pad, style, FALSE, 0, dx);
+        int availW = (mi.rcWork.right - mi.rcWork.left) - (int)S(LW + 36) - (pad.right - pad.left);
+        int availH = (mi.rcWork.bottom - mi.rcWork.top) - (int)S(24) - (pad.bottom - pad.top);
+        RECT r = {0, 0, (LONG)std::max((int)S(820), std::min((int)S(960), availW)), (LONG)std::max((int)S(600), std::min((int)S(720), availH))};
         AdjustWindowRectExForDpi(&r, style, FALSE, 0, dx);
         int w = r.right - r.left, hgt = r.bottom - r.top;
         int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2, y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - hgt) / 2;
