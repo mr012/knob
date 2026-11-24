@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.8"
+#define APP_VERSION L"1.41.0"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -919,7 +919,7 @@ static bool UpdatePeaks() {   // returns true if anything is (or just was) playi
 // ---------------------------------------------------------------- audio: mirroring (loopback of default output -> extra outputs)
 struct RouterTarget { std::wstring id; int delayMs; };
 struct RouterCtx { std::wstring src; DWORD pid = 0; std::vector<RouterTarget> targets; volatile LONG stop = 0; HANDLE thread = nullptr;
-                   volatile LONG calOnly = -1; };   // auto sync: -1 normal, -2 all copies silent, k = only target k plays
+                   volatile LONG calOnly = -1; bool mic = false; };   // auto sync: -1 normal, -2 all copies silent, k = only target k plays; mic: src is a microphone
 static RouterCtx* g_router;
 
 // ---- one app's own sound (Windows 11: "process loopback"), so it can also play on extra speakers
@@ -994,7 +994,7 @@ static DWORD WINAPI RouterProc(LPVOID p) {
             if (FAILED(en->GetDevice(ctx->src.c_str(), &sdev))) break;
             if (FAILED(sdev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cap))) break;
             if (FAILED(cap->GetMixFormat(&wf))) break;
-            if (FAILED(cap->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, wf, nullptr))) break;
+            if (FAILED(cap->Initialize(AUDCLNT_SHAREMODE_SHARED, ctx->mic ? 0 : AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, wf, nullptr))) break;   // a mic is recorded directly
         }
         if (FAILED(cap->GetService(__uuidof(IAudioCaptureClient), (void**)&cc))) break;
         const UINT32 rate = wf->nSamplesPerSec, fb = wf->nBlockAlign;
@@ -1118,7 +1118,28 @@ static void RestartAppRouters() {
     }
 }
 static void RestartMirror();
-static void RestartRouter() { RestartMirror(); RestartAppRouters(); }
+// ---- a microphone played on speakers (Settings › Sound › Inputs): what it hears comes out there, lined up like everything else
+static std::map<std::wstring, std::vector<std::wstring>> g_micRoutes;   // mic id -> speakers
+static std::vector<RouterCtx*> g_micRouters;
+static void StopMicRouters() {
+    for (auto* r : g_micRouters) InterlockedExchange(&r->stop, 1);
+    for (auto* r : g_micRouters) { if (r->thread) { WaitForSingleObject(r->thread, 3000); CloseHandle(r->thread); } delete r; }
+    g_micRouters.clear();
+}
+static void RestartMicRouters() {
+    StopMicRouters();
+    if (g_demo) return;
+    for (auto& kv : g_micRoutes) {
+        if (kv.second.empty()) continue;
+        int mn = INT_MAX; for (auto& id : kv.second) mn = std::min(mn, DelayFor(id));
+        auto* r = new RouterCtx; r->src = kv.first; r->mic = true;
+        for (auto& id : kv.second) r->targets.push_back({id, DelayFor(id) - mn});   // the slowest of its speakers waits nothing
+        r->thread = CreateThread(nullptr, 0, RouterProc, r, 0, nullptr);
+        if (r->thread) SetThreadPriority(r->thread, THREAD_PRIORITY_TIME_CRITICAL);
+        g_micRouters.push_back(r);
+    }
+}
+static void RestartRouter() { RestartMirror(); RestartAppRouters(); RestartMicRouters(); }
 static std::vector<std::wstring> AppRoutes(const AppGroup& a) {
     std::vector<std::wstring> r;
     auto it = g_appExtra.find(a.key);
@@ -1167,6 +1188,7 @@ static std::vector<std::wstring> UsedSpeakers() {   // every speaker something p
     for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id);
     for (auto& kv : g_appExtra) { auto ids = kv.second.ids; ids.push_back(kv.second.primary); for (auto& id : ids) if (!id.empty() && std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id); }
     for (auto& a : g_apps) if (!a.system) for (auto& id : AppRoutes(a)) if (std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id);   // same speakers the routing board draws
+    for (auto& kv : g_micRoutes) for (auto& id : kv.second) if (std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id);
     return r;
 }
 static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
@@ -1179,6 +1201,7 @@ static void OneSpeaker() {   // back to a single speaker: every app and Windows 
     for (auto& a : g_apps) a.outId.clear();
     g_appExtra.clear();
     g_mirror.clear();
+    g_micRoutes.clear();
     SaveSettings();
     RestartRouter();
     UpdateTrayTip();
@@ -1423,6 +1446,37 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
     if (!g_hwnd || !PostMessageW(g_hwnd, WM_APP_CALDONE, 0, (LPARAM)res)) delete res;
     return 0;
 }
+// every other app is muted while Auto sync measures, so music doesn't drown out the test sounds; put back exactly as it was afterwards
+static std::vector<std::pair<ISimpleAudioVolume*, BOOL>> g_calMuted;
+static void CalMuteOthers(bool on) {
+    if (!on) { for (auto& m : g_calMuted) { m.first->SetMute(m.second, nullptr); m.first->Release(); } g_calMuted.clear(); return; }
+    if (!g_calMuted.empty() || g_demo || !g_enum) return;   // already muted (second pass)
+    DWORD self = GetCurrentProcessId();
+    IMMDeviceCollection* c = nullptr;
+    if (FAILED(g_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &c))) return;
+    UINT n = 0; c->GetCount(&n);
+    for (UINT i = 0; i < n; i++) {
+        IMMDevice* dev = nullptr; IAudioSessionManager2* mgr = nullptr; IAudioSessionEnumerator* se = nullptr;
+        if (FAILED(c->Item(i, &dev))) continue;
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr && SUCCEEDED(mgr->GetSessionEnumerator(&se)) && se) {
+            int cnt = 0; se->GetCount(&cnt);
+            for (int j = 0; j < cnt; j++) {
+                IAudioSessionControl* sc = nullptr; IAudioSessionControl2* sc2 = nullptr; ISimpleAudioVolume* sv = nullptr;
+                if (FAILED(se->GetSession(j, &sc)) || !sc) continue;
+                DWORD pid = 0;
+                if (SUCCEEDED(sc->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&sc2)) && sc2) { sc2->GetProcessId(&pid); sc2->Release(); }
+                if (pid != self && SUCCEEDED(sc->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&sv)) && sv) {   // Knob's own test sound stays
+                    BOOL m = FALSE; sv->GetMute(&m); sv->SetMute(TRUE, nullptr); g_calMuted.push_back({sv, m});
+                }
+                sc->Release();
+            }
+            se->Release();
+        }
+        if (mgr) mgr->Release();
+        dev->Release();
+    }
+    c->Release();
+}
 static void StartAutoSync() {
     if (g_calibrating) return;
     if (!g_calChained) { g_calPass = 0; g_calRefineRun = false; }   // a fresh run; only the follow-up passes Knob starts itself keep their state
@@ -1433,6 +1487,7 @@ static void StartAutoSync() {
     std::vector<std::wstring> appIds;   // speakers apps are copied to, and each app's own speaker
     for (auto& kv : g_appExtra) { appIds.insert(appIds.end(), kv.second.ids.begin(), kv.second.ids.end()); appIds.push_back(kv.second.primary); }
     for (auto& a : g_apps) if (!a.system && g_appExtra.count(a.key)) for (auto& id : AppRoutes(a)) appIds.push_back(id);
+    for (auto& kv : g_micRoutes) appIds.insert(appIds.end(), kv.second.begin(), kv.second.end());   // speakers a mic plays on
     {
         for (auto& id : appIds) {
             if (id.empty() || (di >= 0 && g_out[di].id == id)) continue;
@@ -1459,11 +1514,12 @@ static void StartAutoSync() {
     }
     InterlockedExchange(&g_calibrating, 1);
     InterlockedExchange(&g_calCancel, 0);
-    g_calStatus = L"Listening… keep the room quiet";
+    g_calStatus = L"Listening… other apps are muted until it's done";
     g_calIds.clear(); g_calNames.clear(); g_calK = 0; if (!g_calPass) g_calHeard.clear();
     for (auto& t : *ts) { g_calIds.push_back(t.id); g_calNames.push_back(t.name); }
+    CalMuteOthers(true);
     HANDLE h = CreateThread(nullptr, 0, CalibrateProc, ts, 0, nullptr);
-    if (h) CloseHandle(h); else { delete ts; InterlockedExchange(&g_calibrating, 0); g_calStatus = L"Couldn't start"; }
+    if (h) CloseHandle(h); else { delete ts; InterlockedExchange(&g_calibrating, 0); g_calStatus = L"Couldn't start"; CalMuteOthers(false); }
 }
 
 // ---------------------------------------------------------------- display worker (DDC/CI + WMI + orientation)
@@ -4313,9 +4369,46 @@ static const float NAVW = 220;
 // routing board (Settings › Sound): sounds on the left, speakers on the right, a line = "plays there"
 struct RtLine { int src, dst; PointF p[4]; };
 static std::vector<RtLine> g_rtLines;
-static std::map<int, RectF> g_rtSrc, g_rtDst;   // src: -1 everything else, else app index; dst: output index
-static const int RT_NONE = -1000;
+static std::map<int, RectF> g_rtSrc, g_rtDst;   // src: RT_EVERY, an app index, or RT_MIC0 - mic index; dst: output index
+static const int RT_NONE = -1000, RT_EVERY = -1, RT_MIC0 = -100;
 static int g_rtDrag = RT_NONE, g_rtSel = RT_NONE, g_rtHoverLine = -1;
+static int g_rtDragDst = -1, g_rtSelDst = -1;   // dragging from / selected speaker
+static std::vector<std::wstring> RtRoutes(int src) {   // the speakers a sound was sent to (lines on the board)
+    std::vector<std::wstring> r;
+    if (src == RT_EVERY) { for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id); }
+    else if (src <= RT_MIC0) { int k = RT_MIC0 - src; if (k < (int)g_in.size()) { auto it = g_micRoutes.find(g_in[k].id); if (it != g_micRoutes.end()) r = it->second; } }
+    else if (src >= 0 && src < (int)g_apps.size()) { const AppGroup& a = g_apps[src]; if (!a.outId.empty() || g_appExtra.count(a.key)) r = AppRoutes(a); }   // an app with no line of its own plays with Everything else
+    return r;
+}
+static bool RtLineRemovable(const RtLine& l) {   // Everything else always keeps one speaker
+    if (l.src != RT_EVERY) return true;
+    int n = 0; for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) n++;
+    return n > 1;
+}
+static void RtConnect(int src, int dst) {   // a line from a sound to a speaker: it plays there too
+    if (dst < 0 || dst >= (int)g_out.size()) return;
+    const std::wstring& id = g_out[dst].id;
+    if (src == RT_EVERY) { if (!OutSelected(dst)) ToggleOutput(dst); }
+    else if (src <= RT_MIC0) {
+        int k = RT_MIC0 - src; if (k >= (int)g_in.size()) return;
+        auto& v = g_micRoutes[g_in[k].id];
+        if (std::find(v.begin(), v.end(), id) == v.end()) { v.push_back(id); RestartMicRouters(); }
+    } else if (src >= 0 && src < (int)g_apps.size()) {
+        AppGroup& a = g_apps[src];
+        if (a.outId.empty() && !g_appExtra.count(a.key) && g_out[dst].isDefault) { if (AppOutputSet(a, id)) a.outId = id; }   // pin it to the speaker it's already on
+        else AppRouteAdd(a, id);
+    }
+}
+static void RtDisconnect(const RtLine& l) {   // clicked a line: that sound stops playing there
+    if (!RtLineRemovable(l) || l.dst < 0 || l.dst >= (int)g_out.size()) return;
+    const std::wstring id = g_out[l.dst].id;
+    if (l.src == RT_EVERY) ToggleOutput(l.dst);
+    else if (l.src <= RT_MIC0) {
+        int k = RT_MIC0 - l.src; if (k >= (int)g_in.size()) return;
+        auto it = g_micRoutes.find(g_in[k].id);
+        if (it != g_micRoutes.end()) { it->second.erase(std::remove(it->second.begin(), it->second.end(), id), it->second.end()); if (it->second.empty()) g_micRoutes.erase(it); RestartMicRouters(); }
+    } else if (l.src >= 0 && l.src < (int)g_apps.size()) AppRouteRemove(g_apps[l.src], id);
+}
 static PointF g_rtMouse;
 static int g_editDelay = -1;    // speaker whose delay is being typed
 static std::vector<int> g_hkAddMap;   // "Add a shortcut" list row -> action
@@ -4685,12 +4778,12 @@ static void PaintSettings(HDC hdc) {
         }
         case SP_SOUND: {
             h4(L"Where sound plays");
-            snote(L"Drag from an app to a speaker to play it there. Click a line to remove it. Click a speaker to play everything there. Apps without a line play on the speaker picked in the Sound tab.");
+            snote(L"Drag a sound to a speaker, or a speaker to a sound, to play it there. Click a line to remove it. Apps without a line of their own play with Everything else. Click anything to see where it goes.");
             {   // Timing: one place for sync
                 int n = SpeakersInUse();
                 bool can = n > 1 && !g_calibrating, ns = NeedsSync();
-                std::wstring d = g_calibrating ? (g_calStatus.empty() ? std::wstring(L"Measuring… keep the room quiet") : g_calStatus)
-                    : n < 2 ? L"When an app plays on two or more speakers, Auto sync lines them up"
+                std::wstring d = g_calibrating ? (g_calStatus.empty() ? std::wstring(L"Measuring… other apps are muted until it's done") : g_calStatus)
+                    : n < 2 ? L"When sound plays on two or more speakers, Auto sync lines them up"
                     : ns ? L"Not synced — a speaker hasn't been measured, so it may play early"
                     : L"In sync · the faster speakers wait for the slowest one";
                 float b1 = sbtnW(L"Back to one speaker"), b2 = sbtnW(L"Auto sync", true);
@@ -4699,76 +4792,98 @@ static void PaintSettings(HDC hdc) {
                 sbtn(SK_BUTTON, 7, RectF(r.X + r.Width - S(18) - b2 - S(10) - b1, r.Y + r.Height / 2 - S(16), b1, S(32)), L"Back to one speaker", false, can);
                 after(r.Height, S(14));
             }
-            {   // the board: what's playing on the left, speakers on the right, a line = "plays there"
+            {   // the board: sounds on the left (Everything else, apps, mics), speakers on the right; a line = "you sent it there"
                 top(0);
                 g_rtSrc.clear(); g_rtDst.clear(); g_rtLines.clear();
                 const float gap = S(6), colGap = S(56);
                 float lw = (cw - colGap) / 2, rw = lw, lx = x0, rx = x0 + lw + colGap;
                 float by = y + S(4);
-                SpacedText(g, L"PLAYING NOW", &fRhd, T.t3, lx + S(4), by + S(7), S(0.66f));
+                SpacedText(g, L"SOUND", &fRhd, T.t3, lx + S(4), by + S(7), S(0.66f));
                 SpacedText(g, L"SPEAKERS", &fRhd, T.t3, rx + S(4), by + S(7), S(0.66f));
                 float ly = by + S(22), ry = ly;
-                std::vector<int> srcs;   // apps making sound right now, plus any app that already has a line
-                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system) srcs.push_back(i);   // the list already matches Windows' mixer
-                for (int sidx : srcs) { g_rtSrc[sidx] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; }
+                std::vector<int> srcs;   // RT_EVERY, apps (index), mics (RT_MIC0 - k)
+                std::vector<std::pair<float, const wchar_t*>> heads;   // section titles in the left column
+                std::vector<float> emptyAt;
+                srcs.push_back(RT_EVERY); g_rtSrc[RT_EVERY] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap;
+                heads.push_back({ly + S(6), L"APPS"}); ly += S(24);
+                int nApps = 0;
+                for (int i = 0; i < (int)g_apps.size(); i++) if (!g_apps[i].system) { srcs.push_back(i); g_rtSrc[i] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; nApps++; }
+                if (!nApps) { emptyAt.push_back(ly); ly += S(30); }
+                if (!g_in.empty()) { heads.push_back({ly + S(6), L"INPUTS"}); ly += S(24); }
+                for (int k = 0; k < (int)g_in.size(); k++) { int id = RT_MIC0 - k; srcs.push_back(id); g_rtSrc[id] = RectF(lx, ly, lw, S(44)); ly += S(44) + gap; }
                 for (int i = 0; i < (int)g_out.size(); i++) { g_rtDst[i] = RectF(rx, ry, rw, S(48)); ry += S(48) + gap; }
-                if (srcs.empty()) { Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), ly + S(6), lw, S(18))); ly += S(36); }
+                for (auto& hd : heads) SpacedText(g, hd.second, &fRhd, T.t3, lx + S(4), hd.first + S(7), S(0.66f));
+                for (float ey : emptyAt) Text(g, L"Play something and it shows up here", &fDesc, T.t3, RectF(lx + S(4), ey + S(2), lw, S(18)));
                 auto dotR = [&](int sidx) { RectF r = g_rtSrc[sidx]; return PointF(r.X + r.Width, r.Y + r.Height / 2); };
                 auto dotL = [&](int i) { RectF r = g_rtDst[i]; return PointF(r.X + S(1), r.Y + r.Height / 2); };
-                auto addLine = [&](int sidx, int i, bool own) { PointF a = dotR(sidx), b = dotL(i); float m = (b.X - a.X) * 0.5f;
-                    RtLine l; l.src = own ? sidx : -2 - sidx; l.dst = i; l.p[0] = a; l.p[1] = PointF(a.X + m, a.Y); l.p[2] = PointF(b.X - m, b.Y); l.p[3] = b; g_rtLines.push_back(l); };
-                for (int sidx : srcs) {   // its own speakers, or (no line of its own) wherever the default sound plays now
-                    auto rt = AppRoutes(g_apps[sidx]);
-                    if (!rt.empty()) { for (auto& id : rt) for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].id == id) addLine(sidx, i, true); }
-                    else for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) addLine(sidx, i, false);
-                }
+                auto addLine = [&](PointF a, PointF b, int src, int dst) { float m = (b.X - a.X) * 0.5f;
+                    RtLine l; l.src = src; l.dst = dst; l.p[0] = a; l.p[1] = PointF(a.X + m, a.Y); l.p[2] = PointF(b.X - m, b.Y); l.p[3] = b; g_rtLines.push_back(l); };
+                for (int sidx : srcs)   // only lines you made: Everything else goes to the speakers picked in the Sound tab
+                    for (auto& id : RtRoutes(sidx)) for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].id == id) addLine(dotR(sidx), dotL(i), sidx, i);
                 int lit = g_rtDrag != RT_NONE ? g_rtDrag : g_rtSel;
-                auto lineSrc = [](const RtLine& l) { return l.src >= 0 ? l.src : -2 - l.src; };
-                for (int k = 0; k < (int)g_rtLines.size(); k++) {   // one kind of line; the chosen sound's lines in the accent colour
+                int litD = g_rtDragDst >= 0 ? g_rtDragDst : g_rtSelDst;
+                for (int k = 0; k < (int)g_rtLines.size(); k++) {   // one kind of line; the chosen sound's (or speaker's) lines in the accent colour
                     auto& l = g_rtLines[k];
-                    bool on = lineSrc(l) == lit, hov = k == g_rtHoverLine && l.src >= 0;
+                    bool on = (lit != RT_NONE && l.src == lit) || (litD >= 0 && l.dst == litD), hov = k == g_rtHoverLine && RtLineRemovable(l);
                     Pen pen(hov ? Color(255, 232, 72, 72) : on ? T.accent : WithAlpha(T.t1, 128), hov || on ? S(2.4f) : S(1.6f));
                     pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
                     g.DrawBezier(&pen, l.p[0], l.p[1], l.p[2], l.p[3]);
                 }
-                if (g_rtDrag != RT_NONE && g_rtSrc.count(g_rtDrag)) {   // the line being dragged
+                if (g_rtDrag != RT_NONE && g_rtSrc.count(g_rtDrag)) {   // the line being dragged from a sound
                     PointF a = dotR(g_rtDrag), b = g_rtMouse; float m = (b.X - a.X) * 0.5f;
+                    Pen tp(WithAlpha(T.accent, 230), S(1.6f)); float dash[2] = {3.f, 3.f}; tp.SetDashPattern(dash, 2);
+                    g.DrawBezier(&tp, a, PointF(a.X + m, a.Y), PointF(b.X - m, b.Y), b);
+                }
+                if (g_rtDragDst >= 0 && g_rtDst.count(g_rtDragDst)) {   // ... or from a speaker
+                    PointF a = dotL(g_rtDragDst), b = g_rtMouse; float m = (b.X - a.X) * 0.5f;
                     Pen tp(WithAlpha(T.accent, 230), S(1.6f)); float dash[2] = {3.f, 3.f}; tp.SetDashPattern(dash, 2);
                     g.DrawBezier(&tp, a, PointF(a.X + m, a.Y), PointF(b.X - m, b.Y), b);
                 }
                 for (int sidx : srcs) {
                     RectF r = g_rtSrc[sidx];
-                    add(SK_RTSRC, sidx, r);
+                    add(SK_RTSRC, sidx, RectF(r.X, r.Y, r.Width + S(14), r.Height));   // the dot on the edge is part of it
+                    auto rt = RtRoutes(sidx);
+                    bool hot = g_rtDragDst >= 0 && InRect(RectF(r.X, r.Y, r.Width + S(30), r.Height), g_rtMouse.X, g_rtMouse.Y);
+                    bool sel = lit == sidx || hot || (litD >= 0 && litD < (int)g_out.size() && std::find(rt.begin(), rt.end(), g_out[litD].id) != rt.end());
                     FillRound(g, card, r, S(6));
-                    if (lit == sidx) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
+                    if (sel) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
                     RectF ic(r.X + S(12), r.Y + S(9), S(26), S(26));
-                    AppGroup& a = g_apps[sidx];
-                    Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
-                    if (icn) DrawAppIcon(g, icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24)));
-                    else {
-                        static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
-                        unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
-                        FillRound(g, Hex(tint[hsh % 6]), ic, S(6)); std::wstring l1 = a.name.substr(0, 1); Text(g, l1.c_str(), g_f11s, Color(255, 255, 255, 255), ic, StringAlignmentCenter);
+                    std::wstring name, sub;
+                    if (sidx == RT_EVERY) {
+                        FillRound(g, T.accent, ic, S(6)); Icon(g, "wave", S(15), T.onAccent, ic.X + S(13), ic.Y + S(13));
+                        name = L"Everything else"; sub = L"Apps without their own line, and Windows sounds";
+                    } else if (sidx <= RT_MIC0) {
+                        Endpoint& m = g_in[RT_MIC0 - sidx];
+                        FillRound(g, T.subtle2, ic, S(6)); Icon(g, "mic", S(15), T.t1, ic.X + S(13), ic.Y + S(13));
+                        name = OutLabel(m); sub = rt.empty() ? L"Not playing anywhere" : rt.size() == 1 ? L"On " + OutName(rt[0]) : L"On " + std::to_wstring(rt.size()) + L" speakers";
+                    } else {
+                        AppGroup& a = g_apps[sidx];
+                        Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
+                        if (icn) DrawAppIcon(g, icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24)));
+                        else {
+                            static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
+                            unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
+                            FillRound(g, Hex(tint[hsh % 6]), ic, S(6)); std::wstring l1 = a.name.substr(0, 1); Text(g, l1.c_str(), g_f11s, Color(255, 255, 255, 255), ic, StringAlignmentCenter);
+                        }
+                        name = a.name; sub = rt.empty() ? L"With everything else" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
                     }
-                    auto rt = AppRoutes(a);
-                    std::wstring sub = rt.empty() ? L"Default speaker" : rt.size() == 1 ? L"Only " + OutName(rt[0]) : std::to_wstring(rt.size()) + L" speakers";
-                    Text(g, a.name.c_str(), &fRt, T.t1, RectF(r.X + S(48), r.Y + S(6), r.Width - S(60), S(17)));
+                    Text(g, name.c_str(), &fRt, T.t1, RectF(r.X + S(48), r.Y + S(6), r.Width - S(60), S(17)));
                     Text(g, sub.c_str(), g_f11, T.t3, RectF(r.X + S(48), r.Y + S(22), r.Width - S(60), S(15)));
                     PointF d = dotR(sidx);
                     float dr = isHover(SK_RTSRC, sidx) ? S(7.2f) : S(6);
                     SolidBrush ring(winBg); g.FillEllipse(&ring, d.X - dr - S(2), d.Y - dr - S(2), 2 * dr + S(4), 2 * dr + S(4));
-                    SolidBrush db(T.accent); g.FillEllipse(&db, d.X - dr, d.Y - dr, 2 * dr, 2 * dr);
+                    SolidBrush db(rt.empty() ? T.t3 : T.accent); g.FillEllipse(&db, d.X - dr, d.Y - dr, 2 * dr, 2 * dr);   // grey: nothing of its own yet
                 }
                 for (int i = 0; i < (int)g_out.size(); i++) {
                     Endpoint& o = g_out[i];
                     RectF r = g_rtDst[i];
-                    add(SK_RTDST, i, r);
+                    add(SK_RTDST, i, RectF(r.X - S(14), r.Y, r.Width + S(14), r.Height));   // the dot on the edge is part of it
                     bool hot = g_rtDrag != RT_NONE && InRect(RectF(r.X - S(30), r.Y, r.Width + S(30), r.Height), g_rtMouse.X, g_rtMouse.Y);
                     bool used = std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i; });
-                    bool litDst = lit != RT_NONE && std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i && lineSrc(l) == lit; });
-                    bool hv = isHover(SK_RTDST, i) && g_rtDrag == RT_NONE;
+                    bool litDst = litD == i || (lit != RT_NONE && std::any_of(g_rtLines.begin(), g_rtLines.end(), [&](const RtLine& l) { return l.dst == i && l.src == lit; }));
+                    bool hv = isHover(SK_RTDST, i) && g_rtDrag == RT_NONE && g_rtDragDst < 0;
                     FillRound(g, hv ? cardHover : card, r, S(6));
-                    if (hot) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
+                    if (hot || g_rtSelDst == i) { Pen sp(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.75f), r.Y + S(0.75f), r.Width - S(1.5f), r.Height - S(1.5f)), S(5.5f)); g.DrawPath(&sp, &gp); }
                     else if (litDst) { Pen sp(WithAlpha(T.accent, 140), S(1)); GraphicsPath gp; AddRound(gp, RectF(r.X + S(0.5f), r.Y + S(0.5f), r.Width - S(1), r.Height - S(1)), S(5.5f)); g.DrawPath(&sp, &gp); }
                     RectF ic(r.X + S(12), r.Y + S(11), S(26), S(26));
                     FillRound(g, T.subtle2, ic, S(6));
@@ -4785,12 +4900,13 @@ static void PaintSettings(HDC hdc) {
                         FillRound(g, isHover(SK_RTDELAY, i) || g_editDelay == i ? T.subtle3 : T.subtle2, pr, S(11));
                         if (g_editDelay != i) PillText(g, t, &fPill, T.accent, pr, StringAlignmentCenter);
                     }
-                    std::wstring sub = hv ? std::wstring(L"Click to play everything here") : o.bt ? std::wstring(L"Bluetooth") : o.detail;
+                    std::wstring sub = o.bt ? std::wstring(L"Bluetooth") : o.detail;
                     Text(g, OutLabel(o).c_str(), &fRt, T.t1, RectF(r.X + S(48), r.Y + S(8), r.Width - S(48) - right, S(17)));
-                    Text(g, sub.c_str(), g_f11, hv ? T.accent : T.t3, RectF(r.X + S(48), r.Y + S(24), r.Width - S(48) - right, S(15)));
+                    Text(g, sub.c_str(), g_f11, T.t3, RectF(r.X + S(48), r.Y + S(24), r.Width - S(48) - right, S(15)));
                     PointF d = dotL(i);
-                    SolidBrush ring(winBg); g.FillEllipse(&ring, d.X - S(8), d.Y - S(8), S(16), S(16));
-                    SolidBrush db(used ? T.accent : T.t3); g.FillEllipse(&db, d.X - S(6), d.Y - S(6), S(12), S(12));
+                    float dr = hv ? S(7.2f) : S(6);
+                    SolidBrush ring(winBg); g.FillEllipse(&ring, d.X - dr - S(2), d.Y - dr - S(2), 2 * dr + S(4), 2 * dr + S(4));
+                    SolidBrush db(used ? T.accent : T.t3); g.FillEllipse(&db, d.X - dr, d.Y - dr, 2 * dr, 2 * dr);
                 }
                 float bottom = std::max(ly, ry) - gap + S(6);
                 after(bottom - y, 0);
@@ -5044,12 +5160,12 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 77) { KillTimer(h, 77); InvalidateRect(h, nullptr, FALSE); return 0; }   // sliding pill frame
         if (wp == 78) {   // Settings › Sound: the apps playing right now, without opening the Apps tab
-            if (g_setPage != SP_SOUND || !IsWindowVisible(h) || g_rtDrag != RT_NONE || g_dragEl >= 0 || g_ddOpen >= 0) return 0;   // never while something holds an app's place in the list
+            if (g_setPage != SP_SOUND || !IsWindowVisible(h) || g_rtDrag != RT_NONE || g_rtDragDst >= 0 || g_dragEl >= 0 || g_ddOpen >= 0) return 0;   // never while something holds an app's place in the list
             static int tick = 0;
             if (++tick % 4 == 0 || g_apps.empty()) {
                 std::wstring selKey = g_rtSel >= 0 && g_rtSel < (int)g_apps.size() ? g_apps[g_rtSel].key : L"";
                 LoadApps();
-                g_rtSel = RT_NONE; for (int i = 0; i < (int)g_apps.size(); i++) if (!selKey.empty() && g_apps[i].key == selKey) g_rtSel = i;
+                if (g_rtSel >= 0) { g_rtSel = RT_NONE; for (int i = 0; i < (int)g_apps.size(); i++) if (!selKey.empty() && g_apps[i].key == selKey) g_rtSel = i; }
             }
             UpdatePeaks();
             InvalidateRect(h, nullptr, FALSE);
@@ -5070,7 +5186,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_sDragDelay >= 0) { SettingsDelayAt(x); return 0; }
         if (g_sDragColor) { SettingsColorAt(x); return 0; }
         if (g_sDragNl >= 0) { SettingsNlAt(x); return 0; }
-        if (g_rtDrag != RT_NONE) { g_rtMouse = PointF(x, y); InvalidateRect(h, nullptr, FALSE); return 0; }
+        if (g_rtDrag != RT_NONE || g_rtDragDst >= 0) { g_rtMouse = PointF(x, y); InvalidateRect(h, nullptr, FALSE); return 0; }
         if (g_setPage == SP_SOUND) { int ln = SettingsHit(x, y) < 0 ? RtLineAt(x, y) : -1; if (ln != g_rtHoverLine) { g_rtHoverLine = ln; InvalidateRect(h, nullptr, FALSE); } }
         int hv = SettingsHit(x, y);
         if (hv != g_sHover) { g_sHover = hv; InvalidateRect(h, nullptr, FALSE); }
@@ -5087,11 +5203,11 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int ln = RtLineAt(x, y);
             if (ln >= 0) {
                 RtLine l = g_rtLines[ln];
-                if (l.src < 0) { g_rtHoverLine = -1; return 0; }   // an app on the default speaker: nothing of its own to remove
-                if (l.src < (int)g_apps.size() && l.dst < (int)g_out.size()) AppRouteRemove(g_apps[l.src], g_out[l.dst].id);
+                if (!RtLineRemovable(l)) { g_rtHoverLine = -1; return 0; }   // Everything else keeps its last speaker
+                RtDisconnect(l);
                 g_rtHoverLine = -1; SettingsChanged(); return 0;
             }
-            if (g_rtSel != RT_NONE) { g_rtSel = RT_NONE; InvalidateRect(h, nullptr, FALSE); }
+            if (g_rtSel != RT_NONE || g_rtSelDst >= 0) { g_rtSel = RT_NONE; g_rtSelDst = -1; InvalidateRect(h, nullptr, FALSE); }
         }
         if (g_sddOpen >= 0 && (hi < 0 || (g_sItems[hi].kind != SK_DDBTN && g_sItems[hi].kind != SK_DDOPT && g_sItems[hi].kind != SK_HKADD))) {   // click outside an open list closes it
             g_sddOpen = -1; InvalidateRect(h, nullptr, FALSE); return 0;
@@ -5182,15 +5298,9 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_HKDEL: if (it.id < (int)g_sc.size()) { UnregisterHotkeys(); g_sc.erase(g_sc.begin() + it.id); g_capture = -1; RegisterHotkeys(); SaveSettings(); } break;
         case SK_HKADD: g_sddOpen = g_sddOpen == 4 ? -1 : 4; InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_NLSL: g_sDragNl = it.id; SetCapture(h); SettingsNlAt(x); return 0;
-        case SK_RTSRC: g_rtSel = it.id; g_rtDrag = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
-        case SK_RTDST:   // a speaker: everything plays there, and only there
-            if (it.id < (int)g_out.size()) {
-                std::wstring id = g_out[it.id].id;
-                OneSpeaker();
-                if (!g_out[it.id].isDefault) { SetDefaultDevice(id); LoadEndpoints(eRender, g_out); }
-                g_rtSel = RT_NONE; UpdateTrayTip();
-            }
-            break;
+        case SK_RTSRC: g_rtSel = it.id; g_rtSelDst = -1; g_rtDrag = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
+        case SK_RTDST:   // a speaker: select it (its sounds light up), or drag from it to a sound
+            g_rtSelDst = it.id; g_rtSel = RT_NONE; g_rtDragDst = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_RTDELAY: StartDelayEdit(it.id); return 0;
         }
         SettingsChanged();
@@ -5200,13 +5310,13 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_rtDrag != RT_NONE) {   // dropped on a speaker: that sound plays there too
             int src = g_rtDrag; g_rtDrag = RT_NONE; ReleaseCapture();
             float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
-            for (auto& kv : g_rtDst) {
-                RectF r = kv.second;
-                if (!InRect(RectF(r.X - S(30), r.Y, r.Width + S(30), r.Height), x, y) || kv.first >= (int)g_out.size()) continue;
-                if (src < 0) { if (!OutSelected(kv.first)) ToggleOutput(kv.first); }
-                else if (src < (int)g_apps.size()) AppRouteAdd(g_apps[src], g_out[kv.first].id);
-                break;
-            }
+            for (auto& kv : g_rtDst) { RectF r = kv.second; if (InRect(RectF(r.X - S(30), r.Y, r.Width + S(30), r.Height), x, y)) { RtConnect(src, kv.first); break; } }
+            SettingsChanged(); return 0;
+        }
+        if (g_rtDragDst >= 0) {   // dragged from a speaker onto a sound: the same line, drawn the other way
+            int dst = g_rtDragDst; g_rtDragDst = -1; ReleaseCapture();
+            float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
+            for (auto& kv : g_rtSrc) { RectF r = kv.second; if (InRect(RectF(r.X, r.Y, r.Width + S(30), r.Height), x, y)) { RtConnect(kv.first, dst); break; } }
             SettingsChanged(); return 0;
         }
         if (g_sDragDelay >= 0) { g_sDragDelay = -1; ReleaseCapture(); SaveSettings(); RestartRouter(); SettingsChanged(); }
@@ -5251,7 +5361,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_DESTROY:
-        g_rtDrag = RT_NONE; g_rtSel = RT_NONE;
+        g_rtDrag = RT_NONE; g_rtSel = RT_NONE; g_rtDragDst = -1; g_rtSelDst = -1;
         if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
         if (g_edit) CommitRename(true);
         g_set = nullptr;
@@ -5379,6 +5489,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         g_routerPending = false; RestartRouter();   // apply the new delays (and any device change that waited)
         if (g_calPass) InterlockedExchange(&g_calibrating, 1);   // stay busy until the second run starts
+        else CalMuteOthers(false);   // all done: everyone's sound comes back
         if (g_visible) InvalidateRect(h, nullptr, FALSE);
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
@@ -5478,6 +5589,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             RestartRouter();
             g_calChained = true;
             StartAutoSync();   // second run with the new main output, or the check pass after a sync
+            if (!g_calibrating) CalMuteOthers(false);   // it couldn't start: give everyone's sound back
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             return 0;
         } else if (wp == TIMER_TRAYPIN) {
@@ -5704,7 +5816,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_POWERBROADCAST:
         if (wp == PBT_APMRESUMEAUTOMATIC) { g_restoreAllNext = true; BrightRequest(true, false); PostMessageW(h, WM_APP_AUDIOCHANGED, 0, 0); }
         return TRUE;
-    case WM_DESTROY: BlackoutEnd(); PostQuitMessage(0); return 0;   // never leave the screens dark
+    case WM_DESTROY: BlackoutEnd(); StopMicRouters(); CalMuteOthers(false); PostQuitMessage(0); return 0;   // never leave the screens dark; never leave a mic playing
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
