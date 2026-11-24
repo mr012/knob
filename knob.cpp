@@ -45,12 +45,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.2"
+#define APP_VERSION L"1.41.3"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE, WM_APP_FOCUSPANEL };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16, TIMER_FOCUSWATCH = 17 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -61,7 +61,7 @@ static HICON g_trayIcon;
 static bool g_visible = false;
 static HWND g_set;   // Settings window (declared early: the panel checks it)
 static bool g_pairHidden = false;   // panel tucked away because Settings went behind other windows
-static DWORD g_hideTick = 0;
+static DWORD g_hideTick = 0, g_shownTick = 0; static bool g_hadFocus = false, g_focusRetried = false;   // the panel on its own: closes as soon as it loses focus
 static std::wstring g_iniPath;
 static int g_trayPinned = -1;   // tray icon on the taskbar: -1 unknown, 0 hidden, 1 shown
 static bool g_trayGuidOk = true;
@@ -3755,7 +3755,8 @@ static void PairShow(bool activateSettings) {   // Settings came back: bring the
     if (!g_set) return;
     if (g_pairHidden) { g_pairHidden = false; ShowWindow(g_hwnd, SW_SHOWNOACTIVATE); InvalidateRect(g_hwnd, nullptr, FALSE); }
     if (g_visible) {   // like G-Helper's extra windows: both are ordinary windows (not always on top) and come forward together
-        SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // not always-on-top...
+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // ...but above every other app (NOTOPMOST alone leaves it where it was)
         SetWindowPos(g_set, g_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // Settings right under the panel
     }
     if (activateSettings) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
@@ -4013,6 +4014,8 @@ static void ShowFlyout() {
     ShowWindow(g_hwnd, SW_SHOW);
     ForceForeground(g_hwnd);
     g_visible = true;
+    g_shownTick = GetTickCount(); g_hadFocus = false; g_focusRetried = false;
+    SetTimer(g_hwnd, TIMER_FOCUSWATCH, 150, nullptr);   // a safety net next to WM_ACTIVATE: not in front any more means closed
     SetTimer(g_hwnd, TIMER_REFRESH, 1000, nullptr);
     StartAnim();
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -4027,6 +4030,7 @@ static void HideFlyout() {
     if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
     if (GetCapture() == g_hwnd) ReleaseCapture();
     KillTimer(g_hwnd, TIMER_REFRESH);
+    KillTimer(g_hwnd, TIMER_FOCUSWATCH);
     KillTimer(g_hwnd, TIMER_ANIM);
     ShowWindow(g_hwnd, SW_HIDE);
     g_hideTick = GetTickCount();
@@ -5611,6 +5615,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             RestartRouter();
             UpdateTrayTip();
             if (g_visible) InvalidateRect(h, nullptr, FALSE);
+        } else if (wp == TIMER_FOCUSWATCH) {
+            if (!g_visible || g_set || g_pairHidden) return 0;   // with Settings open the two windows follow the pair rules instead
+            HWND fg = GetForegroundWindow();
+            if (!fg) return 0;   // Windows is switching windows
+            DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+            if (fg == h) { g_hadFocus = true; return 0; }
+            if (pid == GetCurrentProcessId()) return 0;   // one of Knob's own windows
+            DWORD age = GetTickCount() - g_shownTick;
+            if (g_hadFocus) HideFlyout();   // it was in front and another app took over
+            else if (age > 400 && !g_focusRetried) { g_focusRetried = true; ForceForeground(h); }   // never got focus: one more try
+            else if (age > 2000) HideFlyout();
+            return 0;
         } else if (wp == TIMER_REFRESH && g_visible && g_dragEl < 0) {
             RefreshEndpointLevels(g_out);
             RefreshEndpointLevels(g_in);
