@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.4"
+#define APP_VERSION L"1.40.5"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2182,12 +2182,10 @@ static Graphics* MeasureG() {   // one small surface for measuring text outside 
     return mg;
 }
 static float MeasureW(const wchar_t* s, Font* f) { RectF out; MeasureG()->MeasureString(s, -1, f, PointF(0, 0), &out); return out.Width; }
-// Sound header, right to left: Auto sync · Routing · "N speakers ×"   (the design's h3row)
+// Sound header, right to left: Routing · "N speakers ×"   (Auto sync lives in Settings › Sound only)
 static bool ShowSyncBtns() { return SpeakersInUse() > 1; }
-static RectF AutoSyncRect(const El& e) { float w = S(11) + MeasureW(L"Auto sync", g_f11s) + S(11); return RectF(e.r.X + e.r.Width - w, e.r.Y + e.r.Height / 2 - S(12), w, S(24)); }
 static RectF RoutingRect(const El& e) {
-    float w = S(4) + MeasureW(L"Routing", g_fSmall) + S(4), right = ShowSyncBtns() ? AutoSyncRect(e).X - S(8) : e.r.X + e.r.Width;
-    if (ShowSyncBtns() && NeedsSync()) right -= S(8) + S(11) + MeasureW(L"Not synced", g_f11);
+    float w = S(4) + MeasureW(L"Routing", g_fSmall) + S(4), right = e.r.X + e.r.Width;
     return RectF(right - w, e.r.Y + e.r.Height / 2 - S(9), w, S(18));
 }
 static std::wstring OneLabel() { return std::to_wstring(SpeakersInUse()) + L" speakers"; }
@@ -2211,8 +2209,7 @@ static RectF DelayPopup(const RectF& chip) {   // the design's "bstep" popup: 25
 }
 static RectF DlMinus(const RectF& pop) { return RectF(pop.X + S(14), pop.Y + S(37), S(34), S(34)); }
 static RectF DlPlus(const RectF& pop) { return RectF(pop.X + pop.Width - S(14) - S(34), pop.Y + S(37), S(34), S(34)); }
-static RectF DlSync(const RectF& pop) { float w = S(22) + MeasureW(L"Run Auto sync again", g_f11s); return RectF(pop.X + pop.Width - S(14) - w, pop.Y + pop.Height - S(12) - S(24), w, S(24)); }
-static RectF DlReset(const RectF& pop) { RectF s = DlSync(pop); float w = S(22) + MeasureW(L"Reset", g_f11s); return RectF(s.X - S(6) - w, s.Y, w, S(24)); }
+static RectF DlReset(const RectF& pop) { float w = S(22) + MeasureW(L"Reset", g_f11s); return RectF(pop.X + pop.Width - S(14) - w, pop.Y + pop.Height - S(12) - S(24), w, S(24)); }
 static bool InUse(int i) { auto u = UsedSpeakers(); return i >= 0 && i < (int)g_out.size() && std::find(u.begin(), u.end(), g_out[i].id) != u.end(); }
 static int DelayOf(int i) { return ShownDelay(g_out[i].id); }   // how long this speaker waits; the slowest shows 0
 static bool HasDelayChip(int i) { return SpeakersInUse() > 1 && InUse(i) && (DelayOf(i) > 0 || g_delayOpen == i); }
@@ -2350,7 +2347,7 @@ static Hit HitTest(float x, float y) {
     if (g_delayOpen >= 0 && DelayAnchor(dchip)) {
         RectF pop = DelayPopup(dchip);
         if (InRect(pop, x, y)) {
-            h.h = InRect(DlMinus(pop), x, y) ? H_DLMINUS : InRect(DlPlus(pop), x, y) ? H_DLPLUS : InRect(DlSync(pop), x, y) ? H_DLSYNC : InRect(DlReset(pop), x, y) ? H_DLRESET : H_MENUBG;
+            h.h = InRect(DlMinus(pop), x, y) ? H_DLMINUS : InRect(DlPlus(pop), x, y) ? H_DLPLUS : InRect(DlReset(pop), x, y) ? H_DLRESET : H_MENUBG;
             return h;
         }
     }
@@ -2375,7 +2372,6 @@ static Hit HitTest(float x, float y) {
         if (e.k == E_H3 && e.text == L"APPS" && AppRouteReady() && InRect(ResetOutRect(e), x, y)) { h.h = H_RESETOUT; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && InRect(RoutingRect(e), x, y)) { h.h = H_ROUTING; h.el = i; return h; }
         if (e.k == E_H3 && e.text == L"OUTPUT" && ShowSyncBtns() && InRect(OneRect(e), x, y)) { h.h = H_ONESPK; h.el = i; return h; }
-        if (e.k == E_H3 && e.text == L"OUTPUT" && ShowSyncBtns() && InRect(AutoSyncRect(e), x, y)) { h.h = H_AUTOSYNC; h.el = i; return h; }
         if (!InRect(e.r, x, y)) continue;
         h.el = i; h.idx = e.idx;
         if (IsRowKind(e.k)) {
@@ -2997,15 +2993,6 @@ static void DrawEl(Graphics& g, int index) {
                 FillRound(g, hov ? T.subtle3 : T.subtle2, op, op.Height / 2);
                 PillText(g, OneLabel().c_str(), g_f11, T.t1, RectF(op.X + S(10), op.Y, op.Width - S(10), op.Height));
                 Icon(g, "exit", S(11), WithAlpha(T.t1, 179), op.X + op.Width - S(9) - S(5.5f), op.Y + op.Height / 2);
-                RectF ar = AutoSyncRect(e); bool ah = g_hover.h == H_AUTOSYNC, need = NeedsSync();   // filled when a speaker was never measured
-                if (need) {   // "● Not synced" in the accent, just before the button
-                    float nx0 = ar.X - S(8) - (S(11) + MeasureW(L"Not synced", g_f11));
-                    DWORD t = GetTickCount() % 1400; float al = 0.55f + 0.45f * cosf(t / 1400.f * 6.2832f);
-                    SolidBrush db(WithAlpha(T.accent, (int)(255 * al))); g.FillEllipse(&db, nx0, op.Y + op.Height / 2 - S(3), S(6), S(6));
-                    PillText(g, L"Not synced", g_f11, T.accent, RectF(nx0 + S(11), ar.Y, ar.X - nx0, ar.Height));
-                }
-                FillRound(g, need ? (ah ? WithAlpha(T.accent, 220) : T.accent) : (ah ? T.subtle3 : T.subtle2), ar, ar.Height / 2);
-                PillText(g, g_calibrating ? L"Syncing\u2026" : L"Auto sync", g_f11s, need ? T.onAccent : T.t1, ar, StringAlignmentCenter);
             }
         }
         return;
@@ -3462,7 +3449,6 @@ static void DrawDelayPopupBody(Graphics& g) {
     TextWrap(g, note.c_str(), g_fSmall, T.t3, RectF(pop.X + S(14), pop.Y + S(79), pop.Width - S(28), DelayNoteLines() * S(17.25f) + S(4)));
     bool canReset = DelayOf(g_delayOpen) != MeasuredShown(g_out[g_delayOpen].id);
     GhostBtn(g, DlReset(pop), L"Reset", g_hover.h == H_DLRESET, false, canReset);
-    GhostBtn(g, DlSync(pop), L"Run Auto sync again", g_hover.h == H_DLSYNC, false, !g_calibrating);
 }
 
 static void DrawDropdown(Graphics& g) {
@@ -5526,7 +5512,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         Layout();
         Hit ht = HitTest(x, y);
         // an open popup swallows the click that closes it
-        if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLSYNC && ht.h != H_DLRESET && ht.h != H_MENUBG) {
+        if (g_delayOpen >= 0 && ht.h != H_DLMINUS && ht.h != H_DLPLUS && ht.h != H_DLRESET && ht.h != H_MENUBG) {
             bool same = ht.h == H_DELAYCHIP && ht.idx == g_delayOpen;
             g_delayOpen = -1; InvalidateRect(h, nullptr, FALSE);
             if (same || ht.h != H_DELAYCHIP) return 0;
@@ -5595,12 +5581,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(h, TIMER_DELAYAPPLY, 350, nullptr);   // apply once the clicking stops
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             break;
-        case H_DLSYNC: g_delayOpen = -1; g_calShow = true; g_calAsk = true; break;   // ask first, like the header button
         case H_DLRESET:   // back to what Auto sync measured
             for (auto& kv : g_delayMeasured) g_delay[kv.first] = kv.second;
             SaveSettings(); RestartRouter(); break;
-        case H_AUTOSYNC: if (!g_calibrating) { g_calShow = true; g_calAsk = true; g_calStatus.clear(); } else g_calShow = true; g_delayOpen = -1; break;
-        case H_CALSTART: g_calAsk = false; StartAutoSync(); break;
+                case H_CALSTART: g_calAsk = false; StartAutoSync(); break;
         case H_CALCANCEL: if (g_calAsk) { g_calAsk = false; g_calShow = false; } else InterlockedExchange(&g_calCancel, 1); break;
         case H_CALDONE: g_calShow = false; g_calStatus.clear(); break;
         case H_GEAR:   // open Settings, or bring it to the front if it's already open
