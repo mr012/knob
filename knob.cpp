@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.5"
+#define APP_VERSION L"1.40.6"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -3723,7 +3723,7 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
         int t = a == HK_TABSOUND ? T_SOUND : a == HK_TABAPPS ? T_APPS : T_DISPLAY;
         if (g_visible && g_tab == t && !g_set) { HideFlyout(); return; }   // same keys again closes it
         if (g_pairHidden) PairShow(false);   // Settings is open behind another app: bring the panel back first
-        if (!g_visible) { g_tab = t; ShowFlyout(); } else { LoadEndpoints(eRender, g_out); LoadEndpoints(eCapture, g_in); SetTab(t); if (t == T_APPS) { LoadApps(); UpdatePeaks(); } InvalidateRect(g_hwnd, nullptr, FALSE); SetForegroundWindow(g_hwnd); }
+        if (!g_visible) { g_tab = t; g_tabStart = 0; ShowFlyout(); }   // g_tabStart = 0: the tab highlight jumps straight to this tab (it kept the last animated one) else { LoadEndpoints(eRender, g_out); LoadEndpoints(eCapture, g_in); SetTab(t); if (t == T_APPS) { LoadApps(); UpdatePeaks(); } InvalidateRect(g_hwnd, nullptr, FALSE); SetForegroundWindow(g_hwnd); }
         return;
     }
     int d = DefaultOut();
