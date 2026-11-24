@@ -45,11 +45,11 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.1"
+#define APP_VERSION L"1.41.2"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
-enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE };
+enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE, WM_APP_FOCUSPANEL };
 enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
@@ -3731,6 +3731,15 @@ static void Paint(HDC hdc) {
     DeleteDC(mdc);
 }
 
+static void ForceForeground(HWND h) {   // Windows only lets the active app take focus; borrow the active window's input for a moment
+    if (!h) return;
+    HWND fg = GetForegroundWindow();
+    if (fg == h) return;
+    DWORD me = GetCurrentThreadId(), ft = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    bool att = ft && ft != me && AttachThreadInput(me, ft, TRUE);
+    BringWindowToTop(h); SetForegroundWindow(h);
+    if (att) AttachThreadInput(me, ft, FALSE);
+}
 static void ShowFlyout();
 static void PairHide() {   // Settings lost the foreground to another app: tuck the panel away with it
     if (!g_set || !g_visible || g_pairHidden) return;
@@ -3818,9 +3827,18 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
     if (a == HK_OPEN) { if (g_set && (g_visible || g_pairHidden)) PairShow(true); else if (g_visible) HideFlyout(); else ShowFlyout(); return; }
     if (a == HK_TABSOUND || a == HK_TABAPPS || a == HK_TABDISPLAY) {   // open straight on that tab
         int t = a == HK_TABSOUND ? T_SOUND : a == HK_TABAPPS ? T_APPS : T_DISPLAY;
-        if (g_visible && g_tab == t && !g_set) { HideFlyout(); return; }   // same keys again closes it
+        bool front = GetForegroundWindow() == g_hwnd;
+        if (g_visible && !g_set && front && g_tab == t) { HideFlyout(); return; }   // same keys again closes it (only the panel on its own)
         if (g_pairHidden) PairShow(false);   // Settings is open behind another app: bring the panel back first
-        if (!g_visible) { g_tab = t; g_tabStart = 0; ShowFlyout(); }   // g_tabStart = 0: the tab highlight jumps straight to this tab (it kept the last animated one) else { LoadEndpoints(eRender, g_out); LoadEndpoints(eCapture, g_in); SetTab(t); if (t == T_APPS) { LoadApps(); UpdatePeaks(); } InvalidateRect(g_hwnd, nullptr, FALSE); SetForegroundWindow(g_hwnd); }
+        if (!g_visible) { g_tab = t; g_tabStart = 0; ShowFlyout(); }   // g_tabStart = 0: the tab highlight jumps straight to this tab
+        else {   // already open (or behind other windows): go to that tab and take focus
+            LoadEndpoints(eRender, g_out); LoadEndpoints(eCapture, g_in);
+            SetTab(t);
+            if (t == T_APPS) { LoadApps(); UpdatePeaks(); }
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            if (g_set) PairShow(false);   // Settings comes forward with the panel
+            ForceForeground(g_hwnd);
+        }
         return;
     }
     int d = DefaultOut();
@@ -3993,7 +4011,7 @@ static void ShowFlyout() {
     BrightRequest(!g_monsLoaded, g_monsLoaded);
     PositionFlyout();
     ShowWindow(g_hwnd, SW_SHOW);
-    SetForegroundWindow(g_hwnd);
+    ForceForeground(g_hwnd);
     g_visible = true;
     SetTimer(g_hwnd, TIMER_REFRESH, 1000, nullptr);
     StartAnim();
@@ -5395,7 +5413,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         CanvasFree(g_cvSet); FadeFree(g_fadeSet);   // Settings closed: its frame buffers aren't needed
         if (!g_visible && !g_pairHidden) FreeApps();   // the routing board's app list
         if (g_pairHidden) { g_pairHidden = false; HideFlyout(); }   // it was tucked away: close it properly
-        else if (g_visible) { SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); SetForegroundWindow(g_hwnd); }   // quick flyout again: on top, and focus back so it closes normally
+        else if (g_visible) PostMessageW(g_hwnd, WM_APP_FOCUSPANEL, 0, 0);   // quick flyout again: on top and focused (after Settings is gone) so it closes when you click away
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -5520,6 +5538,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
     }
+    case WM_APP_FOCUSPANEL:
+        if (g_visible && !g_set) { SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); ForceForeground(h); }
+        return 0;
     case WM_APP_QUIT: DestroyWindow(h); return 0;
     case WM_APP_VOLCHANGED:
         InterlockedExchange(&g_volPending, 0);
