@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.3"
+#define APP_VERSION L"1.40.4"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -272,10 +272,17 @@ static ProcInfo& GetProcInfo(const std::wstring& path) {
         size_t dot = pi.name.rfind(L'.');
         if (dot != std::wstring::npos) pi.name.resize(dot);
     }
-    int isz = (int)S(22);
+    int isz = std::max(64, (int)S(48));   // taken big and shrunk when drawn: a 22 px copy was stretched to 18-24 px and looked soft
     HICON big = nullptr;
     if (SHDefExtractIconW(path.c_str(), 0, 0, &big, nullptr, MAKELONG(isz, isz)) == S_OK && big) { pi.icon = IconToBitmap(big); DestroyIcon(big); }
     return g_procCache[path] = pi;
+}
+static void DrawAppIcon(Graphics& g, Gdiplus::Bitmap* icn, RectF r) {   // shrink the big icon smoothly, with no halo at its edges
+    Gdiplus::ImageAttributes ia; ia.SetWrapMode(Gdiplus::WrapModeTileFlipXY);
+    auto im = g.GetInterpolationMode(); auto po = g.GetPixelOffsetMode();
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    g.DrawImage(icn, r, 0, 0, (REAL)icn->GetWidth(), (REAL)icn->GetHeight(), Gdiplus::UnitPixel, &ia);
+    g.SetInterpolationMode(im); g.SetPixelOffsetMode(po);
 }
 static void ClearProcCache() {
     for (auto& kv : g_procCache) delete kv.second.icon;
@@ -3029,7 +3036,7 @@ static void DrawEl(Graphics& g, int index) {
             Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
             float isz = S(24);
             if (a.system) { FillRound(g, T.badge, RectF(lx - S(11), cy1 - S(11), S(22), S(22)), S(10)); Icon(g, "bell", S(14), T.t1, lx, cy1); }
-            else if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(lx - isz / 2, cy1 - isz / 2, isz, isz)); }
+            else if (icn) DrawAppIcon(g, icn, RectF(lx - isz / 2, cy1 - isz / 2, isz, isz));
             else {   // no icon: a tile with the app's first letter, like the design
                 static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
                 unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
@@ -3083,9 +3090,9 @@ static void DrawEl(Graphics& g, int index) {
             for (auto& a : g_apps) { if (a.system) continue; auto r = AppRoutes(a); if (std::find(r.begin(), r.end(), g_out[e.idx].id) != r.end()) here.push_back(&a); }
             for (int k = (int)here.size() - 1; k >= 0; k--) {   // right to left, so each icon sits on top of the one after it
                 RectF ir(ix + k * (isz - S(4)), iy, isz, isz);
-                FillRound(g, Color(T.dark ? 100 : 56, 0, 0, 0), RectF(ir.X + S(1.5f), ir.Y, ir.Width, ir.Height), S(5));   // small shadow
                 Gdiplus::Bitmap* icn = here[k]->path.empty() ? nullptr : GetProcInfo(here[k]->path).icon;
-                if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, ir); }
+                if (!icn) FillRound(g, Color(T.dark ? 100 : 56, 0, 0, 0), RectF(ir.X + S(1.5f), ir.Y, ir.Width, ir.Height), S(5));   // small shadow, only behind the solid letter tiles (it showed as a dark box behind real icons)
+                if (icn) DrawAppIcon(g, icn, ir);
                 else {
                     static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
                     unsigned hsh = 0; for (wchar_t ch : here[k]->name) hsh = hsh * 31 + ch;
@@ -4710,7 +4717,7 @@ static void PaintSettings(HDC hdc) {
                     RectF ic(r.X + S(12), r.Y + S(9), S(26), S(26));
                     AppGroup& a = g_apps[sidx];
                     Gdiplus::Bitmap* icn = a.path.empty() ? nullptr : GetProcInfo(a.path).icon;
-                    if (icn) { g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24))); }
+                    if (icn) DrawAppIcon(g, icn, RectF(ic.X + S(1), ic.Y + S(1), S(24), S(24)));
                     else {
                         static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
                         unsigned hsh = 0; for (wchar_t ch : a.name) hsh = hsh * 31 + ch;
