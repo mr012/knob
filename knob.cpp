@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.39.9"
+#define APP_VERSION L"1.40.0"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -182,7 +182,6 @@ struct AppGroup {
     BOOL mute = FALSE;
     float peak = 0;
     bool onMain = false;   // has a session on the main speaker: what Windows' own volume mixer lists
-    bool active = false;   // Windows says its sound is running right now
 };
 struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
@@ -843,7 +842,6 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
                                 }
                                 g_apps[it->second].vols.push_back(sv);
                                 if (isMain) g_apps[it->second].onMain = true;
-                                if (st == AudioSessionStateActive) g_apps[it->second].active = true;
                                 if (!sys && std::find(g_apps[it->second].pids.begin(), g_apps[it->second].pids.end(), pid) == g_apps[it->second].pids.end())
                                     g_apps[it->second].pids.push_back(pid);
                                 Meter* mi = nullptr;
@@ -877,23 +875,13 @@ static void LoadApps(bool all = false) {   // all = include apps Windows marks i
     }
     if (gone) RestartAppRouters();
     if (all) return;
-    // same list as Windows' volume mixer: apps on the main speaker that are playing, or paused with a window open
-    // (a paused browser stays; background helpers like Biometric Enrollment Host don't). Apps you sent to another speaker stay too.
-    std::set<std::wstring> withWindow;   // programs that have a window on screen
-    { std::map<DWORD, bool> seen;
-      struct C { std::set<std::wstring>* w; std::map<DWORD, bool>* seen; } c{&withWindow, &seen};
-      EnumWindows([](HWND w, LPARAM lp) -> BOOL {
-          auto* c = (C*)lp;
-          if (!IsWindowVisible(w) || GetWindow(w, GW_OWNER)) return TRUE;
-          DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
-          if ((*c->seen)[pid]) return TRUE;
-          (*c->seen)[pid] = true;
-          std::wstring path = ProcPath(pid); if (!path.empty()) c->w->insert(ToLower(path));
-          return TRUE; }, (LPARAM)&c); }
+    // same list as Windows' volume mixer: every app Windows has on the main speaker, playing or paused.
+    // Windows' own helper programs (in the Windows folder, like Biometric Enrollment Host) stay hidden. Apps you sent to another speaker stay too.
+    static std::wstring winDir; if (winDir.empty()) { wchar_t w[MAX_PATH] = {}; GetWindowsDirectoryW(w, MAX_PATH); winDir = ToLower(std::wstring(w)) + L"\\"; }
     for (size_t i = g_apps.size(); i-- > 0;) {
         AppGroup& a = g_apps[i];
         if (a.system || !a.outId.empty() || g_appExtra.count(a.key)) continue;
-        if (a.onMain && (a.active || withWindow.count(a.key))) continue;
+        if (a.onMain && a.key.compare(0, winDir.size(), winDir) != 0) continue;
         for (auto* v : a.vols) v->Release();
         for (auto* m : a.meters) m->Release();
         g_apps.erase(g_apps.begin() + i);
@@ -1009,7 +997,7 @@ static DWORD WINAPI RouterProc(LPVOID p) {
             IMMDevice* d = nullptr;
             if (FAILED(en->GetDevice(t.id.c_str(), &d))) continue;
             Out o; o.ti = ti;
-            o.delayFrames = (UINT32)((UINT64)rate * std::max(0, std::min(1000, t.delayMs)) / 1000);
+            o.delayFrames = (UINT32)((UINT64)rate * std::max(0, std::min(2000, t.delayMs)) / 1000);
             o.q.reserve((size_t)(o.delayFrames + rate) * fb);   // room for a second of audio, so it rarely has to grow
             o.q.assign((size_t)o.delayFrames * fb, 0);   // start the delay line full of silence
             if (SUCCEEDED(d->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&o.ac)) &&
@@ -1206,7 +1194,8 @@ static void RestartMirror() {
 // Two chirps go out through the main output. During the first every copy is silent; during the second only
 // copy k plays. The mic hears main alone, then main + copy k: the gap between them is copy k's offset.
 struct CalTarget { std::wstring id, name; int delayMs; };
-struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::wstring status, swapTo, swapName; };
+struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::vector<std::wstring> missed; std::wstring status, swapTo, swapName; };
+static std::set<std::wstring> g_calMissed;   // speakers the last Auto sync couldn't hear
 static int g_calPass = 0;
 static bool g_calApps = false;   // this run also measures speakers only apps play on: no main-speaker switch, delays may go below 0   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
@@ -1242,7 +1231,7 @@ static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std
     IAudioClient *rac = nullptr, *cac = nullptr; IAudioRenderClient* rc = nullptr; IAudioCaptureClient* cc = nullptr;
     std::vector<float> rec;
     int result = 3;
-    const UINT32 gap = CAL_RATE * 8 / 10, lead = CAL_RATE / 10, total = lead + gap + CAL_RATE * 9 / 10;
+    const UINT32 gap = CAL_RATE * 8 / 10, lead = CAL_RATE / 10, total = lead + gap + CAL_RATE * 9 / 10;   // the copy may land up to ~2 s later
     do {
         if (FAILED(outDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&rac))) break;
         if (FAILED(micDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&cac))) break;
@@ -1271,7 +1260,7 @@ static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std
         cac->Start(); rac->Start();
         DWORD t0 = GetTickCount();
         bool switched = false;
-        while (GetTickCount() - t0 < 2600) {
+        while (GetTickCount() - t0 < 3800) {
             Sleep(5);
             if (!switched && GetTickCount() - t0 > 500) { if (g_router) InterlockedExchange(&g_router->calOnly, target); switched = true; }
             UINT32 pk = 0;
@@ -1336,7 +1325,23 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
     do {
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) { res->status = L"Couldn't open audio devices"; break; }
         if (FAILED(en->GetDefaultAudioEndpoint(eRender, eConsole, &outDev))) { res->status = L"No main output"; break; }
-        if (FAILED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &micDev))) { res->status = L"No microphone found — auto sync needs one"; break; }
+        {   // the laptop's built-in mic hears the room best, and never puts Bluetooth buds into call mode
+            auto builtIn = [](IMMDevice* d) {   // not Bluetooth, not USB
+                IPropertyStore* ps = nullptr; std::wstring hw;
+                if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps)) && ps) { hw = Lower(PropStr(ps, PK_HwInstance)); ps->Release(); }
+                hw += L"|" + Lower(ConnectedPath(d));
+                return hw.find(L"bth") == std::wstring::npos && hw.find(L"usb") == std::wstring::npos;
+            };
+            IMMDevice* def = nullptr;
+            if (SUCCEEDED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &def)) && def) { if (builtIn(def)) micDev = def; else def->Release(); }
+            IMMDeviceCollection* mc = nullptr;
+            if (!micDev && SUCCEEDED(en->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &mc)) && mc) {
+                UINT mn = 0; mc->GetCount(&mn);
+                for (UINT i = 0; i < mn && !micDev; i++) { IMMDevice* d = nullptr; if (SUCCEEDED(mc->Item(i, &d)) && d) { if (builtIn(d)) micDev = d; else d->Release(); } }
+                mc->Release();
+            }
+        }
+        if (!micDev && FAILED(en->GetDefaultAudioEndpoint(eCapture, eConsole, &micDev))) { res->status = L"No microphone found — auto sync needs one"; break; }
         int ok = 0;
         int worst = 0; std::wstring worstId, worstName;   // most negative delay = slowest speaker
         for (int k = 0; k < (int)ts->size(); k++) {
@@ -1351,12 +1356,12 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
                 if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 34, k, (LPARAM)(INT_PTR)lround(fabs(off)));
                 if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
                 if (nd < -10 && g_calPass) notes += t.name + L" couldn't be lined up fully. ";
-                nd = g_calApps ? std::max(-500, std::min(500, nd)) : std::max(0, std::min(500, nd));   // app copies: keep "faster than main" too
+                nd = g_calApps ? std::max(-2000, std::min(2000, nd)) : std::max(0, std::min(2000, nd));   // app copies: keep "faster than main" too
                 res->delays.push_back({t.id, nd});
                 ok++;
             } else if (r == 2) { res->status = L"The microphone couldn't hear the main output — turn the volume up"; break; }
-            else if (r == 3) notes += L"Couldn't use " + t.name + L". ";
-            else notes += L"Couldn't hear " + t.name + L". ";
+            else if (r == 3) { notes += L"Couldn't use " + t.name + L". "; res->missed.push_back(t.id); }
+            else { notes += L"Couldn't hear " + t.name + L" \u2014 turn it up and try again. "; res->missed.push_back(t.id); }
         }
         if (res->status == L"Stopped") break;
         if (res->status.empty() && worst < -10 && !g_calPass && !g_calApps) {   // let Knob make the slowest speaker the main output, then sync again
@@ -2208,8 +2213,8 @@ static bool NeedsSync() {   // several speakers, and one of them was never measu
 }
 static void NudgeDelay(int i, int ms) {   // −/+ in the delay popup: going below 0 holds the other speakers back instead
     if (i < 0 || i >= (int)g_out.size()) return;
-    if (g_out[i].isDefault) { for (auto& id : UsedSpeakers()) if (id != g_out[i].id) g_delay[id] = std::max(-500, std::min(500, DelayFor(id) - ms)); }
-    else g_delay[g_out[i].id] = std::max(-500, std::min(500, DelayFor(g_out[i].id) + ms));
+    if (g_out[i].isDefault) { for (auto& id : UsedSpeakers()) if (id != g_out[i].id) g_delay[id] = std::max(-2000, std::min(2000, DelayFor(id) - ms)); }
+    else g_delay[g_out[i].id] = std::max(-2000, std::min(2000, DelayFor(g_out[i].id) + ms));
 }
 
 static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height; }
@@ -3374,7 +3379,8 @@ static void DrawCalCard(Graphics& g) {
         for (auto& id : UsedSpeakers()) {
             int d = ShownDelay(id);
             Text(g, OutName(id).c_str(), g_fSmall, T.t1, RectF(tx, y, c.Width - S(140), S(16)));
-            if (d) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", d); Text(g, t, &fB, T.accent, RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar); }
+            if (g_calMissed.count(id)) Text(g, L"not heard", &fB, Color(255, 232, 72, 72), RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar);
+            else if (d) { wchar_t t[24]; swprintf(t, 24, L"+%d ms", d); Text(g, t, &fB, T.accent, RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar); }
             else Text(g, L"slowest · 0 ms", g_fSmall, T.t3, RectF(c.X + c.Width - S(14) - S(120), y, S(120), S(16)), StringAlignmentFar);
             y += S(21);
         }
@@ -4318,7 +4324,7 @@ static void CommitRename(bool keep) {
     if (g_editDelay >= 0) {   // typed sync delay
         if (keep && g_editDelay < (int)g_out.size()) {
             wchar_t b[16]; GetWindowTextW(g_edit, b, 16);
-            int v = std::max(0, std::min(500, (int)lround(_wtoi(b) / 5.0) * 5));
+            int v = std::max(0, std::min(2000, (int)lround(_wtoi(b) / 5.0) * 5));
             g_delay[g_out[g_editDelay].id] = v + MinDelay(); SaveSettings(); RestartRouter();
         }
         HWND e = g_edit; g_edit = nullptr; g_editDelay = -1; DestroyWindow(e);
@@ -5286,6 +5292,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (r) {
             for (auto& d : r->delays) { g_delay[d.first] = d.second; g_delayMeasured[d.first] = d.second; }
             g_calStatus = r->status;
+            g_calMissed.clear(); for (auto& id : r->missed) g_calMissed.insert(id);
             if (!r->delays.empty()) SaveSettings();
             int di = DefaultOut();
             if (!r->swapTo.empty() && di >= 0) {   // slowest speaker becomes the main output; the old main becomes a copy
