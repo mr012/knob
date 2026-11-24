@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.6"
+#define APP_VERSION L"1.40.7"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1958,7 +1958,7 @@ static void ApplyDim() {
         if (!w) continue;
         SetLayeredWindowAttributes(w, 0, (BYTE)std::min(230, it->second * 255 / 100), LWA_ALPHA);
         SetWindowPos(w, HWND_TOPMOST, m.rc.left, m.rc.top, m.rc.right - m.rc.left, m.rc.bottom - m.rc.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        if (g_hwnd && IsWindowVisible(g_hwnd)) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // the panel stays readable
+        if (g_hwnd && !g_set && IsWindowVisible(g_hwnd)) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // the panel stays readable
     }
     for (auto it = g_dimWnds.begin(); it != g_dimWnds.end();) {
         if (!want.count(it->first)) { if (it->second) DestroyWindow(it->second); it = g_dimWnds.erase(it); } else ++it;
@@ -3651,7 +3651,10 @@ static void PairBack() {   // you clicked another app: panel and Settings both s
 static void PairShow(bool activateSettings) {   // Settings came back: bring the panel back beside it
     if (!g_set) return;
     if (g_pairHidden) { g_pairHidden = false; ShowWindow(g_hwnd, SW_SHOWNOACTIVATE); InvalidateRect(g_hwnd, nullptr, FALSE); }
-    if (g_visible) SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (g_visible) {   // like G-Helper's extra windows: both are ordinary windows (not always on top) and come forward together
+        SetWindowPos(g_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetWindowPos(g_set, g_hwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);   // Settings right under the panel
+    }
     if (activateSettings) { if (IsIconic(g_set)) ShowWindow(g_set, SW_RESTORE); SetForegroundWindow(g_set); }
 }
 static void HideFlyout();
@@ -3880,7 +3883,7 @@ static void PositionFlyout() {
     int x = wa.right - w - m, y = wa.bottom - h - m;
     if (wa.top > mr.top) y = wa.top + m;
     if (wa.left > mr.left) x = wa.left + m;
-    SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+    SetWindowPos(g_hwnd, g_set ? HWND_NOTOPMOST : HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);   // on top only as a quick flyout; next to Settings it is a normal window
 }
 
 static void StartAnim() { if (g_visible && g_tab == T_APPS) SetTimer(g_hwnd, TIMER_ANIM, 70, nullptr); else KillTimer(g_hwnd, TIMER_ANIM); }
@@ -5218,7 +5221,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         CanvasFree(g_cvSet); FadeFree(g_fadeSet);   // Settings closed: its frame buffers aren't needed
         if (!g_visible && !g_pairHidden) FreeApps();   // the routing board's app list
         if (g_pairHidden) { g_pairHidden = false; HideFlyout(); }   // it was tucked away: close it properly
-        else if (g_visible) SetForegroundWindow(g_hwnd);   // hand focus back so the panel closes normally again
+        else if (g_visible) { SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); SetForegroundWindow(g_hwnd); }   // quick flyout again: on top, and focus back so it closes normally
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -5265,6 +5268,7 @@ static void OpenSettings(int page, bool newProfile) {
     SetTimer(g_set, 78, 500, nullptr);
     if (page == SP_SOUND) { LoadApps(); UpdatePeaks(); }
     ShowWindow(g_set, IsIconic(g_set) ? SW_RESTORE : SW_SHOW);
+    if (g_visible) PairShow(false);   // the panel stops being always-on-top while Settings is open
     SetForegroundWindow(g_set);
     InvalidateRect(g_set, nullptr, FALSE);
     if (editIdx >= 0) PostMessageW(g_set, WM_APP_STARTEDIT, editIdx, 0);
@@ -5458,6 +5462,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_ACTIVATE:
+        if (LOWORD(wp) != WA_INACTIVE && g_set && g_visible) PairShow(false);   // clicked the panel: Settings comes forward with it
         if (LOWORD(wp) == WA_INACTIVE && g_visible) {
             if (!g_set) HideFlyout();
             else if ((HWND)lp != g_set) PairBack();   // clicked another app: panel and Settings step back together, both still visible
