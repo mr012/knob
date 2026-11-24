@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.0"
+#define APP_VERSION L"1.41.1"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4059,18 +4059,44 @@ static bool IsCallEndpoint(const Endpoint& e) {   // Bluetooth hands-free (call 
 static std::vector<HWND> g_blackWnds;
 static std::vector<int> g_blackPrev;
 static POINT g_blackPt; static DWORD g_blackTick;
-static void BlackoutEnd() {
-    if (g_blackWnds.empty()) return;
+// the black fades in over BLACK_FADE ms, then the screens' own brightness goes to 0; waking fades it back out
+static const DWORD BLACK_FADE = 320;
+static int g_blackDir = 0;              // 1 fading to black, -1 fading back, 0 holding
+static DWORD g_blackT0; static int g_blackA = 0, g_blackA0 = 0;
+static bool g_blackCursorHidden = false;
+static void BlackSetAlpha(int a) { g_blackA = a; for (HWND w : g_blackWnds) SetLayeredWindowAttributes(w, 0, (BYTE)a, LWA_ALPHA); }
+static void BlackDestroy() {
     for (HWND w : g_blackWnds) DestroyWindow(w);
-    g_blackWnds.clear();
-    ShowCursor(TRUE);
-    for (int i = 0; i < (int)g_blackPrev.size() && i < (int)g_mons.size(); i++) if (g_blackPrev[i] >= 0) { g_mons[i].pct = g_blackPrev[i]; MonSet(i, 0, g_blackPrev[i]); }
+    g_blackWnds.clear(); g_blackDir = 0; g_blackA = 0;
+}
+static void BlackoutEnd(bool now = false) {   // now = at exit: no fade, never leave the screens dark
+    if (g_blackWnds.empty()) return;
+    if (g_blackCursorHidden) { ShowCursor(TRUE); g_blackCursorHidden = false; }
+    for (int i = 0; i < (int)g_blackPrev.size() && i < (int)g_mons.size(); i++) if (g_blackPrev[i] >= 0) { g_mons[i].pct = g_blackPrev[i]; MonSet(i, 0, g_blackPrev[i]); }   // brightness back first, under the black
     g_blackPrev.clear();
+    if (now) { BlackDestroy(); return; }
+    if (g_blackDir == -1) return;
+    g_blackDir = -1; g_blackA0 = g_blackA; g_blackT0 = GetTickCount();
+    SetTimer(g_blackWnds[0], 1, 15, nullptr);
 }
 static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_ERASEBKGND: { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
     case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
+    case WM_TIMER: {   // one fade step; smooth start and end
+        float t = std::min(1.f, (GetTickCount() - g_blackT0) / (float)BLACK_FADE), e = t * t * (3 - 2 * t);
+        int target = g_blackDir == 1 ? 255 : 0;
+        BlackSetAlpha(g_blackA0 + (int)lroundf((target - g_blackA0) * e));
+        if (t >= 1) {
+            KillTimer(h, 1);
+            if (g_blackDir == 1) {   // fully black: now dim every display we control to 0, remembering where it was
+                g_blackDir = 0;
+                g_blackPrev.assign(g_mons.size(), -1);
+                for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }
+            } else if (g_blackDir == -1) BlackDestroy();
+        }
+        return 0;
+    }
     case WM_MOUSEMOVE: {
         if (GetTickCount() - g_blackTick < 800) return 0;   // ignore the click that started it
         POINT p; GetCursorPos(&p);
@@ -4084,8 +4110,8 @@ static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 static BOOL CALLBACK BlackMonProc(HMONITOR, HDC, LPRECT rc, LPARAM) {
-    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"KnobBlack", L"", WS_POPUP, rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top, nullptr, nullptr, g_inst, nullptr);
-    if (w) { ShowWindow(w, SW_SHOW); g_blackWnds.push_back(w); }
+    HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"KnobBlack", L"", WS_POPUP, rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top, nullptr, nullptr, g_inst, nullptr);
+    if (w) { SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA); ShowWindow(w, SW_SHOW); g_blackWnds.push_back(w); }   // starts see-through, then fades to black
     return TRUE;
 }
 static void BlackoutStart() {
@@ -4095,10 +4121,10 @@ static void BlackoutStart() {
     EnumDisplayMonitors(nullptr, nullptr, BlackMonProc, 0);
     if (g_blackWnds.empty()) return;
     SetForegroundWindow(g_blackWnds[0]);
-    ShowCursor(FALSE);
+    ShowCursor(FALSE); g_blackCursorHidden = true;
     GetCursorPos(&g_blackPt); g_blackTick = GetTickCount();
-    g_blackPrev.assign(g_mons.size(), -1);   // dim every display we control to 0, remember where it was
-    for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }
+    g_blackDir = 1; g_blackA0 = 0; g_blackA = 0; g_blackT0 = GetTickCount();
+    SetTimer(g_blackWnds[0], 1, 15, nullptr);
 }
 static void ClickOutput(int i);
 static void AutoSwitchCheck() {   // headphones or earbuds just appeared: play there; gone: go back
@@ -5816,7 +5842,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_POWERBROADCAST:
         if (wp == PBT_APMRESUMEAUTOMATIC) { g_restoreAllNext = true; BrightRequest(true, false); PostMessageW(h, WM_APP_AUDIOCHANGED, 0, 0); }
         return TRUE;
-    case WM_DESTROY: BlackoutEnd(); StopMicRouters(); CalMuteOthers(false); PostQuitMessage(0); return 0;   // never leave the screens dark; never leave a mic playing
+    case WM_DESTROY: BlackoutEnd(true); StopMicRouters(); CalMuteOthers(false); PostQuitMessage(0); return 0;   // never leave the screens dark; never leave a mic playing
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
