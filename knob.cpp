@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.7"
+#define APP_VERSION L"1.40.8"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1206,6 +1206,7 @@ struct CalTarget { std::wstring id, name; int delayMs; };
 struct CalResult { std::vector<std::pair<std::wstring, int>> delays; std::vector<std::wstring> missed; std::wstring status, swapTo, swapName; };
 static std::set<std::wstring> g_calMissed;   // speakers the last Auto sync couldn't hear
 static int g_calPass = 0;
+static bool g_calRefineRun = false, g_calChained = false;   // the extra pass after a sync: measures once more with the new delays and trims what is left
 static bool g_calApps = false;   // this run also measures speakers only apps play on: no main-speaker switch, delays may go below 0   // 1 = second run after Knob made the slowest speaker the main output
 static std::wstring g_calStatus;
 static bool g_calShow = false;   // the panel's Auto sync card: ask, then measuring, then the result
@@ -1218,7 +1219,7 @@ static std::map<std::wstring, int> g_delayMeasured;   // what Auto sync set, so 
 static const UINT32 CAL_RATE = 48000;
 
 static const GUID KNOB_IID_IAudioClient2 = {0x726778cd, 0xf60a, 0x4eda, {0x82, 0xde, 0xe4, 0x76, 0x10, 0xcd, 0x78, 0xaa}};
-static std::vector<float> CalChirp() {   // 50 ms sweep 1 -> 6 kHz, Hann window
+static std::vector<float> CalChirp(bool quad = false) {   // 50 ms sweep 1 -> 6 kHz, Hann window; quad = the same sweep shifted 90 degrees (for the envelope)
     const int n = CAL_RATE / 20;
     std::vector<float> c(n);
     const double f0 = 1000, f1 = 6000, T = n / (double)CAL_RATE;
@@ -1226,7 +1227,7 @@ static std::vector<float> CalChirp() {   // 50 ms sweep 1 -> 6 kHz, Hann window
         double t = i / (double)CAL_RATE;
         double ph = 2 * 3.14159265358979 * (f0 * t + (f1 - f0) * t * t / (2 * T));
         double w = 0.5 - 0.5 * cos(2 * 3.14159265358979 * i / (n - 1));
-        c[i] = (float)(sin(ph) * w);
+        c[i] = (float)((quad ? cos(ph) : sin(ph)) * w);
     }
     return c;
 }
@@ -1235,7 +1236,8 @@ static void CalFormat(WAVEFORMATEX& f) {
     f.wBitsPerSample = 32; f.nBlockAlign = 4; f.nAvgBytesPerSec = CAL_RATE * 4;
 }
 // one round: returns copy-minus-main offset in ms; flags: 0 ok, 1 copy not heard, 2 nothing heard, 3 device error
-static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std::vector<float>& chirp, double& offsetMs) {
+static int CalAnalyze(const std::vector<float>& rec, const std::vector<float>& chirp, const std::vector<float>& chirpQ, UINT32 gap, double& offsetMs);
+static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std::vector<float>& chirp, const std::vector<float>& chirpQ, double& offsetMs) {
     WAVEFORMATEX f; CalFormat(f);
     IAudioClient *rac = nullptr, *cac = nullptr; IAudioRenderClient* rc = nullptr; IAudioCaptureClient* cc = nullptr;
     std::vector<float> rec;
@@ -1290,7 +1292,29 @@ static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std
     if (cac) cac->Release();
     if (rac) rac->Release();
     if (result == 3) return 3;
-    // matched filter
+    return CalAnalyze(rec, chirp, chirpQ, gap, offsetMs);
+}
+
+// Envelope of the matched filter (in-phase and 90-degree versions) around a coarse peak, with the top found to a fraction of a sample.
+// It ignores the carrier's phase, which each speaker bends differently, so the main and the copy are timed the same way.
+static void CalRefine(const std::vector<float>& rec, const std::vector<float>& c, const std::vector<float>& q, size_t at, double& pos) {
+    const size_t m = c.size();
+    int lo = std::max(0, (int)at - 48), hi = (int)at + 48;
+    if (rec.size() < m + 1) return;
+    hi = std::min(hi, (int)(rec.size() - m));
+    if (hi - lo < 4) return;
+    std::vector<double> env(hi - lo + 1);
+    for (int i = lo; i <= hi; i++) {
+        double a = 0, b = 0; const float* r = &rec[i];
+        for (size_t j = 0; j < m; j++) { a += (double)r[j] * c[j]; b += (double)r[j] * q[j]; }
+        env[i - lo] = sqrt(a * a + b * b);
+    }
+    int bi = 0; for (int k = 1; k < (int)env.size(); k++) if (env[k] > env[bi]) bi = k;
+    double frac = 0;
+    if (bi > 0 && bi + 1 < (int)env.size()) { double y0 = env[bi - 1], y1 = env[bi], y2 = env[bi + 1], d = y0 - 2 * y1 + y2; if (d < 0) frac = std::max(-1.0, std::min(1.0, 0.5 * (y0 - y2) / d)); }
+    pos = lo + bi + frac;
+}
+static int CalAnalyze(const std::vector<float>& rec, const std::vector<float>& chirp, const std::vector<float>& chirpQ, UINT32 gap, double& offsetMs) {   // what the microphone recorded -> copy minus main, in ms
     const size_t m = chirp.size();
     if (rec.size() < m + CAL_RATE) return 2;
     std::vector<float> corr(rec.size() - m);
@@ -1321,7 +1345,9 @@ static int CalRound(IMMDevice* outDev, IMMDevice* micDev, LONG target, const std
         if (corr[mainAt] > p1.second * 1.35f) { offsetMs = 0; return 0; }
         return 1;
     }
-    offsetMs = ((double)copyAt - (double)mainAt) * 1000.0 / CAL_RATE;
+    double mainPos = (double)mainAt, copyPos = (double)copyAt;   // then sharpen both to a fraction of a sample on the matched filter's envelope
+    CalRefine(rec, chirp, chirpQ, mainAt, mainPos); CalRefine(rec, chirp, chirpQ, copyAt, copyPos);
+    offsetMs = (copyPos - mainPos) * 1000.0 / CAL_RATE;
     return 0;
 }
 static DWORD WINAPI CalibrateProc(LPVOID p) {
@@ -1329,7 +1355,7 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     CalResult* res = new CalResult;
     IMMDeviceEnumerator* en = nullptr; IMMDevice *outDev = nullptr, *micDev = nullptr;
-    std::vector<float> chirp = CalChirp();
+    std::vector<float> chirp = CalChirp(), chirpQ = CalChirp(true);
     std::wstring notes;
     do {
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) { res->status = L"Couldn't open audio devices"; break; }
@@ -1357,18 +1383,28 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
             if (g_calCancel) { res->status = L"Stopped"; res->delays.clear(); ok = 0; break; }
             if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 33, k, 0);   // the panel shows which speaker is chirping
             CalTarget& t = (*ts)[k];
-            double off = 0; int r = CalRound(outDev, micDev, k, chirp, off);
+            double off = 0; int r = CalRound(outDev, micDev, k, chirp, chirpQ, off);
             if (r == 0) {
-                double oSecond = 0;   // measure again and average when the two agree
-                if (CalRound(outDev, micDev, k, chirp, oSecond) == 0 && fabs(oSecond - off) < 15) off = (off + oSecond) / 2;
-                int nd = (int)lround((t.delayMs - off) / 10.0) * 10;
-                if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 34, k, (LPARAM)(INT_PTR)lround(fabs(off)));
+                // Speakers jitter by a few ms from round to round (Bluetooth most of all): take two rounds and use their average when they
+                // agree within 5 ms, otherwise a third and the middle one. The check pass after a sync takes a single round.
+                std::vector<double> got{off};
+                for (int again = 1; again < (g_calRefineRun ? 1 : 3) && !g_calCancel; again++) {
+                    double o2 = 0; if (CalRound(outDev, micDev, k, chirp, chirpQ, o2) != 0) continue;
+                    got.push_back(o2);
+                    if (got.size() == 2 && fabs(got[0] - got[1]) <= 5) break;
+                }
+                std::sort(got.begin(), got.end());
+                off = got.size() == 1 ? got[0] : got.size() == 2 ? (got[0] + got[1]) / 2 : got[1];
+                int nd = (int)lround(t.delayMs - off);   // to the millisecond
+                if (g_calRefineRun) { if (abs(nd - t.delayMs) > 40) nd = t.delayMs; }   // the check pass only trims; a big jump means this reading was off
+                if (g_hwnd && !g_calRefineRun) PostMessageW(g_hwnd, WM_APP + 34, k, (LPARAM)(INT_PTR)lround(fabs(off)));   // the check pass leaves the list showing the first measurement
                 if (nd < worst) { worst = nd; worstId = t.id; worstName = t.name; }
-                if (nd < -10 && g_calPass) notes += t.name + L" couldn't be lined up fully. ";
+                if (nd < -10 && g_calPass == 1) notes += t.name + L" couldn't be lined up fully. ";
                 nd = g_calApps ? std::max(-2000, std::min(2000, nd)) : std::max(0, std::min(2000, nd));   // app copies: keep "faster than main" too
                 res->delays.push_back({t.id, nd});
                 ok++;
-            } else if (r == 2) { res->status = L"The microphone couldn't hear the main output — turn the volume up"; break; }
+            } else if (g_calRefineRun) { continue; }   // the check pass: keep what the first pass set
+            else if (r == 2) { res->status = L"The microphone couldn't hear the main output — turn the volume up"; break; }
             else if (r == 3) { notes += L"Couldn't use " + t.name + L". "; res->missed.push_back(t.id); }
             else { notes += L"Couldn't hear " + t.name + L" \u2014 turn it up and try again. "; res->missed.push_back(t.id); }
         }
@@ -1389,6 +1425,8 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
 }
 static void StartAutoSync() {
     if (g_calibrating) return;
+    if (!g_calChained) { g_calPass = 0; g_calRefineRun = false; }   // a fresh run; only the follow-up passes Knob starts itself keep their state
+    g_calChained = false;
     int di = DefaultOut();
     std::vector<RouterTarget> all;
     if (g_router) all = g_router->targets;
@@ -5315,10 +5353,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_CALDONE: {
         CalResult* r = (CalResult*)lp;
         InterlockedExchange(&g_calibrating, 0);
-        if (r && r->status == L"Stopped") { g_calShow = false; g_calStatus.clear(); delete r; r = nullptr; g_calPass = 0; }
+        if (r && r->status == L"Stopped") { g_calShow = false; g_calStatus.clear(); delete r; r = nullptr; g_calPass = 0; g_calRefineRun = false; }
         if (r) {
             for (auto& d : r->delays) { g_delay[d.first] = d.second; g_delayMeasured[d.first] = d.second; }
-            g_calStatus = r->status;
+            if (!(g_calRefineRun && r->delays.empty())) g_calStatus = r->status;   // a check pass that found nothing keeps the first result
             g_calMissed.clear(); for (auto& id : r->missed) g_calMissed.insert(id);
             if (!r->delays.empty()) SaveSettings();
             int di = DefaultOut();
@@ -5332,7 +5370,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveSettings();
                 g_calPass = 1;
                 SetTimer(h, TIMER_CALRETRY, 2500, nullptr);
-            } else g_calPass = 0;
+            } else {
+                g_calPass = 0;
+                if (!g_calRefineRun && !r->delays.empty()) { g_calRefineRun = true; g_calPass = 2; SetTimer(h, TIMER_CALRETRY, 2500, nullptr); }   // measure once more with the new delays in place
+                else g_calRefineRun = false;
+            }
             delete r;
         }
         g_routerPending = false; RestartRouter();   // apply the new delays (and any device change that waited)
@@ -5434,7 +5476,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(h, TIMER_CALRETRY);
             InterlockedExchange(&g_calibrating, 0);
             RestartRouter();
-            StartAutoSync();   // second run with the new main output
+            g_calChained = true;
+            StartAutoSync();   // second run with the new main output, or the check pass after a sync
             if (g_set) InvalidateRect(g_set, nullptr, FALSE);
             return 0;
         } else if (wp == TIMER_TRAYPIN) {
