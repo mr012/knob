@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.2"
+#define APP_VERSION L"1.40.3"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1163,6 +1163,7 @@ static std::vector<std::wstring> UsedSpeakers() {   // every speaker something p
     return r;
 }
 static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
+static bool OutPlays(int i) { auto u = UsedSpeakers(); return std::find(u.begin(), u.end(), g_out[i].id) != u.end(); }   // anything plays here: the main speaker, a copy, or an app sent to it
 static int MinDelay() { int m = 0; bool first = true; for (auto& id : UsedSpeakers()) { int d = DelayFor(id); if (first || d < m) m = d; first = false; } return m; }
 static int ShownDelay(const std::wstring& id) { return DelayFor(id) - MinDelay(); }   // the slowest speaker shows 0 ms
 static void UpdateTrayTip();
@@ -3008,7 +3009,7 @@ static void DrawEl(Graphics& g, int index) {
     }
 
     if (IsRowKind(e.k)) {
-        bool sel = (e.k == E_OUT && OutSelected(e.idx)) || (e.k == E_IN && g_in[e.idx].isDefault);
+        bool sel = (e.k == E_OUT && OutPlays(e.idx)) || (e.k == E_IN && g_in[e.idx].isDefault);
         bool playing = e.k == E_APP && AppPlaying(g_apps[e.idx]) && !g_apps[e.idx].mute;
         bool pickable = e.k == E_OUT || e.k == E_IN;
         bool rowHover = hovEl && g_hover.h == H_ROW;
