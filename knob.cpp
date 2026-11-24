@@ -45,12 +45,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.3"
+#define APP_VERSION L"1.41.4"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
 enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE, WM_APP_FOCUSPANEL };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_OSD = 6, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16, TIMER_FOCUSWATCH = 17 };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16, TIMER_FOCUSWATCH = 17 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -104,7 +104,6 @@ static std::wstring g_updVersion, g_updUrl, g_updStatus = L"";
 static volatile LONG g_updBusy = 0;
 static Gdiplus::RectF g_verRect;
 static int g_capture = -1;      // shortcut row waiting for a key combo
-static bool g_osd = true;       // on-screen popup when a shortcut is used
 static int g_step = 5;          // volume step for shortcuts (%)
 
 // display profiles: name -> per-monitor brightness/contrast
@@ -319,7 +318,6 @@ static void LoadSettings() {
         }
         g_accentId = mode ? 1 : 0;
     }
-    g_osd = GetPrivateProfileIntW(L"main", L"osd", 1, g_iniPath.c_str()) != 0;
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
     g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
     g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
@@ -412,7 +410,7 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"accentmode", std::to_wstring(g_accentId).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"accenthue", std::to_wstring(g_accentHue).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"accentsat", std::to_wstring(g_accentSat).c_str(), g_iniPath.c_str());
-    WritePrivateProfileStringW(L"main", L"osd", g_osd ? L"1" : L"0", g_iniPath.c_str());
+    WritePrivateProfileStringW(L"main", L"osd", nullptr, g_iniPath.c_str());   // the old popup setting, gone
     WritePrivateProfileStringW(L"main", L"restorebright", g_restoreBright ? L"1" : L"0", g_iniPath.c_str());
     {
         std::wstring d, l;
@@ -3764,66 +3762,15 @@ static void PairShow(bool activateSettings) {   // Settings came back: bring the
 static void HideFlyout();
 static void OpenSettings(int page, bool newProfile);
 
-// ---------------------------------------------------------------- on-screen popup for shortcuts
-enum { OSD_VOL, OSD_MIC, OSD_BRIGHT };
-static HWND g_osdWnd;
-static int g_osdKind = OSD_VOL, g_osdVal = 0; static bool g_osdMuted = false;
-static LRESULT CALLBACK OsdProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_PAINT) {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        {
-            Graphics g(dc);
-            g.SetSmoothingMode(SmoothingModeAntiAlias);
-            g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
-            g.Clear(T.dark ? Color(255, 44, 44, 44) : Color(255, 249, 249, 249));
-            float W = (float)rc.right, H = (float)rc.bottom, cy = H / 2;
-            wchar_t gl = g_osdKind == OSD_BRIGHT ? G_BRIGHT : g_osdKind == OSD_MIC ? (g_osdMuted ? G_MICOFF : G_MIC) : (g_osdMuted ? G_MUTE : G_VOLUME);
-            Glyph(g, gl, g_fIcon, T.t1, S(28), cy);
-            RectF bar(S(52), cy - S(2), W - S(52) - S(52), S(4));
-            FillRound(g, T.track, bar, S(2));
-            float v = g_osdMuted ? 0.f : g_osdVal / 100.f;
-            if (v > 0) FillRound(g, T.accent, RectF(bar.X, bar.Y, bar.Width * v, bar.Height), S(2));
-            wchar_t t[16];
-            if (g_osdKind == OSD_MIC) swprintf(t, 16, g_osdMuted ? L"Off" : L"On");
-            else if (g_osdMuted) swprintf(t, 16, L"Mute");
-            else swprintf(t, 16, L"%d", g_osdVal);
-            Text(g, t, g_fSmall600, T.t1, RectF(W - S(46), 0, S(36), H), StringAlignmentCenter);
-        }
-        EndPaint(h, &ps);
-        return 0;
-    }
-    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
-    return DefWindowProcW(h, msg, wp, lp);
-}
-static HMONITOR PanelMonitor() {   // the screen Knob's windows open on
-    if (g_openOn == 0) { POINT o = {0, 0}; return MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY); }
-    POINT pt; GetCursorPos(&pt); return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-}
-static void ShowOsd(int kind, int val, bool muted) {
-    if (!g_osd) return;
-    g_osdKind = kind; g_osdVal = val; g_osdMuted = muted;
-    if (kind == OSD_MIC) g_osdVal = muted ? 0 : 100;
-    HMONITOR hm = PanelMonitor();
-    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
-    int w = (int)S(240), h = (int)S(48);
-    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2, y = mi.rcWork.bottom - h - (int)S(64);
-    if (!g_osdWnd) {
-        g_osdWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-                                   L"KnobOSD", L"", WS_POPUP, x, y, w, h, nullptr, nullptr, g_inst, nullptr);
-        if (!g_osdWnd) return;
-        SetLayeredWindowAttributes(g_osdWnd, 0, 245, LWA_ALPHA);
-        DWORD pref = 2; DwmSetWindowAttribute(g_osdWnd, 33, &pref, sizeof(pref));
-    }
-    SetWindowPos(g_osdWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(g_osdWnd, nullptr, FALSE);
-    SetTimer(g_hwnd, TIMER_OSD, 1400, nullptr);
-}
 
 static void SetTab(int t);
 static void NextOutput();
 static void StartAutoSync();
 static void SwitchOutput(int i);
+static HMONITOR PanelMonitor() {   // the screen Knob's windows open on
+    if (g_openOn == 0) { POINT o = {0, 0}; return MonitorFromPoint(o, MONITOR_DEFAULTTOPRIMARY); }
+    POINT pt; GetCursorPos(&pt); return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
 static void RunHotkey(int a, const std::wstring& param = L"") {
     if (a == HK_OPEN) { if (g_set && (g_visible || g_pairHidden)) PairShow(true); else if (g_visible) HideFlyout(); else ShowFlyout(); return; }
     if (a == HK_TABSOUND || a == HK_TABAPPS || a == HK_TABDISPLAY) {   // open straight on that tab
@@ -3849,13 +3796,13 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
         if (d >= 0) {
             float delta = (a == HK_VOLUP ? 1 : -1) * g_step / 100.f;
             for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) SetEndpointLevel(g_out[i], g_out[i].level + delta);
-            UpdateTrayTip(); ShowOsd(OSD_VOL, (int)lround(g_out[d].level * 100), false);
+            UpdateTrayTip();
         }
         break;
     case HK_MUTE:
-        if (d >= 0 && g_out[d].vol) { BOOL m = !g_out[d].mute; g_out[d].vol->SetMute(m, nullptr); g_out[d].mute = m; UpdateTrayTip(); ShowOsd(OSD_VOL, (int)lround(g_out[d].level * 100), m != FALSE); }
+        if (d >= 0 && g_out[d].vol) { BOOL m = !g_out[d].mute; g_out[d].vol->SetMute(m, nullptr); g_out[d].mute = m; UpdateTrayTip(); }
         break;
-    case HK_MIC: MicToggleMute(); ShowOsd(OSD_MIC, 0, AllMicsMuted()); break;
+    case HK_MIC: MicToggleMute(); break;
     case HK_APPMUTE: {   // the app whose window is in front
         DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         std::wstring path = ToLower(ProcPath(pid));
@@ -3866,20 +3813,17 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
             if (!match) continue;
             ap.mute = !ap.mute;
             for (auto* sv : ap.vols) sv->SetMute(ap.mute, nullptr);
-            ShowOsd(OSD_VOL, (int)lround(ap.level * 100), ap.mute != FALSE);
             break;
         }
         if (!g_visible) FreeApps(); else LoadApps();   // back to the mixer's list
         break;
     }
     case HK_BRIUP: case HK_BRIDOWN: {
-        int shown = -1;
         for (int i = 0; i < (int)g_mons.size(); i++) {
             if (!g_mons[i].ok) continue;
             int p = std::max(0, std::min(100, g_mons[i].pct + (a == HK_BRIUP ? g_step : -g_step)));
-            g_mons[i].pct = p; MonSet(i, 0, p); if (shown < 0) shown = p;
+            g_mons[i].pct = p; MonSet(i, 0, p);
         }
-        if (shown >= 0) ShowOsd(OSD_BRIGHT, shown, false);
         if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
         break;
     }
@@ -4189,7 +4133,7 @@ static void SwitchOutput(int i) {   // shortcut "Switch to": that speaker, with 
     if (i < 0 || i >= (int)g_out.size()) return;
     std::wstring id = g_out[i].id;
     ClickOutput(i);
-    for (int k = 0; k < (int)g_out.size(); k++) if (g_out[k].id == id) { ShowOsd(OSD_VOL, (int)lround(g_out[k].level * 100), false); break; }
+    for (int k = 0; k < (int)g_out.size(); k++) if (g_out[k].id == id) { break; }
     if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 static void NextOutput() {   // shortcut: the next speaker in the list (skips Bluetooth call-quality outputs)
@@ -4198,7 +4142,7 @@ static void NextOutput() {   // shortcut: the next speaker in the list (skips Bl
         int i = (d + k + n) % n;
         if (IsCallEndpoint(g_out[i])) continue;
         ClickOutput(i);
-        ShowOsd(OSD_VOL, (int)lround(g_out[DefaultOut() >= 0 ? DefaultOut() : i].level * 100), false);
+       
         if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
         return;
     }
@@ -5302,7 +5246,6 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
             else if (it.id == 3) g_restoreBright = !g_restoreBright;
-            else if (it.id == 4) g_osd = !g_osd;
             SaveSettings();
             break;
         case SK_LINK:
@@ -5671,9 +5614,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_UPDCHECK) {
             SetTimer(h, TIMER_UPDCHECK, 6 * 60 * 60 * 1000, nullptr);   // then every 6 hours
             CheckForUpdates();
-        } else if (wp == TIMER_OSD) {
-            KillTimer(h, TIMER_OSD);
-            if (g_osdWnd) ShowWindow(g_osdWnd, SW_HIDE);
         } else if (wp == TIMER_SPIN) {
             if (GetTickCount() >= g_spinUntil) KillTimer(h, TIMER_SPIN);
             InvalidateRect(h, nullptr, FALSE);
@@ -5977,9 +5917,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     sc.lpfnWndProc = SettingsProc; sc.hInstance = hi; sc.lpszClassName = L"KnobSettings"; sc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     sc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1)); sc.hIconSm = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassExW(&sc);
-    WNDCLASSEXW oc = {sizeof(oc)};
-    oc.lpfnWndProc = OsdProc; oc.hInstance = hi; oc.lpszClassName = L"KnobOSD"; oc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    RegisterClassExW(&oc);
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, wc.lpszClassName, APP_NAME, WS_POPUP, 0, 0, 380, 568, nullptr, nullptr, hi, nullptr);
     if (!g_hwnd) return 1;
