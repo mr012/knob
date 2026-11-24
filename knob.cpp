@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.0"
+#define APP_VERSION L"1.40.1"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1159,6 +1159,7 @@ static std::vector<std::wstring> UsedSpeakers() {   // every speaker something p
     std::vector<std::wstring> r;
     for (int i = 0; i < (int)g_out.size(); i++) if (OutSelected(i)) r.push_back(g_out[i].id);
     for (auto& kv : g_appExtra) { auto ids = kv.second.ids; ids.push_back(kv.second.primary); for (auto& id : ids) if (!id.empty() && std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id); }
+    for (auto& a : g_apps) if (!a.system) for (auto& id : AppRoutes(a)) if (std::find(r.begin(), r.end(), id) == r.end()) r.push_back(id);   // same speakers the routing board draws
     return r;
 }
 static int SpeakersInUse() { return (int)UsedSpeakers().size(); }
@@ -1383,9 +1384,11 @@ static void StartAutoSync() {
     int di = DefaultOut();
     std::vector<RouterTarget> all;
     if (g_router) all = g_router->targets;
-    for (auto& kv : g_appExtra) {   // speakers apps are copied to, and each app's own speaker
-        std::vector<std::wstring> ids = kv.second.ids; ids.push_back(kv.second.primary);
-        for (auto& id : ids) {
+    std::vector<std::wstring> appIds;   // speakers apps are copied to, and each app's own speaker
+    for (auto& kv : g_appExtra) { appIds.insert(appIds.end(), kv.second.ids.begin(), kv.second.ids.end()); appIds.push_back(kv.second.primary); }
+    for (auto& a : g_apps) if (!a.system && g_appExtra.count(a.key)) for (auto& id : AppRoutes(a)) appIds.push_back(id);
+    {
+        for (auto& id : appIds) {
             if (id.empty() || (di >= 0 && g_out[di].id == id)) continue;
             bool have = false; for (auto& t : all) if (t.id == id) have = true;
             if (!have) { auto it = g_delay.find(id); all.push_back({id, it == g_delay.end() ? 0 : std::max(0, it->second)}); }
