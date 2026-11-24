@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.40.1"
+#define APP_VERSION L"1.40.2"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -3475,19 +3475,23 @@ static void DrawDelayPopup(Graphics& g) {
 static bool g_dwmRound = false;
 
 // Smooth changes: when the theme, style or accent changes, both windows fade from the old look to the new one.
-struct Fade { std::vector<BYTE> last, from, scratch; int w = 0, h = 0; DWORD start = 0; bool on = false; int top = 0; };
+struct Fade { std::vector<BYTE> last, from, scratch; int w = 0, h = 0; DWORD start = 0, armed = 0, ms = 380; float t = 1; bool on = false; int top = 0; };   // start = 0: the clock begins at the first frame painted in the new look
 static Fade g_fadeFly, g_fadeSet;
-static const DWORD FADE_MS = 220;
+static const DWORD FADE_THEME_MS = 380, FADE_PANE_MS = 200;
+static float EaseInOut(float t) { return t < .5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2; }
 enum { TIMER_FADE = 11 };
 static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after drawing, before showing
     BYTE* bits = (BYTE*)bitsV; size_t n = (size_t)w * h * 4;
+    f.t = 1;
+    if (f.on && !f.start && GetTickCount() - f.armed > 1500) f.on = false;   // never painted in the new look: don't replay it later
     if (!f.on) { f.last.assign(bits, bits + n); f.w = w; f.h = h; return; }   // reuses its memory
+    if (!f.start) f.start = GetTickCount();   // the restyle itself takes a moment; time the fade from the first new frame, not from the click
     std::vector<BYTE>& fresh = f.scratch; fresh.assign(bits, bits + n);
     {
-        float t = (GetTickCount() - f.start) / (float)FADE_MS;
+        float t = (GetTickCount() - f.start) / (float)f.ms;
         if (t >= 1 || f.w != w || f.h != h || f.from.size() != n) f.on = false;
         else {
-            t = t * t * (3 - 2 * t);   // ease in-out
+            t = EaseInOut(t); f.t = t;
             int a = (int)(t * 256);
             for (size_t i = (size_t)std::max(0, std::min(h, f.top)) * w * 4; i < n; i++) bits[i] = (BYTE)(f.from[i] + (((int)bits[i] - (int)f.from[i]) * a >> 8));
         }
@@ -3496,12 +3500,15 @@ static void FadeApply(Fade& f, void* bitsV, int w, int h) {   // call after draw
 }
 static void FadeFree(Fade& f) { std::vector<BYTE>().swap(f.last); std::vector<BYTE>().swap(f.from); std::vector<BYTE>().swap(f.scratch); f.on = false; }
 static void StartFade() {
-    for (Fade* f : {&g_fadeFly, &g_fadeSet}) if (!f->last.empty()) { f->from = f->last; f->start = GetTickCount(); f->on = true; f->top = 0; }
+    for (Fade* f : {&g_fadeFly, &g_fadeSet}) {
+        if (f == &g_fadeFly && !g_visible) { f->on = false; continue; }   // hidden: nothing to fade, and it must not replay when it opens
+        if (!f->last.empty()) { f->from = f->last; f->start = 0; f->armed = GetTickCount(); f->ms = FADE_THEME_MS; f->on = true; f->top = 0; }
+    }
     if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
 }
 static void StartPaneFade() {   // tab switch: cross-fade the content under the tabs only
     if (g_fadeFly.last.empty()) return;
-    g_fadeFly.from = g_fadeFly.last; g_fadeFly.start = GetTickCount(); g_fadeFly.on = true; g_fadeFly.top = (int)S(54);
+    g_fadeFly.from = g_fadeFly.last; g_fadeFly.start = 0; g_fadeFly.armed = GetTickCount(); g_fadeFly.ms = FADE_PANE_MS; g_fadeFly.on = true; g_fadeFly.top = (int)S(54);
     if (g_hwnd) SetTimer(g_hwnd, TIMER_FADE, 15, nullptr);
 }
 // One 32-bit drawing surface per window, kept between frames (animations paint ~60 times a second)
@@ -4286,20 +4293,37 @@ static int RtLineAt(float x, float y) {   // the line under the mouse, if any
 }
 
 static bool g_setGlass = false;   // Settings window uses the Glass style too
+// The title bar is painted by Windows, so it is faded by hand: its colour follows the same curve as the window body.
+static COLORREF g_capCur = 0xFFFFFFFF, g_capFrom = 0, g_capTo = 0;   // 0xFFFFFFFF: not set yet
+static bool g_capAnim = false, g_capDarkDone = true; static BOOL g_capDark = FALSE;
+static COLORREF LerpRGB(COLORREF a, COLORREF b, float t) {
+    auto ch = [&](int sh) { int x = (a >> sh) & 255, y = (b >> sh) & 255; return (int)(x + (y - x) * t + .5f); };
+    return RGB(ch(0), ch(8), ch(16));
+}
+static void SetCaption(COLORREF c) {
+    DwmSetWindowAttribute(g_set, 35 /*DWMWA_CAPTION_COLOR*/, &c, sizeof(c));
+    DwmSetWindowAttribute(g_set, 34 /*DWMWA_BORDER_COLOR*/, &c, sizeof(c));
+    g_capCur = c;
+}
+static void CaptionStep(float t) {   // after each Settings frame: t is the fade's eased progress, 1 when finished
+    if (!g_capAnim || !g_set) return;
+    if (t >= .5f && !g_capDarkDone) { DwmSetWindowAttribute(g_set, 20, &g_capDark, sizeof(g_capDark)); g_capDarkDone = true; }   // caption buttons and text flip halfway
+    if (t >= 1) { SetCaption(g_capTo); g_capAnim = false; } else SetCaption(LerpRGB(g_capFrom, g_capTo, t));
+}
 static void ApplySettingsStyle() {
     if (!g_set) return;
     g_setGlass = false;   // Settings always uses the solid look; Glass is for the panel only
-    BOOL dark = g_setTheme.dark; DwmSetWindowAttribute(g_set, 20, &dark, sizeof(dark));
+    BOOL dark = g_setTheme.dark;
     int backdrop = g_setGlass ? 3 : 1;   // acrylic behind the whole window (title bar included), or none
     DwmSetWindowAttribute(g_set, 38, &backdrop, sizeof(backdrop));
     MARGINS m = g_setGlass ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0};
     DwmExtendFrameIntoClientArea(g_set, &m);
     // solid: paint the title bar the same colour as the window body
-    COLORREF cap = g_setGlass ? 0xFFFFFFFF /*default*/ : (g_setTheme.dark ? RGB(32, 32, 32) : RGB(243, 243, 243));
-    DwmSetWindowAttribute(g_set, 35 /*DWMWA_CAPTION_COLOR*/, &cap, sizeof(cap));
-    COLORREF border = g_setGlass ? 0xFFFFFFFF : cap;
-    DwmSetWindowAttribute(g_set, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
-    InvalidateRect(g_set, nullptr, TRUE);
+    COLORREF cap = g_setTheme.dark ? RGB(32, 32, 32) : RGB(243, 243, 243);
+    if (g_fadeSet.on && g_capCur != 0xFFFFFFFF && cap != g_capCur) {   // theme change with the body fading: fade the title bar with it
+        g_capFrom = g_capCur; g_capTo = cap; g_capDark = dark; g_capDarkDone = false; g_capAnim = true;
+    } else { g_capAnim = false; DwmSetWindowAttribute(g_set, 20, &dark, sizeof(dark)); SetCaption(cap); }
+    InvalidateRect(g_set, nullptr, FALSE);
 }
 static void BuildSettingsTheme() {
     Theme keep = T;
@@ -4931,6 +4955,7 @@ static void PaintSettings(HDC hdc) {
     }
     FadeApply(g_fadeSet, bits, g_setW, g_setH);
     BitBlt(hdc, 0, 0, g_setW, g_setH, mdc, 0, 0, SRCCOPY);
+    CaptionStep(g_fadeSet.t);
     SelectObject(mdc, old);
     DeleteDC(mdc);
     std::swap(T, g_setTheme);
@@ -5195,6 +5220,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_capture >= 0) { g_capture = -1; RegisterHotkeys(); }
         if (g_edit) CommitRename(true);
         g_set = nullptr;
+        g_capAnim = false; g_capCur = 0xFFFFFFFF;
         CanvasFree(g_cvSet); FadeFree(g_fadeSet);   // Settings closed: its frame buffers aren't needed
         if (!g_visible && !g_pairHidden) FreeApps();   // the routing board's app list
         if (g_pairHidden) { g_pairHidden = false; HideFlyout(); }   // it was tucked away: close it properly
