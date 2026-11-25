@@ -2,3 +2,4 @@
 *.exe
 !dist/Knob.exe
 out/
+Knob-dev.exe

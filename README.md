@@ -42,8 +42,12 @@ Cross-compiles from Linux with MinGW-w64:
 
 ```sh
 sudo apt install g++-mingw-w64-x86-64
-./build.sh
+./build.sh       # Knob.exe — the official build, the one that goes in dist/
+./build.sh dev   # Knob-dev.exe — for development only: adds a hidden --demo mode
 ```
+
+`Knob-dev.exe --demo` fills Knob with the design's sample speakers, apps and screens, for comparing
+the app with the design. It is never shipped: the official build leaves it out entirely.
 
 ## Updating
 

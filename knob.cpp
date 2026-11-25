@@ -45,7 +45,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.4"
+#define APP_VERSION L"1.41.5"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -78,16 +78,15 @@ static int SI();
 // a short, fixed list of actions (no macros). None has keys until the user picks some.
 // The list in Settings is in this order; "Switch to" and "Apply profile" name a speaker or profile and can be added more than once.
 enum HkAction { HK_OPEN, HK_TABSOUND, HK_TABAPPS, HK_TABDISPLAY, HK_SWITCHTO, HK_NEXTOUT, HK_VOLUP, HK_VOLDOWN, HK_MUTE, HK_MIC, HK_APPMUTE,
-                HK_BRIUP, HK_BRIDOWN, HK_APPLYPROF, HK_SCREENOFF, HK_SYNC, HK_NEXTPROF, HK_COUNT };
-static const int HK_OFFERED = HK_NEXTPROF;   // actions offered under "Add a shortcut" (Next display profile only survives from older settings)
+                HK_BRIUP, HK_BRIDOWN, HK_APPLYPROF, HK_SCREENOFF, HK_SYNC, HK_COUNT };
 struct HotKey { UINT mods; UINT vk; bool ok; };
 struct Shortcut { int act; std::wstring param; HotKey k; };
 static std::vector<Shortcut> g_sc;   // one row each in Settings; nothing is set until the user adds it
 static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open or close Knob", L"Open on Sound", L"Open on Apps", L"Open on Display", L"Switch to", L"Next speaker",
     L"Volume up", L"Volume down", L"Mute or unmute", L"Mute microphone", L"Mute the app in front", L"Brightness up", L"Brightness down",
-    L"Apply profile", L"Turn off displays", L"Run Auto sync", L"Next display profile"};
+    L"Apply profile", L"Turn off displays", L"Run Auto sync"};
 static const wchar_t* HK_KEYS[HK_COUNT] = {L"open", L"tabsound", L"tabapps", L"tabdisplay", L"switchto", L"nextout", L"volup", L"voldown", L"mute", L"mic",
-    L"appmute", L"briup", L"bridown", L"applyprof", L"screenoff", L"sync", L"nextprof"};
+    L"appmute", L"briup", L"bridown", L"applyprof", L"screenoff", L"sync"};
 static int HkParamKind(int a) { return a == HK_SWITCHTO ? 1 : a == HK_APPLYPROF ? 2 : 0; }   // 1 a speaker, 2 a profile
 static bool g_noSave = false, g_restartAfterExit = false;
 static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
@@ -186,7 +185,11 @@ struct ProcInfo { std::wstring name; Gdiplus::Bitmap* icon = nullptr; };
 struct AppLive { float smooth = 0; DWORD lastActive = 0; };
 
 static IMMDeviceEnumerator* g_enum;
+#ifdef KNOB_DEMO   // development builds only (build.sh dev): Knob.exe --demo shows the design's sample devices, apps and screens
 static bool g_demo = false;
+#else
+static constexpr bool g_demo = false;   // official builds: no demo mode, and the compiler leaves all of it out
+#endif
 static std::wstring g_demoDefault;   // demo: which speaker "Windows" plays on   // --demo: the design's sample devices, apps and screens (for side-by-side checks)
 static std::vector<Endpoint> g_out, g_in;
 static std::vector<AppGroup> g_apps;
@@ -305,19 +308,9 @@ static void LoadSettings() {
     g_keepAwake = GetPrivateProfileIntW(L"main", L"keepawake", 0, g_iniPath.c_str()) != 0;
     g_tab = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"tab", 0, g_iniPath.c_str())));
     g_style = std::max(0, std::min(1, (int)GetPrivateProfileIntW(L"main", L"style", 1, g_iniPath.c_str())));
-    {
-        static const int oldHue[7] = {0, 181, 113, 37, 346, 262, 0};   // presets from earlier versions
-        int mode = (int)GetPrivateProfileIntW(L"main", L"accentmode", 99, g_iniPath.c_str());
-        if (mode == 99) {   // migrate the old preset choice
-            int old = std::max(0, std::min(6, (int)GetPrivateProfileIntW(L"main", L"accent", 0, g_iniPath.c_str())));
-            mode = old ? 1 : 0;
-            if (old) { g_accentHue = oldHue[old]; g_accentSat = old == 6 ? 0 : 85; }
-        } else {
-            g_accentHue = (int)GetPrivateProfileIntW(L"main", L"accenthue", 25, g_iniPath.c_str()) % 360;
-            g_accentSat = std::max(0, std::min(100, (int)GetPrivateProfileIntW(L"main", L"accentsat", 85, g_iniPath.c_str())));
-        }
-        g_accentId = mode ? 1 : 0;
-    }
+    g_accentHue = (int)GetPrivateProfileIntW(L"main", L"accenthue", 25, g_iniPath.c_str()) % 360;
+    g_accentSat = std::max(0, std::min(100, (int)GetPrivateProfileIntW(L"main", L"accentsat", 85, g_iniPath.c_str())));
+    g_accentId = GetPrivateProfileIntW(L"main", L"accentmode", 0, g_iniPath.c_str()) ? 1 : 0;
     g_restoreBright = GetPrivateProfileIntW(L"main", L"restorebright", 1, g_iniPath.c_str()) != 0;
     g_trayPinned = (int)GetPrivateProfileIntW(L"main", L"traypinned", -1, g_iniPath.c_str());
     g_themeMode = std::max(0, std::min(2, (int)GetPrivateProfileIntW(L"main", L"theme", 0, g_iniPath.c_str())));
@@ -345,7 +338,6 @@ static void LoadSettings() {
     }
     g_step = (int)GetPrivateProfileIntW(L"main", L"step", 5, g_iniPath.c_str());
     if (g_step != 2 && g_step != 5 && g_step != 10) g_step = 5;
-    bool oldDefaults = GetPrivateProfileIntW(L"main", L"settingsver", 1, g_iniPath.c_str()) < 2;
     g_sc.clear();
     int nsc = (int)GetPrivateProfileIntW(L"shortcuts", L"count", -1, g_iniPath.c_str());
     if (nsc >= 0) {
@@ -361,13 +353,6 @@ static void LoadSettings() {
             x.k.mods = (UINT)_wtoi(s.substr(p1 + 1, p2 - p1 - 1).c_str()); x.k.vk = (UINT)_wtoi(s.substr(p2 + 1, p3 - p2 - 1).c_str());
             x.param = s.substr(p3 + 1);
             g_sc.push_back(x);
-        }
-    } else {   // settings from before 1.39: one fixed key per action
-        for (int a = 0; a < HK_COUNT; a++) {
-            wchar_t b[64]; unsigned mods = 0, vk = 0;
-            if (!GetPrivateProfileStringW(L"hotkeys", HK_KEYS[a], L"", b, 64, g_iniPath.c_str()) || !b[0] || swscanf(b, L"%u,%u", &mods, &vk) != 2 || !vk) continue;
-            if (oldDefaults && mods == (MOD_CONTROL | MOD_ALT) && vk == 'L') continue;   // the old built-in Ctrl+Alt+L
-            g_sc.push_back({a, L"", {mods, vk, false}});
         }
     }
     int np = (int)GetPrivateProfileIntW(L"profiles", L"count", -1, g_iniPath.c_str());
@@ -391,7 +376,6 @@ static void LoadSettings() {
 }
 static void SaveSettings() {
     if (g_noSave) return;
-    WritePrivateProfileStringW(L"main", L"settingsver", L"2", g_iniPath.c_str());
     std::wstring s;
     for (auto& id : g_mirror) { if (!s.empty()) s += L'|'; s += id; }
     WritePrivateProfileStringW(L"main", L"mirror", s.c_str(), g_iniPath.c_str());
@@ -410,7 +394,6 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"accentmode", std::to_wstring(g_accentId).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"accenthue", std::to_wstring(g_accentHue).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"accentsat", std::to_wstring(g_accentSat).c_str(), g_iniPath.c_str());
-    WritePrivateProfileStringW(L"main", L"osd", nullptr, g_iniPath.c_str());   // the old popup setting, gone
     WritePrivateProfileStringW(L"main", L"restorebright", g_restoreBright ? L"1" : L"0", g_iniPath.c_str());
     {
         std::wstring d, l;
@@ -421,7 +404,6 @@ static void SaveSettings() {
         WritePrivateProfileSectionW(L"lastdisplay", l.c_str(), g_iniPath.c_str());
     }
     WritePrivateProfileStringW(L"main", L"step", std::to_wstring(g_step).c_str(), g_iniPath.c_str());
-    WritePrivateProfileSectionW(L"hotkeys", nullptr, g_iniPath.c_str());     // the old format
     WritePrivateProfileSectionW(L"shortcuts", L"\0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"shortcuts", L"count", std::to_wstring(g_sc.size()).c_str(), g_iniPath.c_str());
     for (size_t i = 0; i < g_sc.size(); i++)
@@ -508,7 +490,6 @@ static void FreeEndpoints(std::vector<Endpoint>& v) {
 }
 
 // ---- what kind of device is this, and what should we call it?
-static std::wstring Lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 static bool HasWord(const std::wstring& low, const wchar_t* w) {   // whole-word-ish match
     size_t L = wcslen(w);
     for (size_t p = low.find(w); p != std::wstring::npos; p = low.find(w, p + 1)) {
@@ -518,20 +499,20 @@ static bool HasWord(const std::wstring& low, const wchar_t* w) {   // whole-word
     return false;
 }
 static bool LooksLikeEarbuds(const std::wstring& name) {
-    std::wstring l = Lower(name);
+    std::wstring l = ToLower(name);
     for (auto w : {L"buds", L"airpods", L"earpods", L"earbuds", L"freebuds", L"pods", L"tws", L"ear"}) if (HasWord(l, w)) return true;
     for (auto w : {L"buds ", L"wf-", L"galaxy buds", L"pixel buds", L"jabra elite", L"nothing ear", L"ear (", L"liberty"}) if (l.find(w) != std::wstring::npos) return true;
     return l.size() > 4 && l.compare(l.size() - 4, 4, L"buds") == 0;
 }
 static bool IsGenericName(const std::wstring& n) {
-    std::wstring l = Lower(n);
+    std::wstring l = ToLower(n);
     for (auto w : {L"speakers", L"speaker", L"headphones", L"headphone", L"headset", L"speakers/headphones", L"headset earphone", L"digital output",
                    L"line out", L"spdif out", L"s/pdif", L"microphone", L"microphone array", L"headset microphone", L"line in", L"hands-free", L"stereo mix", L"external microphone"})
         if (l == w) return true;
     return false;
 }
 static bool IsCodecName(const std::wstring& n) {   // chip / driver names that mean nothing to people
-    std::wstring l = Lower(n);
+    std::wstring l = ToLower(n);
     for (auto w : {L"realtek", L"high definition audio", L"intel", L"smart sound", L"amd", L"conexant", L"idt", L"cirrus", L"synaptics", L"audio device", L"soundwire", L"sound blaster", L"nvidia", L"microsoft"})
         if (l.find(w) != std::wstring::npos) return true;
     return false;
@@ -554,7 +535,7 @@ static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the
         IConnector* c = nullptr;
         if (SUCCEEDED(t->GetConnector(0, &c)) && c) {
             LPWSTR id = nullptr;
-            if (SUCCEEDED(c->GetDeviceIdConnectedTo(&id)) && id) { r = Lower(id); CoTaskMemFree(id); }
+            if (SUCCEEDED(c->GetDeviceIdConnectedTo(&id)) && id) { r = ToLower(id); CoTaskMemFree(id); }
             c->Release();
         }
         t->Release();
@@ -562,7 +543,7 @@ static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the
     return r;
 }
 static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& path) {
-    std::wstring nm = e.rawName, ifc = e.rawIface, both = Lower(nm + L" " + ifc);
+    std::wstring nm = e.rawName, ifc = e.rawIface, both = ToLower(nm + L" " + ifc);
     bool bt = path.find(L"bth") != std::wstring::npos || path.find(L"bluetooth") != std::wstring::npos;
     bool usb = !bt && path.find(L"usb") != std::wstring::npos;
     bool codec = !bt && !usb && (path.find(L"hdaudio") != std::wstring::npos || path.find(L"intelaudio") != std::wstring::npos ||
@@ -583,7 +564,7 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
         else if (virt) { conn = L"Virtual"; e.icon = DI_VIRTUAL; }
         else if (ff == 4 || IsGenericName(nm)) {   // built-in or jack
             if (headset) { name = L"Headset microphone"; conn = codec ? L"3.5 mm jack" : L""; }
-            else if (codec || path.size() <= 1) { if (IsLaptop() || Lower(nm).find(L"array") != std::wstring::npos) name = IsLaptop() ? L"Laptop microphone" : L"Microphone"; conn = L"Built-in"; }
+            else if (codec || path.size() <= 1) { if (IsLaptop() || ToLower(nm).find(L"array") != std::wstring::npos) name = IsLaptop() ? L"Laptop microphone" : L"Microphone"; conn = L"Built-in"; }
             else conn = IsCodecName(ifc) ? L"" : conn;
         }
     } else if (ff == 9) { e.icon = DI_DISPLAY; conn = L"HDMI / DP"; if (IsGenericName(nm) || IsCodecName(nm)) name = ifc.empty() ? L"Display audio" : ifc; }
@@ -606,7 +587,7 @@ static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& pat
     // names stay exactly as Windows shows them ("Speakers" + "Realtek(R) Audio"); only the icon comes from the checks above
     (void)name; (void)conn;
     // the device's own name first ("realme Brick Speaker"), Windows' type name ("Speakers") second
-    if (!ifc.empty() && Lower(ifc) != Lower(nm)) { e.name = ifc; e.detail = nm; }
+    if (!ifc.empty() && ToLower(ifc) != ToLower(nm)) { e.name = ifc; e.detail = nm; }
     else { e.name = nm; e.detail = L""; }
 }
 static void DemoEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
@@ -662,7 +643,7 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         if (e.name.empty()) e.name = L"Audio device";
         e.rawName = e.name; e.rawIface = e.detail;
         std::wstring hwPath;
-        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = Lower(PropStr(ps, PK_HwInstance)); ps->Release(); ps = nullptr; }
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); ps->Release(); ps = nullptr; }
         Classify(e, flow == eCapture, ff, hwPath + L"|" + ConnectedPath(dev));
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
@@ -1384,8 +1365,8 @@ static DWORD WINAPI CalibrateProc(LPVOID p) {
         {   // the laptop's built-in mic hears the room best, and never puts Bluetooth buds into call mode
             auto builtIn = [](IMMDevice* d) {   // not Bluetooth, not USB
                 IPropertyStore* ps = nullptr; std::wstring hw;
-                if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps)) && ps) { hw = Lower(PropStr(ps, PK_HwInstance)); ps->Release(); }
-                hw += L"|" + Lower(ConnectedPath(d));
+                if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &ps)) && ps) { hw = ToLower(PropStr(ps, PK_HwInstance)); ps->Release(); }
+                hw += L"|" + ToLower(ConnectedPath(d));
                 return hw.find(L"bth") == std::wstring::npos && hw.find(L"usb") == std::wstring::npos;
             };
             IMMDevice* def = nullptr;
@@ -2176,7 +2157,7 @@ static int g_W = 0, g_H = 0;
 static float g_contentH = 0;
 static Hit g_hover;
 static int g_dragEl = -1;
-static int g_hoverSlider = -1; static DWORD g_hoverSince = 0, g_lastScroll = 0;
+static int g_hoverSlider = -1; static DWORD g_hoverSince = 0;
 static int g_ddOpen = -1;          // display index whose list is open (0 for the profile list)
 static int g_ddKind = 0;           // which list: 0 orientation, 1 refresh rate, 2 input, 3 profiles
 static DWORD g_spinUntil = 0;      // refresh icon animation
@@ -3827,12 +3808,6 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
         if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
         break;
     }
-    case HK_NEXTPROF: {   // the next saved profile after the active one
-        int n = (int)g_prof.size(), cur = -1;
-        for (int i = 0; i < n; i++) if (ProfileActive(i)) cur = i;
-        for (int k = 1; k <= n; k++) { int i = (cur + k + n) % n; if (!g_prof[i].v.empty()) { ApplyProfile(i); break; } }
-        break;
-    }
     case HK_SWITCHTO: for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].name == param || OutLabel(g_out[i]) == param) { SwitchOutput(i); break; } break;
     case HK_APPLYPROF: for (int i = 0; i < (int)g_prof.size(); i++) if (g_prof[i].name == param && !g_prof[i].v.empty()) { ApplyProfile(i); break; } break;
     case HK_SCREENOFF: HideFlyout(); SetTimer(g_hwnd, TIMER_SCREENOFF, 500, nullptr); break;
@@ -4017,8 +3992,8 @@ static void ToggleOutput(int i) {
 }
 
 static bool IsCallEndpoint(const Endpoint& e) {   // Bluetooth hands-free (call quality) output
-    std::wstring l = Lower(e.rawName + L" " + e.rawIface);
-    return e.bt && (Lower(e.rawName) == L"headset" || l.find(L"hands-free") != std::wstring::npos);
+    std::wstring l = ToLower(e.rawName + L" " + e.rawIface);
+    return e.bt && (ToLower(e.rawName) == L"headset" || l.find(L"hands-free") != std::wstring::npos);
 }
 // "Turn off displays" without locking: real screen-off sends Modern Standby laptops to sleep (and the lock screen),
 // so Knob covers every screen with black and turns brightness to 0, then puts everything back on any input.
@@ -4743,7 +4718,7 @@ static void PaintSettings(HDC hdc) {
             {   // + Add a shortcut: the actions without a row yet ("Switch to" and "Apply profile" can be added again)
                 g_hkAddMap.clear();
                 std::vector<std::wstring> opts;
-                for (int a = 0; a < HK_OFFERED; a++) {
+                for (int a = 0; a < HK_COUNT; a++) {
                     bool have = false; for (auto& s2 : g_sc) if (s2.act == a) have = true;
                     if (have && !HkParamKind(a)) continue;
                     opts.push_back(HK_NAMES[a]); g_hkAddMap.push_back(a);
@@ -5799,7 +5774,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             g_scroll[SI()] -= delta / 120.f * S(56);
             ClampScroll();
-            g_lastScroll = now;
             g_hoverSince = now;
         }
         InvalidateRect(h, nullptr, FALSE);
@@ -5872,7 +5846,9 @@ static bool InstallOrUpdate() {
 
 // ---------------------------------------------------------------- entry
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
+#ifdef KNOB_DEMO
     g_demo = cmd && wcsstr(cmd, L"--demo");
+#endif
     g_inst = hi;
     if (InstallOrUpdate()) return 0;
     {   // tidy up downloaded updates
