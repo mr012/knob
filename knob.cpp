@@ -31,6 +31,7 @@
 #include <lowlevelmonitorconfigurationapi.h>
 #include <wbemidl.h>
 #include <winhttp.h>
+#include <cfgmgr32.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -45,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.5"
+#define APP_VERSION L"1.41.6"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -542,6 +543,33 @@ static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the
     }
     return r;
 }
+// Bluetooth speakers often report a plain hardware path, so also ask: does this endpoint's physical device (container) have a Bluetooth part?
+static const PROPERTYKEY PK_ContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+static std::set<std::wstring> g_btContainers;
+static std::wstring GuidKey(const GUID& g) { wchar_t b[64]; swprintf(b, 64, L"%08lx-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x", g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]); return b; }
+static void RefreshBtContainers() {
+    g_btContainers.clear();
+    static const DEVPROPKEY dk = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
+    for (auto en : {L"BTHENUM", L"BTHLEENUM", L"BTHHFENUM", L"BTHLE"}) {
+        ULONG len = 0;
+        if (CM_Get_Device_ID_List_SizeW(&len, en, CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS || len < 2) continue;
+        std::vector<wchar_t> buf(len + 2, 0);
+        if (CM_Get_Device_ID_ListW(en, buf.data(), len, CM_GETIDLIST_FILTER_ENUMERATOR) != CR_SUCCESS) continue;
+        for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+            DEVINST di; if (CM_Locate_DevNodeW(&di, (DEVINSTID_W)p, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) continue;
+            GUID g{}; DEVPROPTYPE ty = 0; ULONG sz = sizeof(g);
+            if (CM_Get_DevNode_PropertyW(di, &dk, &ty, (PBYTE)&g, &sz, 0) == CR_SUCCESS && sz == sizeof(g)) g_btContainers.insert(GuidKey(g));
+        }
+    }
+}
+static bool InBtContainer(IPropertyStore* ps) {
+    PROPVARIANT pv; PropVariantInit(&pv); bool r = false;
+    if (SUCCEEDED(ps->GetValue(PK_ContainerId, &pv))) {
+        if (pv.vt == VT_CLSID && pv.puuid) r = g_btContainers.count(GuidKey(*pv.puuid)) > 0;
+        else if (pv.vt == VT_LPWSTR && pv.pwszVal) { GUID g; if (SUCCEEDED(CLSIDFromString(pv.pwszVal, &g))) r = g_btContainers.count(GuidKey(g)) > 0; }
+    }
+    PropVariantClear(&pv); return r;
+}
 static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& path) {
     std::wstring nm = e.rawName, ifc = e.rawIface, both = ToLower(nm + L" " + ifc);
     bool bt = path.find(L"bth") != std::wstring::npos || path.find(L"bluetooth") != std::wstring::npos;
@@ -607,6 +635,7 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     FreeEndpoints(v);
     if (g_demo) { DemoEndpoints(flow, v); return; }
     if (!g_enum) return;
+    RefreshBtContainers();
     std::wstring defId;
     IMMDevice* d = nullptr;
     if (SUCCEEDED(g_enum->GetDefaultAudioEndpoint(flow, eConsole, &d))) {
@@ -643,7 +672,7 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         if (e.name.empty()) e.name = L"Audio device";
         e.rawName = e.name; e.rawIface = e.detail;
         std::wstring hwPath;
-        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); ps->Release(); ps = nullptr; }
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); if (InBtContainer(ps)) hwPath += L"|bluetooth"; ps->Release(); ps = nullptr; }
         Classify(e, flow == eCapture, ff, hwPath + L"|" + ConnectedPath(dev));
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
@@ -3122,14 +3151,23 @@ static void DrawEl(Graphics& g, int index) {
                     g_animating = true; KickAnim();
                 } else if (g_calHeard.count(oid)) { detail = L"\u2713 " + std::to_wstring(g_calHeard[oid]) + L" ms"; calDetail = true; }
             }
-            FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
+            Color badgeC = sel ? T.accent : T.badge;
+            float bx = lx + S(13), by = cy1 + S(13), br = S(7.5f), gap = S(2.2f);
+            if (!devBt) FillRound(g, badgeC, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
+            else {   // Bluetooth: the badge's corner is carved out, and a small round badge with the Bluetooth mark sits in the space
+                int ox = (int)floorf(lx - S(16)) - 1, oy = (int)floorf(cy1 - S(16)) - 1, w = (int)ceilf(S(32)) + 3, h = w;
+                Gdiplus::Bitmap tmp(w, h, PixelFormat32bppPARGB);
+                { Graphics tg(&tmp); tg.SetSmoothingMode(SmoothingModeAntiAlias);
+                  FillRound(tg, badgeC, RectF(lx - S(16) - ox, cy1 - S(16) - oy, S(32), S(32)), S(10));
+                  tg.SetCompositingMode(CompositingModeSourceCopy);
+                  SolidBrush hole(Color(0, 0, 0, 0)); float cr = br + gap;
+                  tg.FillEllipse(&hole, bx - ox - cr, by - oy - cr, 2 * cr, 2 * cr); }
+                g.DrawImage(&tmp, Rect(ox, oy, w, h), 0, 0, w, h, UnitPixel);
+                SolidBrush bb(badgeC); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
+            }
             if (devIcon >= 0 && devIcon != DI_MIC) DrawDevIcon(g, devIcon, lx, cy1, sel ? T.onAccent : T.t1);
             else Glyph(g, lg, g_fIcon, sel ? T.onAccent : T.t1, lx, cy1);
-            if (devBt) {   // Bluetooth: one clear blue circle on the corner of the icon
-                float bx = lx + S(13.5f), by = cy1 + S(13.5f), br = S(8.5f);
-                SolidBrush bb(Color(255, 31, 111, 235)); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
-                Icon(g, "bt", S(11), Color(255, 255, 255, 255), bx, by);
-            }
+            if (devBt) Icon(g, "bt", S(10), sel ? T.onAccent : T.t1, bx, by);
         }
         float nx = e.r.X + S(52), maxW = e.r.X + e.r.Width - S(8) - nx;
         if (e.k == E_APP && !g_apps[e.idx].system) {   // where it plays: always shown, like Windows' volume mixer
