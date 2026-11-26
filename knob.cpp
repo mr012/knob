@@ -46,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.6"
+#define APP_VERSION L"1.41.7"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -558,7 +558,10 @@ static void RefreshBtContainers() {
         for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
             DEVINST di; if (CM_Locate_DevNodeW(&di, (DEVINSTID_W)p, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS) continue;
             GUID g{}; DEVPROPTYPE ty = 0; ULONG sz = sizeof(g);
-            if (CM_Get_DevNode_PropertyW(di, &dk, &ty, (PBYTE)&g, &sz, 0) == CR_SUCCESS && sz == sizeof(g)) g_btContainers.insert(GuidKey(g));
+            if (CM_Get_DevNode_PropertyW(di, &dk, &ty, (PBYTE)&g, &sz, 0) == CR_SUCCESS && sz == sizeof(g)) {
+                std::wstring k = GuidKey(g);
+                if (k != L"00000000-0000-0000-ffff-ffffffffffff" && k != L"00000000-0000-0000-0000-000000000000") g_btContainers.insert(k);   // not the PC itself: the Bluetooth radio lives there, and the built-in speakers too
+            }
         }
     }
 }
@@ -3151,23 +3154,14 @@ static void DrawEl(Graphics& g, int index) {
                     g_animating = true; KickAnim();
                 } else if (g_calHeard.count(oid)) { detail = L"\u2713 " + std::to_wstring(g_calHeard[oid]) + L" ms"; calDetail = true; }
             }
-            Color badgeC = sel ? T.accent : T.badge;
-            float bx = lx + S(13), by = cy1 + S(13), br = S(7.5f), gap = S(2.2f);
-            if (!devBt) FillRound(g, badgeC, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
-            else {   // Bluetooth: the badge's corner is carved out, and a small round badge with the Bluetooth mark sits in the space
-                int ox = (int)floorf(lx - S(16)) - 1, oy = (int)floorf(cy1 - S(16)) - 1, w = (int)ceilf(S(32)) + 3, h = w;
-                Gdiplus::Bitmap tmp(w, h, PixelFormat32bppPARGB);
-                { Graphics tg(&tmp); tg.SetSmoothingMode(SmoothingModeAntiAlias);
-                  FillRound(tg, badgeC, RectF(lx - S(16) - ox, cy1 - S(16) - oy, S(32), S(32)), S(10));
-                  tg.SetCompositingMode(CompositingModeSourceCopy);
-                  SolidBrush hole(Color(0, 0, 0, 0)); float cr = br + gap;
-                  tg.FillEllipse(&hole, bx - ox - cr, by - oy - cr, 2 * cr, 2 * cr); }
-                g.DrawImage(&tmp, Rect(ox, oy, w, h), 0, 0, w, h, UnitPixel);
-                SolidBrush bb(badgeC); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
-            }
+            FillRound(g, sel ? T.accent : T.badge, RectF(lx - S(16), cy1 - S(16), S(32), S(32)), S(10));   // rounded-square badge
             if (devIcon >= 0 && devIcon != DI_MIC) DrawDevIcon(g, devIcon, lx, cy1, sel ? T.onAccent : T.t1);
             else Glyph(g, lg, g_fIcon, sel ? T.onAccent : T.t1, lx, cy1);
-            if (devBt) Icon(g, "bt", S(10), sel ? T.onAccent : T.t1, bx, by);
+            if (devBt) {   // Bluetooth: one clear blue circle on the corner of the icon
+                float bx = lx + S(13.5f), by = cy1 + S(13.5f), br = S(8.5f);
+                SolidBrush bb(Color(255, 31, 111, 235)); g.FillEllipse(&bb, bx - br, by - br, 2 * br, 2 * br);
+                Icon(g, "bt", S(11), Color(255, 255, 255, 255), bx, by);
+            }
         }
         float nx = e.r.X + S(52), maxW = e.r.X + e.r.Width - S(8) - nx;
         if (e.k == E_APP && !g_apps[e.idx].system) {   // where it plays: always shown, like Windows' volume mixer
