@@ -46,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.7"
+#define APP_VERSION L"1.41.8"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1922,8 +1922,25 @@ static void CountScreens() {   // every screen plugged in, active or not
     for (UINT32 i = 0; i < np; i++) if (p[i].targetInfo.targetAvailable) seen.insert(((unsigned long long)p[i].targetInfo.adapterId.LowPart << 32) ^ p[i].targetInfo.id ^ ((unsigned long long)p[i].targetInfo.adapterId.HighPart << 48));
     g_connScreens = (int)seen.size();
 }   // shown under the Display tab when Windows refuses a layout
+static bool ActivePathState(UINT32& n, bool& cloned) {   // how many screens are on, and whether two of them show the same picture
+    UINT32 np = 0, nm = 0; n = 0; cloned = false;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return false;
+    std::vector<DISPLAYCONFIG_PATH_INFO> p(np); std::vector<DISPLAYCONFIG_MODE_INFO> m(nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, p.data(), &nm, m.data(), nullptr) != ERROR_SUCCESS) return false;
+    n = np;
+    for (UINT32 i = 0; i < np; i++) for (UINT32 j = i + 1; j < np; j++)
+        if (p[i].sourceInfo.adapterId.LowPart == p[j].sourceInfo.adapterId.LowPart && p[i].sourceInfo.adapterId.HighPart == p[j].sourceInfo.adapterId.HighPart && p[i].sourceInfo.id == p[j].sourceInfo.id) cloned = true;
+    return true;
+}
+static void RunDisplaySwitch(const wchar_t* arg) {   // Windows' own Win+P switcher: the most reliable way to get Extend / Duplicate back
+    wchar_t sys[MAX_PATH]; if (!GetSystemDirectoryW(sys, MAX_PATH)) return;
+    std::wstring cmd = L"\"" + std::wstring(sys) + L"\\DisplaySwitch.exe\" " + arg;
+    STARTUPINFOW si = {}; si.cb = sizeof(si); PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) { WaitForSingleObject(pi.hProcess, 8000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+}
 static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else show the same picture as screen dupOf
     if (idx < 0 || idx >= (int)g_mons.size()) return;
+    CountScreens();
     UINT32 np = 0, nm = 0;
     if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) return;
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(np), oldP; std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm), oldM;
@@ -1954,6 +1971,14 @@ static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else sh
         if (r != ERROR_SUCCESS) {   // let Windows pick the modes for this topology
             for (auto& pth : paths) { pth.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID; pth.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID; }
             r = SetDisplayConfig(np, paths.data(), 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES);
+        }
+    }
+    if (dupOf != -2) {   // Extend / Duplicate: check Windows really did it, and if not, ask Windows' own Win+P switcher
+        auto done = [&]() { UINT32 n = 0; bool cl = false; if (!ActivePathState(n, cl)) return false; return dupOf == -1 ? (n >= 2 && !cl) : cl; };
+        Sleep(400);
+        if (r != ERROR_SUCCESS || !done()) {
+            RunDisplaySwitch(dupOf == -1 ? L"/extend" : L"/clone"); Sleep(800);
+            r = done() ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
         }
     }
     if (r != ERROR_SUCCESS) { g_dispStatus = dupOf == -1 ? L"Windows couldn't extend the screens" : dupOf == -2 ? L"Windows couldn't switch the other screens off" : L"Your graphics card can't show these two screens the same picture"; return; }
