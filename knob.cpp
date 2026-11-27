@@ -36,6 +36,10 @@
 #include <roapi.h>
 #include <winstring.h>
 #include <d2d1.h>
+#include <d2d1_1.h>
+#include <d2d1effects.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -50,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.6"
+#define APP_VERSION L"1.42.7"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -131,7 +135,7 @@ static bool g_offClock = false;         // the time and date in dim grey on the 
 static bool g_offFull = false;          // also tell monitors to power their screen down (DDC/CI), so an LCD's backlight goes dark too
 static std::wstring g_clockScr;         // which screen shows it: "" the main screen, "*" every screen, else a screen's name
 static std::wstring g_partyScr;         // Party screen: "" the main screen, else a screen's name
-static int g_partyLook = 0;             // 0 glow waves, 1 mirror bars, 2 aurora, 3 light line
+static int g_partyLook = 0;             // 0 glow waves, 1 aurora, 2 light line
 static int g_partyClose = 0;            // 0 any key or mouse move ends it, 1 only Esc
 static bool g_partyInfo = true;         // the cover, title and artist small in a corner
 static bool g_rateBat = false;          // the laptop screen drops to 60 Hz on battery and goes back to its highest on power
@@ -347,7 +351,7 @@ static void LoadSettings() {
         auto gi = [&](const wchar_t* k, int d, int lo, int hi) { return std::max(lo, std::min(hi, (int)GetPrivateProfileIntW(L"main", k, d, g_iniPath.c_str()))); };
         auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
-        g_partyScr = gs(L"partyscr"); g_partyLook = gi(L"partylook", 0, 0, 3); g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
+        g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); }   // the old list had Mirror bars second g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000);
         g_fLayout = gi(L"flayout", 0, 0, 1); g_fGlow = gi(L"fglow", 1, 0, 5); g_lkKeys = gi(L"lkkeys", 15, 0, 15);
@@ -422,7 +426,7 @@ static void SaveSettings() {
     {
         auto wi = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"main", k, std::to_wstring(v).c_str(), g_iniPath.c_str()); };
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
-        WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
+        WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook2", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
         wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
         wi(L"fcover", g_fCover); wi(L"fcentre", g_fCentre); wi(L"fplayer", g_fPlayer);
@@ -5432,12 +5436,15 @@ static void FlyoutKeysSync();   // listen to the keyboard only while a flyout th
 // A screen of soft light that moves with the music, in the cover's colours. The light is drawn small (320 px wide)
 // and blurred on the CPU, then Direct2D stretches it to the screen on the graphics card, so it stays light.
 // Only exists while it's on screen: any key or mouse move fades it out and frees everything.
-static const wchar_t* PARTY_LOOKS[4] = {L"Glow waves", L"Mirror bars", L"Aurora", L"Light line"};
+static const wchar_t* PARTY_LOOKS[3] = {L"Glow waves", L"Aurora", L"Light line"};
 static HWND g_party = nullptr;
 static ID2D1Factory* g_d2f = nullptr;
 static ID2D1HwndRenderTarget* g_prt = nullptr;
 static ID2D1Bitmap* g_pbmp = nullptr, *g_pinfo = nullptr;
 static ID2D1SolidColorBrush* g_pline = nullptr;
+// the full-resolution path: Direct3D + Direct2D 1.1, real Gaussian blur on the graphics card (the old path below is only a fallback)
+static ID3D11Device* g_pd3d = nullptr; static ID2D1Factory1* g_pf1 = nullptr; static ID2D1Device* g_pdev = nullptr; static ID2D1DeviceContext* g_pdc = nullptr;
+static IDXGISwapChain1* g_psc = nullptr; static ID2D1Bitmap1* g_ptarget = nullptr, *g_pmid = nullptr; static ID2D1Effect* g_pblur = nullptr;
 static int g_pw = 0, g_ph = 0, g_pDir = 0, g_pA = 0;   // low-res size; fade direction and alpha
 static DWORD g_pT0 = 0, g_pTick = 0; static POINT g_pPt;
 static float g_pTime = 0; static bool g_pLive = false;   // fully started (levels on, cursor hidden)
@@ -5447,11 +5454,23 @@ static HMONITOR PickMonitor(const std::wstring& name) {   // "" = main screen, e
     if (!name.empty()) for (auto& m : g_mons) if (m.name == name && m.cloneOf < 0) return MonitorFromRect(&m.rc, MONITOR_DEFAULTTONEAREST);
     return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
 }
+static void PartyGpuFree() {
+    if (g_pdc) g_pdc->SetTarget(nullptr);
+    if (g_pblur) { g_pblur->Release(); g_pblur = nullptr; }
+    if (g_pmid) { g_pmid->Release(); g_pmid = nullptr; }
+    if (g_ptarget) { g_ptarget->Release(); g_ptarget = nullptr; }
+    if (g_pdc) { g_pdc->Release(); g_pdc = nullptr; }
+    if (g_pdev) { g_pdev->Release(); g_pdev = nullptr; }
+    if (g_pf1) { g_pf1->Release(); g_pf1 = nullptr; }
+    if (g_psc) { g_psc->Release(); g_psc = nullptr; }
+    if (g_pd3d) { g_pd3d->Release(); g_pd3d = nullptr; }
+}
 static void PartyFree() {
     if (g_pinfo) { g_pinfo->Release(); g_pinfo = nullptr; }
     if (g_pline) { g_pline->Release(); g_pline = nullptr; }
     if (g_pbmp) { g_pbmp->Release(); g_pbmp = nullptr; }
     if (g_prt) { g_prt->Release(); g_prt = nullptr; }
+    PartyGpuFree();
     std::vector<float>().swap(g_pbuf); g_pInfoKey.clear();
 }
 static std::vector<std::wstring> ScreenNames() { std::vector<std::wstring> v; for (auto& m : g_mons) if (m.cloneOf < 0 && std::find(v.begin(), v.end(), m.name) == v.end()) v.push_back(m.name); return v; }
@@ -5465,7 +5484,7 @@ static void PartyInfoBitmap() {   // the cover, title and artist for the corner,
     if (key == g_pInfoKey && (g_pinfo || key.empty())) return;
     g_pInfoKey = key;
     if (g_pinfo) { g_pinfo->Release(); g_pinfo = nullptr; }
-    if (key.empty() || !g_prt) return;
+    if (key.empty() || (!g_prt && !g_pdc)) return;
     const int w = (int)S(420), h = (int)S(48);
     Gdiplus::Bitmap bmp(w, h, PixelFormat32bppPARGB);
     {
@@ -5481,12 +5500,142 @@ static void PartyInfoBitmap() {   // the cover, title and artist for the corner,
     }
     BitmapData bd; Rect rc(0, 0, w, h);
     if (bmp.LockBits(&rc, ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Ok) {
-        D2D1_BITMAP_PROPERTIES bp = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96, 96};
-        g_prt->CreateBitmap(D2D1::SizeU(w, h), bd.Scan0, bd.Stride, bp, &g_pinfo);
+        if (g_pdc) {
+            D2D1_BITMAP_PROPERTIES1 bp1 = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+            ID2D1Bitmap1* b1 = nullptr;
+            if (SUCCEEDED(g_pdc->CreateBitmap(D2D1::SizeU(w, h), bd.Scan0, bd.Stride, &bp1, &b1))) g_pinfo = b1;
+        } else {
+            D2D1_BITMAP_PROPERTIES bp = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96, 96};
+            g_prt->CreateBitmap(D2D1::SizeU(w, h), bd.Scan0, bd.Stride, bp, &g_pinfo);
+        }
         bmp.UnlockBits(&bd);
     }
 }
+static bool PartyGpuInit(HWND hw, int w, int h) {
+    typedef HRESULT (WINAPI* PFN_D3DCD)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT, ID3D11Device**, D3D_FEATURE_LEVEL*, ID3D11DeviceContext**);
+    typedef HRESULT (WINAPI* PFN_D2DCF)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**);
+    HMODULE d3 = LoadLibraryW(L"d3d11.dll"), d2 = LoadLibraryW(L"d2d1.dll");
+    if (!d3 || !d2) return false;
+    PFN_D3DCD cd = (PFN_D3DCD)GetProcAddress(d3, "D3D11CreateDevice"); PFN_D2DCF cf = (PFN_D2DCF)GetProcAddress(d2, "D2D1CreateFactory");
+    if (!cd || !cf) return false;
+    IDXGIDevice* dxd = nullptr; IDXGIAdapter* adp = nullptr; IDXGIFactory2* fac = nullptr; IDXGISurface* surf = nullptr; bool ok = false;
+    do {
+        if (FAILED(cd(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &g_pd3d, nullptr, nullptr))) break;
+        if (FAILED(g_pd3d->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxd))) break;
+        if (FAILED(cf(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), nullptr, (void**)&g_pf1))) break;
+        if (FAILED(g_pf1->CreateDevice(dxd, &g_pdev))) break;
+        if (FAILED(g_pdev->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_pdc))) break;
+        if (FAILED(dxd->GetAdapter(&adp))) break;
+        if (FAILED(adp->GetParent(__uuidof(IDXGIFactory2), (void**)&fac))) break;
+        DXGI_SWAP_CHAIN_DESC1 sd = {}; sd.Width = w; sd.Height = h; sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;   // the plain copy model: works with the fading window
+        if (FAILED(fac->CreateSwapChainForHwnd(g_pd3d, hw, &sd, nullptr, nullptr, &g_psc))) break;
+        fac->MakeWindowAssociation(hw, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        if (FAILED(g_psc->GetBuffer(0, __uuidof(IDXGISurface), (void**)&surf))) break;
+        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.f, 96.f);
+        if (FAILED(g_pdc->CreateBitmapFromDxgiSurface(surf, &bp, &g_ptarget))) break;
+        D2D1_BITMAP_PROPERTIES1 mp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+        if (FAILED(g_pdc->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, &mp, &g_pmid))) break;
+        if (FAILED(g_pdc->CreateEffect(CLSID_D2D1GaussianBlur, &g_pblur))) break;
+        g_pdc->SetDpi(96.f, 96.f);
+        ok = true;
+    } while (0);
+    if (surf) surf->Release(); if (fac) fac->Release(); if (adp) adp->Release(); if (dxd) dxd->Release();
+    if (!ok) PartyGpuFree();
+    return ok;
+}
+static void PartyFrameGpu() {   // the same looks at the screen's own resolution: shapes drawn with gradients, softened by a real Gaussian blur
+    ID2D1DeviceContext* dc = g_pdc; if (!dc || !g_ptarget || !g_pmid) return;
+    D2D1_SIZE_U psz = g_ptarget->GetPixelSize(); const float W = (float)psz.width, H = (float)psz.height;
+    g_pTime += 0.033f; const float t = g_pTime;
+    Color a = PopAcc(); const float ar = a.GetR() / 255.f, ag = a.GetG() / 255.f, ab = a.GetB() / 255.f;
+    PartyInfoBitmap();
+    float sigma = 0; ID2D1PathGeometry* line = nullptr;
+    dc->SetTarget(g_pmid); dc->BeginDraw(); dc->Clear(D2D1::ColorF(0, 0, 0, 0));
+    auto linGrad = [&](ID2D1GradientStopCollection* gs, float x0, float y0, float x1, float y1) { ID2D1LinearGradientBrush* br = nullptr; dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(x0, y0), D2D1::Point2F(x1, y1)), gs, &br); return br; };
+    if (g_partyLook == 0) {   // glow waves: bars rising from the bottom, brighter at their base
+        D2D1_GRADIENT_STOP st[2] = {{0.f, D2D1::ColorF(ar, ag, ab, 0.75f)}, {1.f, D2D1::ColorF(ar, ag, ab, 0.26f)}};
+        ID2D1GradientStopCollection* gs = nullptr; dc->CreateGradientStopCollection(st, 2, &gs);
+        if (gs) {
+            const int n = 32; float x0 = -W * 0.04f, span = W * 1.08f, gap = W * 0.0047f, bw = span / n - gap;
+            for (int k = 0; k < n; k++) {
+                float hgt = LvBar(k, n) * H, bx = x0 + k * (bw + gap); if (hgt < 2.f) continue;
+                if (ID2D1LinearGradientBrush* br = linGrad(gs, bx, H, bx, H - hgt)) { dc->FillRectangle(D2D1::RectF(bx, H - hgt, bx + bw, H), br); br->Release(); }
+            }
+            gs->Release();
+        }
+        sigma = W * 0.014f;
+    } else if (g_partyLook == 1) {   // aurora: three curtains of light rays hanging from slow wavy lines; the music lifts the rays
+        float bass = (g_lv[0] + g_lv[1] + g_lv[2]) / 3;
+        {   // the night sky, a touch of colour low down
+            D2D1_GRADIENT_STOP st[2] = {{0.f, D2D1::ColorF(ar * 0.1f + 0.008f, ag * 0.1f + 0.024f, ab * 0.1f + 0.067f, 0.9f)}, {1.f, D2D1::ColorF(ar * 0.1f + 0.008f, ag * 0.1f + 0.024f, ab * 0.1f + 0.067f, 0.f)}};
+            ID2D1GradientStopCollection* gs = nullptr; dc->CreateGradientStopCollection(st, 2, &gs);
+            if (gs) { ID2D1RadialGradientBrush* rb = nullptr; dc->CreateRadialGradientBrush(D2D1::RadialGradientBrushProperties(D2D1::Point2F(W / 2, H), D2D1::Point2F(0, 0), 0.6f * W, 0.7f * H), gs, &rb);
+                      if (rb) { dc->FillRectangle(D2D1::RectF(0, 0, W, H), rb); rb->Release(); } gs->Release(); }
+        }
+        static const float base[3][3] = {{0.24f, 1.0f, 0.63f}, {0.18f, 0.85f, 1.0f}, {0.70f, 0.42f, 1.0f}};
+        static const float mixA[3] = {0.35f, 0.30f, 0.30f}, op[3] = {1.0f, 0.75f, 0.55f};
+        dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);   // overlapping rays add their light
+        for (int l = 0; l < 3; l++) {
+            float cr = ar * mixA[l] + base[l][0] * (1 - mixA[l]), cg = ag * mixA[l] + base[l][1] * (1 - mixA[l]), cb = ab * mixA[l] + base[l][2] * (1 - mixA[l]), K = op[l] * 0.55f;
+            D2D1_GRADIENT_STOP st[4] = {{0.f, D2D1::ColorF(cr, cg, cb, 0.f)}, {0.06f, D2D1::ColorF(cr, cg, cb, K)}, {0.35f, D2D1::ColorF(cr, cg, cb, K * 0.55f)}, {1.f, D2D1::ColorF(cr, cg, cb, 0.f)}};
+            ID2D1GradientStopCollection* gs = nullptr; dc->CreateGradientStopCollection(st, 4, &gs); if (!gs) continue;
+            const int rays = 64;
+            for (int k = 0; k < rays; k++) {
+                float x = k / (float)(rays - 1), bi = LvBar((int)(x * 31), 32);
+                float bottom = (34 + l * 9 + sinf(x * 3.1f + t * .32f + l * 1.9f) * 10 + sinf(x * 7.3f - t * .47f + l) * 4) / 100.f * H;
+                float hgt = (14 + l * 4 + bi * (34 - l * 6) + sinf(k * .9f + t * 1.3f + l) * 3 + bass * 6) / 100.f * H;
+                float cx = x * W, half = W * 0.012f, yb = H - bottom;
+                if (ID2D1LinearGradientBrush* br = linGrad(gs, cx, yb, cx, yb - hgt)) { dc->FillRectangle(D2D1::RectF(cx - half, yb - hgt, cx + half, yb), br); br->Release(); }
+            }
+            gs->Release();
+        }
+        dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        sigma = W * 0.007f;
+    } else {   // light line: one smooth line across the middle; each part of the song swings it up or down
+        const int n = 40;
+        std::vector<D2D1_POINT_2F> pts; pts.push_back(D2D1::Point2F(0, H / 2.f));
+        for (int k = 0; k < n; k++) pts.push_back(D2D1::Point2F((k + .5f) / n * W, H / 2.f - LvBar(k, n) * H * 0.44f * sinf(k * 1.1f + t * 2.4f)));
+        pts.push_back(D2D1::Point2F(W, H / 2.f));
+        if (g_pf1 && SUCCEEDED(g_pf1->CreatePathGeometry(&line)) && line) {
+            ID2D1GeometrySink* sink = nullptr;
+            if (SUCCEEDED(line->Open(&sink)) && sink) {   // smooth curves through the midpoints of the points
+                sink->BeginFigure(pts[0], D2D1_FIGURE_BEGIN_HOLLOW);
+                for (size_t i = 1; i + 1 < pts.size(); i++) {
+                    D2D1_POINT_2F e = D2D1::Point2F((pts[i].x + pts[i + 1].x) / 2, (pts[i].y + pts[i + 1].y) / 2);
+                    sink->AddQuadraticBezier(D2D1::QuadraticBezierSegment(pts[i], e));
+                }
+                sink->AddLine(pts.back());
+                sink->EndFigure(D2D1_FIGURE_END_OPEN); sink->Close(); sink->Release();
+            }
+            ID2D1SolidColorBrush* br = nullptr; dc->CreateSolidColorBrush(D2D1::ColorF(ar, ag, ab, 0.5f), &br);
+            ID2D1StrokeStyle* ss = nullptr; g_pf1->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND, 10.f, D2D1_DASH_STYLE_SOLID, 0.f), nullptr, 0, &ss);
+            if (br) { dc->DrawGeometry(line, br, W * 0.012f, ss); br->Release(); }
+            if (ss) ss->Release();
+        }
+        sigma = W * 0.009f;
+    }
+    HRESULT hr1 = dc->EndDraw();
+    dc->SetTarget(g_ptarget); dc->BeginDraw(); dc->Clear(D2D1::ColorF(0, 0, 0, 1));
+    if (SUCCEEDED(hr1)) {
+        g_pblur->SetInput(0, g_pmid);
+        g_pblur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, sigma);
+        g_pblur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+        dc->DrawImage(g_pblur);
+    }
+    if (line) {   // the line itself, sharp, over its glow
+        ID2D1SolidColorBrush* br = nullptr; dc->CreateSolidColorBrush(D2D1::ColorF(ar, ag, ab, 1.f), &br);
+        if (br) { dc->DrawGeometry(line, br, S(3)); br->Release(); }
+        line->Release();
+    }
+    if (g_pinfo) { D2D1_SIZE_F is = g_pinfo->GetSize(); dc->DrawBitmap(g_pinfo, D2D1::RectF(S(36), H - S(32) - is.height, S(36) + is.width, H - S(32)), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR); }
+    HRESULT hr2 = dc->EndDraw();
+    if (hr2 == (HRESULT)D2DERR_RECREATE_TARGET || hr1 == (HRESULT)D2DERR_RECREATE_TARGET) { PartyFree(); return; }
+    HRESULT hp = g_psc->Present(1, 0);
+    if (hp == DXGI_ERROR_DEVICE_REMOVED || hp == DXGI_ERROR_DEVICE_RESET) PartyFree();
+}
 static void PartyFrame() {
+    if (g_pdc) { PartyFrameGpu(); return; }
     if (!g_prt && g_d2f && g_party) {   // the graphics card was reset: make a new target
         RECT rc; GetClientRect(g_party, &rc);
         g_d2f->CreateHwndRenderTarget(D2D1::RenderTargetProperties(), D2D1::HwndRenderTargetProperties(g_party, D2D1::SizeU(rc.right, rc.bottom)), &g_prt);
@@ -5524,21 +5673,20 @@ static void PartyFrame() {
     };
     float sc = W / 320.f;
     std::vector<D2D1_POINT_2F> line;
-    if (g_partyLook == 0 || g_partyLook == 1) {   // bars: glow waves rise from the bottom; mirror bars grow both ways from the middle
-        bool mir = g_partyLook == 1; int n = mir ? 48 : 32;
-        float x0 = mir ? W * 0.03f : -W * 0.04f, span = mir ? W * 0.94f : W * 1.08f, gap = (mir ? 1.2f : 1.5f) * sc, bw = span / n - gap;
+    if (g_partyLook == 0) {   // glow waves rise from the bottom
+        int n = 32;
+        float x0 = -W * 0.04f, span = W * 1.08f, gap = 1.5f * sc, bw = span / n - gap;
         for (int k = 0; k < n; k++) {
-            float v = LvBar(k, n) * (mir ? 0.9f : 1.0f), hgt = v * H, bx = x0 + k * (bw + gap);
+            float hgt = LvBar(k, n) * H, bx = x0 + k * (bw + gap);
             for (int y = 0; y < H; y++) {
-                float m;
-                if (mir) { float d = fabsf(y - H / 2.f) / std::max(1.f, hgt / 2); if (d > 1) continue; m = 1 - 0.6f * d; }
-                else { float fromB = (H - 1 - y) / std::max(1.f, hgt); if (fromB > 1) continue; m = 1 - 0.65f * fromB; }
+                float fromB = (H - 1 - y) / std::max(1.f, hgt); if (fromB > 1) continue;
+                float m = 1 - 0.65f * fromB;
                 for (int x = (int)bx; x < (int)(bx + bw); x++) add(x, y, ar, ag, ab, m);
             }
         }
-        if (mir) blur((int)lroundf(1 * sc), 2); else blur((int)lroundf(4 * sc), 3);
-        float o = mir ? 0.85f : 0.75f; for (auto& v : b) v *= o;
-    } else if (g_partyLook == 2) {   // aurora: three curtains of soft light rays hanging from slow wavy lines; the music lifts the rays
+        blur((int)lroundf(4 * sc), 3);
+        for (auto& v : b) v *= 0.75f;
+    } else if (g_partyLook == 1) {   // aurora: three curtains of soft light rays hanging from slow wavy lines; the music lifts the rays
         float bass = (g_lv[0] + g_lv[1] + g_lv[2]) / 3;
         for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {   // the night sky, a touch of colour low down
             float dx = (x - W / 2.f) / (W * 0.6f), dy = (y - H) / (H * 0.7f), d = std::min(1.f, sqrtf(dx * dx + dy * dy));
@@ -5660,8 +5808,10 @@ static void PartyStart() {
     g_party = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"KnobParty", L"", WS_POPUP, r.left, r.top, w, h, nullptr, nullptr, g_inst, nullptr);
     if (!g_party) return;
     SetLayeredWindowAttributes(g_party, 0, 0, LWA_ALPHA);
-    D2D1_RENDER_TARGET_PROPERTIES rp = D2D1::RenderTargetProperties();
-    if (FAILED(g_d2f->CreateHwndRenderTarget(rp, D2D1::HwndRenderTargetProperties(g_party, D2D1::SizeU(w, h)), &g_prt))) { DestroyWindow(g_party); return; }
+    if (!PartyGpuInit(g_party, w, h)) {   // no full-resolution path on this PC: the older, lower-resolution one
+        D2D1_RENDER_TARGET_PROPERTIES rp = D2D1::RenderTargetProperties();
+        if (FAILED(g_d2f->CreateHwndRenderTarget(rp, D2D1::HwndRenderTargetProperties(g_party, D2D1::SizeU(w, h)), &g_prt))) { DestroyWindow(g_party); return; }
+    }
     g_pw = 320; g_ph = std::max(90, 320 * h / std::max(1, w));
     g_pTime = 0; g_pInfoKey.clear();
     ShowWindow(g_party, SW_SHOW); SetForegroundWindow(g_party);
@@ -6560,7 +6710,7 @@ static void PaintSettings(HDC hdc) {
                     ddCard(18, L"Party screen shows on", L"", o, cur, -1);
                 }
                 ddCard(31, L"End the Party screen with", L"Esc only keeps it going when the mouse moves or other keys are pressed", {L"Any key or mouse move", L"Esc only"}, g_partyClose, -1);
-                ddCard(19, L"Look", L"All of them follow the music and use the cover's colours", {PARTY_LOOKS[0], PARTY_LOOKS[1], PARTY_LOOKS[2], PARTY_LOOKS[3]}, g_partyLook, -1);
+                ddCard(19, L"Look", L"All of them follow the music and use the cover's colours", {PARTY_LOOKS[0], PARTY_LOOKS[1], PARTY_LOOKS[2]}, g_partyLook, -1);
                 switchCard(28, L"Show what's playing", L"The cover, title and artist, small in a corner", g_partyInfo);
             }
             h4(L"Profiles");
@@ -6901,7 +7051,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 (dd == 17 ? g_clockScr : g_partyScr) = v; SaveSettings();
             }
             if (dd == 31) { g_partyClose = std::max(0, std::min(1, k)); SaveSettings(); }
-            if (dd == 19) { g_partyLook = std::max(0, std::min(3, k)); SaveSettings(); }
+            if (dd == 19) { g_partyLook = std::max(0, std::min(2, k)); SaveSettings(); }
             if (dd >= 1000 && dd - 1000 < (int)g_sc.size()) {   // which speaker / profile a shortcut uses
                 Shortcut& s2 = g_sc[dd - 1000];
                 if (HkParamKind(s2.act) == 1 && k < (int)g_out.size()) s2.param = OutLabel(g_out[k]);
