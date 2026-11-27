@@ -32,6 +32,10 @@
 #include <wbemidl.h>
 #include <winhttp.h>
 #include <cfgmgr32.h>
+#include <shcore.h>
+#include <roapi.h>
+#include <winstring.h>
+#include <d2d1.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -46,12 +50,12 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.11"
+#define APP_VERSION L"1.42.0"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
-enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE, WM_APP_FOCUSPANEL };
-enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16, TIMER_FOCUSWATCH = 17 };
+enum { WM_APP_TRAY = WM_APP + 1, WM_APP_AUDIOCHANGED, WM_APP_MONITORS, WM_APP_SHOW, WM_APP_VOLCHANGED, WM_APP_VERSION, WM_APP_QUIT, WM_APP_UPDINFO, WM_APP_CALDONE, WM_APP_FOCUSPANEL, WM_APP_MEDIA };
+enum { TIMER_REFRESH = 1, TIMER_AUDIODEBOUNCE = 2, TIMER_ANIM = 3, TIMER_IDENT = 4, TIMER_SPIN = 5, TIMER_UPDCHECK = 7, TIMER_TRAYPIN = 8, TIMER_CALRETRY = 9, TIMER_SCREENOFF = 10, TIMER_NIGHT = 14, TIMER_DELAYAPPLY = 15, TIMER_TRIM = 16, TIMER_FOCUSWATCH = 17, TIMER_OFFAT = 18, TIMER_POPKEY = 19, TIMER_LOCKKEY = 20 };
 enum Tab { T_SOUND = 0, T_APPS = 1, T_DISPLAY = 2 };
 
 static HINSTANCE g_inst;
@@ -79,15 +83,15 @@ static int SI();
 // a short, fixed list of actions (no macros). None has keys until the user picks some.
 // The list in Settings is in this order; "Switch to" and "Apply profile" name a speaker or profile and can be added more than once.
 enum HkAction { HK_OPEN, HK_TABSOUND, HK_TABAPPS, HK_TABDISPLAY, HK_SWITCHTO, HK_NEXTOUT, HK_VOLUP, HK_VOLDOWN, HK_MUTE, HK_MIC, HK_APPMUTE,
-                HK_BRIUP, HK_BRIDOWN, HK_APPLYPROF, HK_SCREENOFF, HK_SYNC, HK_COUNT };
+                HK_BRIUP, HK_BRIDOWN, HK_APPLYPROF, HK_SCREENOFF, HK_SYNC, HK_PARTY, HK_COUNT };
 struct HotKey { UINT mods; UINT vk; bool ok; };
 struct Shortcut { int act; std::wstring param; HotKey k; };
 static std::vector<Shortcut> g_sc;   // one row each in Settings; nothing is set until the user adds it
 static const wchar_t* HK_NAMES[HK_COUNT] = {L"Open or close Knob", L"Open on Sound", L"Open on Apps", L"Open on Display", L"Switch to", L"Next speaker",
     L"Volume up", L"Volume down", L"Mute or unmute", L"Mute microphone", L"Mute the app in front", L"Brightness up", L"Brightness down",
-    L"Apply profile", L"Turn off displays", L"Run Auto sync"};
+    L"Apply profile", L"Turn off displays", L"Run Auto sync", L"Show party screen"};
 static const wchar_t* HK_KEYS[HK_COUNT] = {L"open", L"tabsound", L"tabapps", L"tabdisplay", L"switchto", L"nextout", L"volup", L"voldown", L"mute", L"mic",
-    L"appmute", L"briup", L"bridown", L"applyprof", L"screenoff", L"sync"};
+    L"appmute", L"briup", L"bridown", L"applyprof", L"screenoff", L"sync", L"party"};
 static int HkParamKind(int a) { return a == HK_SWITCHTO ? 1 : a == HK_APPLYPROF ? 2 : 0; }   // 1 a speaker, 2 a profile
 static bool g_noSave = false, g_restartAfterExit = false;
 static int g_themeMode = 0;          // 0 follow Windows, 1 light, 2 dark
@@ -119,7 +123,25 @@ static std::map<std::wstring, NightCfg> g_night;   // monitor name -> night ligh
 static int g_nightAuto = 0;                        // 0 whenever it's switched on, 1 evenings only (7 pm - 7 am)
 static double g_geoLat = 999, g_geoLon = 999; static long long g_geoWhen = 0;   // rough location for "Sunset to sunrise" (2 decimals)
 static int g_newSeen = 0;   // "NEW" tags in Settings: a bit per setting, cleared once you've used it
+// Turn off displays, the clock on the black screen, Party screen, refresh rate on battery
+static const int OFF_MIN[5] = {0, 15, 30, 60, 120};
+static int g_offDelay = 0;              // Turn off displays: 0 right away, else after OFF_MIN[g_offDelay] minutes
+static DWORD g_offAt = 0;               // a timer is running: GetTickCount() when the screens go off
+static bool g_offClock = false;         // the time and date in dim grey on the black screen
+static bool g_offFull = false;          // also tell monitors to power their screen down (DDC/CI), so an LCD's backlight goes dark too
+static std::wstring g_clockScr;         // which screen shows it: "" the main screen, "*" every screen, else a screen's name
+static std::wstring g_partyScr;         // Party screen: "" the main screen, else a screen's name
+static int g_partyLook = 0;             // 0 glow waves, 1 mirror bars, 2 aurora, 3 light line
+static bool g_partyInfo = true;         // the cover, title and artist small in a corner
+static bool g_rateBat = false;          // the laptop screen drops to 60 Hz on battery and goes back to its highest on power
+// flyouts (Settings › Flyouts): off until you switch them on, so they never double up with another flyout app
+static bool g_popMedia = false, g_popNext = false, g_popLock = false;
+static int g_fStayMs = 2000, g_fAnimMs = 300;   // how long flyouts stay (0 = media stays until you close it) and how long they take to slide in (0 = no motion)
+static int g_fPos = 0, g_fScreen = 0, g_fLayout = 0, g_fGlow = 1, g_lkKeys = 15;   // g_lkKeys: Caps 1, Num 2, Scroll 4, Insert 8
+static bool g_fCover = true, g_fCentre = true, g_fPlayer = true;
 
+static std::wstring OffLeft(); static void ScreenOffRequest(); static void PartyStart();
+static bool IsClockScreen(const RECT& rc); static void PaintClock(HWND h, HDC dc);
 static int g_dpi = 96;
 static float g_scale = 1.f;
 static inline float S(float v) { return v * g_scale; }
@@ -320,6 +342,16 @@ static void LoadSettings() {
     g_autoSwitch = GetPrivateProfileIntW(L"main", L"autoswitch", 1, g_iniPath.c_str()) != 0;
     g_nightAuto = std::min(2, (int)GetPrivateProfileIntW(L"main", L"nightauto", 0, g_iniPath.c_str()));
     g_newSeen = (int)GetPrivateProfileIntW(L"main", L"newseen", 0, g_iniPath.c_str());
+    {
+        auto gi = [&](const wchar_t* k, int d, int lo, int hi) { return std::max(lo, std::min(hi, (int)GetPrivateProfileIntW(L"main", k, d, g_iniPath.c_str()))); };
+        auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
+        g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
+        g_partyScr = gs(L"partyscr"); g_partyLook = gi(L"partylook", 0, 0, 3); g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
+        g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
+        g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000);
+        g_fLayout = gi(L"flayout", 0, 0, 1); g_fGlow = gi(L"fglow", 1, 0, 5); g_lkKeys = gi(L"lkkeys", 15, 0, 15);
+        g_fCover = gi(L"fcover", 1, 0, 1); g_fCentre = gi(L"fcentre", 1, 0, 1); g_fPlayer = gi(L"fplayer", 1, 0, 1);
+    }
     { wchar_t b[64]; GetPrivateProfileStringW(L"main", L"geo", L"", b, 64, g_iniPath.c_str()); double la, lo; long long w;
       if (swscanf(b, L"%lf,%lf,%lld", &la, &lo, &w) == 3) { g_geoLat = la; g_geoLon = lo; g_geoWhen = w; } }
     { wchar_t cb[512] = {}; GetPrivateProfileStringW(L"main", L"calldev", L"", cb, 512, g_iniPath.c_str()); g_callDev = cb; }
@@ -386,6 +418,14 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"main", L"autoswitch", g_autoSwitch ? L"1" : L"0", g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"nightauto", std::to_wstring(g_nightAuto).c_str(), g_iniPath.c_str());
     WritePrivateProfileStringW(L"main", L"newseen", std::to_wstring(g_newSeen).c_str(), g_iniPath.c_str());
+    {
+        auto wi = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"main", k, std::to_wstring(v).c_str(), g_iniPath.c_str()); };
+        wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
+        WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"ratebat", g_rateBat);
+        wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
+        wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
+        wi(L"fcover", g_fCover); wi(L"fcentre", g_fCentre); wi(L"fplayer", g_fPlayer);
+    }
     if (g_geoLat < 900) { wchar_t b[64]; swprintf(b, 64, L"%.2f,%.2f,%lld", g_geoLat, g_geoLon, g_geoWhen); WritePrivateProfileStringW(L"main", L"geo", b, g_iniPath.c_str()); }
     { std::wstring n; for (auto& kv : g_night) { n += kv.first + L"=" + (kv.second.on ? L"1," : L"0,") + std::to_wstring(kv.second.str); n.push_back(0); } n.push_back(0);
       WritePrivateProfileSectionW(L"nightlight", n.c_str(), g_iniPath.c_str()); }
@@ -1822,6 +1862,7 @@ static DWORD WINAPI BrightProc(LPVOID) {
                 if (idx < 0 || idx >= (int)w_mons.size()) continue;
                 auto& m = w_mons[idx];
                 if (type == 2) { if (m.phys && SetVCPFeature(m.phys, 0x60, (DWORD)kv.second)) m.input = kv.second; continue; }   // switch input
+                if (type == 3) { if (m.phys) SetVCPFeature(m.phys, 0xD6, (DWORD)kv.second); continue; }   // power: 1 on, 4 screen off (DDC/CI)
                 if (!m.ok) continue;
                 int pct = std::max(0, std::min(100, kv.second));
                 if (type == 0) {
@@ -1864,6 +1905,11 @@ static void MonSet(int idx, int type, int pct) {
     SetEvent(g_bEvent);
 }
 
+static void SetMonitorPower(int idx, bool on) {   // the monitor's own screen-off command; the PC and the other screens carry on
+    if (idx < 0 || idx >= (int)g_mons.size()) return;
+    EnterCriticalSection(&g_bcs); g_bSets[idx * 4 + 3] = on ? 1 : 4; g_bSetGen = g_monGen; LeaveCriticalSection(&g_bcs);
+    SetEvent(g_bEvent);
+}
 static void SetMonitorInput(int idx, int code) {
     if (idx < 0 || idx >= (int)g_mons.size()) return;
     g_mons[idx].input = code;
@@ -2238,7 +2284,7 @@ enum : wchar_t {
 // ---------------------------------------------------------------- layout model
 enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_DTOP, E_MONOFF };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENUBG, H_MICALL, H_DELAYCHIP, H_UPDATE, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL, H_OFFEXT, H_OFFDUP };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENUBG, H_MICALL, H_DELAYCHIP, H_UPDATE, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL, H_OFFEXT, H_OFFDUP, H_PARTY };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 78, ROWGAP = 3;
@@ -2398,7 +2444,12 @@ static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
 static RectF OffExt(const El& e) { float w = S(18) + MeasureW(L"Extend", g_fSmall); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y + S(2), w, S(30)); }
 static RectF OffDup(const El& e) { float w = S(18) + MeasureW(L"Duplicate", g_fSmall); RectF x = OffExt(e); return RectF(x.X - S(6) - w, e.r.Y + S(2), w, S(30)); }
-static RectF DTopOff(const El& e) { float w = S(12) + S(14) + S(6) + MeasureW(L"Turn off displays", g_fSmall) + S(12); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y, w, S(32)); }
+static RectF DTopParty(const El& e) { float w = S(12) + S(14) + S(6) + MeasureW(L"Party", g_fSmall) + S(12); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y, w, S(32)); }
+static RectF DTopOff(const El& e) {   // "Turn off", or the countdown with a × to cancel it
+    std::wstring t = g_offAt ? OffLeft() : L"Turn off";
+    float w = S(12) + S(14) + S(6) + MeasureW(t.c_str(), g_fSmall) + (g_offAt ? S(16) : 0) + S(12);
+    RectF p = DTopParty(e); return RectF(p.X - S(8) - w, e.r.Y, w, S(32));
+}
 static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(10), e.r.Y, o.X - S(8) - e.r.X - S(10), S(32)); }
 static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
 // header pills, right to left: night light, HDR (screens that can), refresh rate
@@ -2568,6 +2619,7 @@ static Hit HitTest(float x, float y) {
         } else if (e.k == E_DTOP) {
             if (InRect(DTopProfile(e), x, y)) h.h = H_PROFDD;
             else if (InRect(DTopOff(e), x, y)) h.h = H_SCREENOFF;
+            else if (InRect(DTopParty(e), x, y)) h.h = H_PARTY;
         }
         return h;
     }
@@ -2907,6 +2959,13 @@ static const struct { const char* n; const char* s; } ICONS_EXTRA[] = {
     {"back", "<path d=\"M12 5l-5 5 5 5\"/>"},
     {"chevRight", "<path d=\"M8 6l4 4-4 4\"/>"},
     {"chevUp", "<path d=\"M6 12l4-4 4 4\"/>"},
+    {"mFlyout", "<rect x=\"3\" y=\"11\" width=\"14\" height=\"6\" rx=\"2\"/><path d=\"M6 14h5\"/><path d=\"M3 4.5h14M3 7.5h9\"/>"},
+    {"mShuf", "<path d=\"M3 6h3c3 0 5 8 8 8h3\"/><path d=\"M3 14h3c1.3 0 2.4-1.5 3.4-3.2M11.6 9.2C12.6 7.5 13.7 6 15 6h2\"/><path d=\"M15.5 4l2 2-2 2M15.5 12l2 2-2 2\"/>"},
+    {"mRep", "<path d=\"M4 9V8a2 2 0 0 1 2-2h10\"/><path d=\"M14 4l2 2-2 2\"/><path d=\"M16 11v1a2 2 0 0 1-2 2H4\"/><path d=\"M6 16l-2-2 2-2\"/>"},
+    {"mPlay", "<path d=\"M7 5.2v9.6l7.6-4.8z\" fill=\"currentColor\" stroke=\"none\"/>"},
+    {"mPause", "<rect x=\"6\" y=\"5\" width=\"2.6\" height=\"10\" rx=\".8\" fill=\"currentColor\" stroke=\"none\"/><rect x=\"11.4\" y=\"5\" width=\"2.6\" height=\"10\" rx=\".8\" fill=\"currentColor\" stroke=\"none\"/>"},
+    {"mPrev", "<path d=\"M5.5 5v10\"/><path d=\"M15 5.4v9.2L8 10z\" fill=\"currentColor\" stroke=\"none\"/>"},
+    {"mNext", "<path d=\"M14.5 5v10\"/><path d=\"M5 5.4v9.2L12 10z\" fill=\"currentColor\" stroke=\"none\"/>"},
 };
 struct IcoPart { GraphicsPath* path; bool fill, stroke; };
 static std::map<std::string, std::vector<IcoPart>> g_icoCache;
@@ -3315,9 +3374,21 @@ static void DrawEl(Graphics& g, int index) {
         Icon(g, "save", S(13), T.t2, pb.X + S(11) + S(6.5f), pb.Y + pb.Height / 2);
         PillText(g, act >= 0 ? g_prof[act].name.c_str() : L"Profile", g_fName, T.t1, RectF(pb.X + S(32), pb.Y, pb.Width - S(60), pb.Height));
         Icon(g, "chevron", S(14), T.t1, pb.X + pb.Width - S(19), pb.Y + pb.Height / 2, open ? 180.f : 0.f);
-        FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.subtle3 : T.subtle2, ob, S(8));
-        Icon(g, "power", S(14), hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, ob.X + S(12) + S(7), ob.Y + ob.Height / 2);
-        PillText(g, L"Turn off displays", g_fSmall, hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, RectF(ob.X + S(32), ob.Y, ob.Width - S(32), ob.Height));
+        bool ho = hovEl && g_hover.h == H_SCREENOFF, hp = hovEl && g_hover.h == H_PARTY;
+        FillRound(g, ho ? T.subtle3 : T.subtle2, ob, S(8));
+        if (g_offAt) {   // counting down: click to cancel
+            Icon(g, "timer", S(14), T.accent, ob.X + S(12) + S(7), ob.Y + ob.Height / 2);
+            std::wstring t = OffLeft();
+            PillText(g, t.c_str(), g_fSmall600, T.accent, RectF(ob.X + S(32), ob.Y, ob.Width - S(32) - S(20), ob.Height));
+            Icon(g, "exit", S(9), ho ? T.t1 : T.t3, ob.X + ob.Width - S(12) - S(5), ob.Y + ob.Height / 2);
+        } else {
+            Icon(g, "power", S(14), ho ? T.t1 : T.t2, ob.X + S(12) + S(7), ob.Y + ob.Height / 2);
+            PillText(g, L"Turn off", g_fSmall, ho ? T.t1 : T.t2, RectF(ob.X + S(32), ob.Y, ob.Width - S(32), ob.Height));
+        }
+        RectF pr = DTopParty(e);
+        FillRound(g, hp ? T.subtle3 : T.subtle2, pr, S(8));
+        Icon(g, "wave", S(14), hp ? T.t1 : T.t2, pr.X + S(12) + S(7), pr.Y + pr.Height / 2);
+        PillText(g, L"Party", g_fSmall, hp ? T.t1 : T.t2, RectF(pr.X + S(32), pr.Y, pr.Width - S(32), pr.Height));
         return;
     }
     if (e.k == E_MONOFF) {   // a screen that is off: dimmed number and name, then the ways to turn it back on
@@ -3938,7 +4009,8 @@ static void RunHotkey(int a, const std::wstring& param = L"") {
     }
     case HK_SWITCHTO: for (int i = 0; i < (int)g_out.size(); i++) if (g_out[i].name == param || OutLabel(g_out[i]) == param) { SwitchOutput(i); break; } break;
     case HK_APPLYPROF: for (int i = 0; i < (int)g_prof.size(); i++) if (g_prof[i].name == param && !g_prof[i].v.empty()) { ApplyProfile(i); break; } break;
-    case HK_SCREENOFF: HideFlyout(); SetTimer(g_hwnd, TIMER_SCREENOFF, 500, nullptr); break;
+    case HK_SCREENOFF: ScreenOffRequest(); break;
+    case HK_PARTY: HideFlyout(); PartyStart(); break;
     case HK_SYNC: StartAutoSync(); break;
     }
 }
@@ -4127,6 +4199,7 @@ static bool IsCallEndpoint(const Endpoint& e) {   // Bluetooth hands-free (call 
 // so Knob covers every screen with black and turns brightness to 0, then puts everything back on any input.
 static std::vector<HWND> g_blackWnds;
 static std::vector<int> g_blackPrev;
+static std::vector<std::wstring> g_blackPowered;   // monitors told to switch their screen off (by name: the list can change while they're off)
 static POINT g_blackPt; static DWORD g_blackTick;
 // the black fades in over BLACK_FADE ms, then the screens' own brightness goes to 0; waking fades it back out
 static const DWORD BLACK_FADE = 320;
@@ -4143,6 +4216,8 @@ static void BlackoutEnd(bool now = false) {   // now = at exit: no fade, never l
     if (g_blackCursorHidden) { ShowCursor(TRUE); g_blackCursorHidden = false; }
     for (int i = 0; i < (int)g_blackPrev.size() && i < (int)g_mons.size(); i++) if (g_blackPrev[i] >= 0) { g_mons[i].pct = g_blackPrev[i]; MonSet(i, 0, g_blackPrev[i]); }   // brightness back first, under the black
     g_blackPrev.clear();
+    for (auto& n : g_blackPowered) for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].name == n) SetMonitorPower(i, true);   // back on first, under the black
+    g_blackPowered.clear();
     if (now) { BlackDestroy(); return; }
     if (g_blackDir == -1) return;
     g_blackDir = -1; g_blackA0 = g_blackA; g_blackT0 = GetTickCount();
@@ -4150,9 +4225,11 @@ static void BlackoutEnd(bool now = false) {   // now = at exit: no fade, never l
 }
 static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_ERASEBKGND: { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
+    case WM_ERASEBKGND: { if (GetWindowLongPtrW(h, GWLP_USERDATA) & 1) return 1; RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
+    case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); if (GetWindowLongPtrW(h, GWLP_USERDATA) & 1) PaintClock(h, dc); EndPaint(h, &ps); return 0; }
     case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
     case WM_TIMER: {   // one fade step; smooth start and end
+        if (wp == 2) { SetWindowLongPtrW(h, GWLP_USERDATA, ((LONG_PTR)(GetTickCount() % 9409) << 1) | 1); InvalidateRect(h, nullptr, FALSE); return 0; }   // the clock: next minute, a little elsewhere
         float t = std::min(1.f, (GetTickCount() - g_blackT0) / (float)BLACK_FADE), e = t * t * (3 - 2 * t);
         int target = g_blackDir == 1 ? 255 : 0;
         BlackSetAlpha(g_blackA0 + (int)lroundf((target - g_blackA0) * e));
@@ -4161,7 +4238,9 @@ static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_blackDir == 1) {   // fully black: now dim every display we control to 0, remembering where it was
                 g_blackDir = 0;
                 g_blackPrev.assign(g_mons.size(), -1);
-                for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }
+                for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].ok && !IsClockScreen(g_mons[i].rc)) { g_blackPrev[i] = g_mons[i].pct; MonSet(i, 0, 0); }   // the clock's screen keeps its brightness
+                if (g_offFull) for (int i = 0; i < (int)g_mons.size(); i++)   // monitors: their own power-down, so the backlight goes dark too
+                    if (!g_mons[i].internal && g_mons[i].cloneOf < 0 && !IsClockScreen(g_mons[i].rc)) { SetMonitorPower(i, false); g_blackPowered.push_back(g_mons[i].name); }
             } else if (g_blackDir == -1) BlackDestroy();
         }
         return 0;
@@ -4180,6 +4259,7 @@ static LRESULT CALLBACK BlackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 static BOOL CALLBACK BlackMonProc(HMONITOR, HDC, LPRECT rc, LPARAM) {
     HWND w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"KnobBlack", L"", WS_POPUP, rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top, nullptr, nullptr, g_inst, nullptr);
+    if (w && IsClockScreen(*rc)) { SetWindowLongPtrW(w, GWLP_USERDATA, ((LONG_PTR)(GetTickCount() % 9409) << 1) | 1); SetTimer(w, 2, 60000, nullptr); }
     if (w) { SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA); ShowWindow(w, SW_SHOW); g_blackWnds.push_back(w); }   // starts see-through, then fades to black
     return TRUE;
 }
@@ -4429,15 +4509,1286 @@ static void StartUpdate() {
     if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
+// ---------------------------------------------------------------- sound levels (Party screen, Pulse glow)
+// A loopback copy of the main speaker split into bands, low notes first. The thread only runs while something
+// on screen draws from it (the party screen, or a media flyout with Pulse), and stops the moment that closes.
+static const int LV_N = 48;
+static float g_lv[LV_N];                // 0..1 per band, written by the level thread
+static volatile LONG g_lvRefs = 0, g_lvStop = 0;
+static HANDLE g_lvThread = nullptr;
+static void Fft(float* re, float* im, int n) {   // in place, radix 2
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { std::swap(re[i], re[j]); std::swap(im[i], im[j]); }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        float a = -6.2831853f / len, wr = cosf(a), wi = sinf(a);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1, ci = 0;
+            for (int k = 0; k < len / 2; k++) {
+                int p = i + k, q = p + len / 2;
+                float tr = re[q] * cr - im[q] * ci, ti = re[q] * ci + im[q] * cr;
+                re[q] = re[p] - tr; im[q] = im[p] - ti; re[p] += tr; im[p] += ti;
+                float nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+            }
+        }
+    }
+}
+static DWORD WINAPI LevelProc(LPVOID) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (g_demo) {   // demo builds: no sound to listen to, so the bands move like music
+        float t = 0, w[LV_N]; for (int b = 0; b < LV_N; b++) w[b] = (b * 37 % 100) / 100.f;
+        while (!g_lvStop) {
+            Sleep(16); t += 0.045f; float beat = powf(std::max(0.f, sinf(t * 7.3f)), 5);
+            for (int b = 0; b < LV_N; b++) { float f = b / (float)(LV_N - 1); w[b] = std::max(0.f, std::min(1.f, w[b] + ((b * 7919 + (int)(t * 1000)) % 100 / 100.f - .5f) * .2f));
+                float target = std::min(1.f, beat * .85f * std::max(0.f, 1 - f * 2.2f) + w[b] * (.25f + .45f * (1 - f * .5f)) * (.5f + .5f * fabsf(sinf(t * (2.1f + b * .7f) + b * 2.3f))) + .06f);
+                g_lv[b] += (target - g_lv[b]) * (target > g_lv[b] ? .55f : .14f); }
+        }
+        for (auto& x : g_lv) x = 0;
+        CoUninitialize(); return 0;
+    }
+    IMMDeviceEnumerator* en = nullptr; IMMDevice* dev = nullptr; IAudioClient* ac = nullptr; IAudioCaptureClient* cc = nullptr; WAVEFORMATEX* wf = nullptr;
+    bool ok = SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))
+        && SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &dev))
+        && SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&ac))
+        && SUCCEEDED(ac->GetMixFormat(&wf))
+        && SUCCEEDED(ac->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1000000, 0, wf, nullptr))
+        && SUCCEEDED(ac->GetService(__uuidof(IAudioCaptureClient), (void**)&cc))
+        && SUCCEEDED(ac->Start());
+    if (ok) {
+        const int N = 1024;
+        std::vector<float> ring(N, 0.f), re(N), im(N), win(N);
+        for (int i = 0; i < N; i++) win[i] = 0.5f - 0.5f * cosf(6.2831853f * i / (N - 1));
+        const int ch = std::max(1, (int)wf->nChannels), bits = wf->wBitsPerSample, fb = wf->nBlockAlign;
+        const float rate = (float)wf->nSamplesPerSec;
+        int lo[LV_N], hi[LV_N];
+        for (int b = 0; b < LV_N; b++) {   // 40 Hz .. 14 kHz, evenly on a log scale like hearing
+            float f0 = 40.f * powf(350.f, (float)b / LV_N), f1 = 40.f * powf(350.f, (float)(b + 1) / LV_N);
+            lo[b] = std::max(1, (int)(f0 * N / rate)); hi[b] = std::max(lo[b] + 1, (int)(f1 * N / rate));
+        }
+        int wpos = 0; float agc = 0.02f, sm[LV_N] = {};
+        DWORD lastPkt = GetTickCount();
+        while (!g_lvStop) {
+            Sleep(16);
+            UINT32 pk = 0;
+            while (SUCCEEDED(cc->GetNextPacketSize(&pk)) && pk) {
+                BYTE* d = nullptr; UINT32 fr = 0; DWORD fl = 0;
+                if (FAILED(cc->GetBuffer(&d, &fr, &fl, nullptr, nullptr))) break;
+                for (UINT32 i = 0; i < fr; i++) {
+                    float v = 0;
+                    if (!(fl & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                        const BYTE* f = d + (size_t)i * fb;
+                        for (int c = 0; c < ch && c < 2; c++) v += bits == 32 ? ((const float*)f)[c] : ((const short*)f)[c] / 32768.f;
+                    }
+                    ring[wpos] = v; wpos = (wpos + 1) % N;
+                }
+                cc->ReleaseBuffer(fr);
+                lastPkt = GetTickCount();
+            }
+            if (GetTickCount() - lastPkt > 120) { for (auto& x : ring) x = 0; }   // nothing playing: Windows sends no packets at all
+            for (int i = 0; i < N; i++) { re[i] = ring[(wpos + i) % N] * win[i]; im[i] = 0; }
+            Fft(re.data(), im.data(), N);
+            float lv[LV_N], mx = 0;
+            for (int b = 0; b < LV_N; b++) {
+                float s = 0; for (int k = lo[b]; k < hi[b]; k++) s += sqrtf(re[k] * re[k] + im[k] * im[k]);
+                lv[b] = s / (hi[b] - lo[b]) * (1.f + 2.f * b / LV_N);   // a little lift for the treble, which carries less energy
+                mx = std::max(mx, lv[b]);
+            }
+            agc = std::max(mx, std::max(0.02f, agc * 0.996f));   // follows the loudest band, so quiet and loud songs both move
+            for (int b = 0; b < LV_N; b++) {
+                float t = std::min(1.f, lv[b] / agc);
+                sm[b] += (t - sm[b]) * (t > sm[b] ? 0.6f : 0.14f);   // quick up, slow fall
+                g_lv[b] = sm[b];
+            }
+        }
+        ac->Stop();
+    }
+    if (cc) cc->Release(); if (ac) ac->Release(); if (dev) dev->Release(); if (en) en->Release(); if (wf) CoTaskMemFree(wf);
+    for (auto& x : g_lv) x = 0;
+    CoUninitialize();
+    return 0;
+}
+static void LevelsStart() {
+    if (InterlockedIncrement(&g_lvRefs) != 1) return;
+    g_lvStop = 0; g_lvThread = CreateThread(nullptr, 0, LevelProc, nullptr, 0, nullptr);
+}
+static void LevelsStop() {
+    if (InterlockedDecrement(&g_lvRefs) != 0) return;
+    if (g_lvThread) { g_lvStop = 1; WaitForSingleObject(g_lvThread, 1500); CloseHandle(g_lvThread); g_lvThread = nullptr; }
+}
+static float LvBar(int k, int n) {   // n bars from the bands, each blended with its neighbours so the shape reads as one soft wave
+    auto at = [&](int i) { i = std::max(0, std::min(n - 1, i)); int a = i * LV_N / n, b = std::max(a + 1, (i + 1) * LV_N / n); float s = 0; for (int j = a; j < b; j++) s += g_lv[j]; return s / (b - a); };
+    return (at(k - 1) + 2 * at(k) + at(k + 1)) / 4;
+}
+
+// ---------------------------------------------------------------- now playing (Windows' media sessions: the same list its own media controls show)
+// mingw has no header for Windows.Media.Control, so the interfaces are called by their vtable slots (checked against the Windows SDK).
+static const IID IID_GsmtcStatics = {0x2050c4ee, 0x11a0, 0x57de, {0xae, 0xd7, 0xc9, 0x7c, 0x70, 0x33, 0x82, 0x45}};
+static const IID IID_KnobAsyncInfo = {0x00000036, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+struct MSess { std::wstring aumid, app, title, artist; int status = 0; bool canPP = false, canNext = false, canPrev = false, canShuf = false, canRep = false, canSeek = false, shuffle = false; int repeat = 0; INT64 start = 0, pos = 0, end = 0, updated = 0; };
+struct MediaSnap { std::vector<MSess> s; int cur = -1; Gdiplus::Bitmap* cover = nullptr; bool newCover = false; int why = 0; };   // why 2: the next song started on its own
+static MediaSnap g_ms;                  // what the flyouts and the party screen show (UI thread)
+static Gdiplus::Bitmap* g_cover = nullptr;
+static Color g_coverAcc, g_coverC1, g_coverC2; static bool g_coverHas = false;
+static DWORD g_mediaTid = 0; static HANDLE g_mediaThread = nullptr;
+static volatile DWORD g_mediaCmdTick = 0;   // a media key or a flyout button, just now: the song change that follows isn't "Up next"
+static std::wstring g_mediaPick;            // the player you picked in the flyout's list ("" = the one Windows shows)
+static CRITICAL_SECTION g_mcs;
+enum { MC_REFRESH = WM_APP + 1, MC_CMD, MC_QUIT };
+enum { MCMD_PLAYPAUSE, MCMD_NEXT, MCMD_PREV, MCMD_SHUFFLE, MCMD_REPEAT, MCMD_SEEK };
+static void** Vt(void* o) { return *(void***)o; }
+static void Rel(void* o) { if (o) ((IUnknown*)o)->Release(); }
+static HRESULT GetP(void* o, int slot, void** out) { *out = nullptr; return ((HRESULT(STDMETHODCALLTYPE*)(void*, void**))Vt(o)[slot])(o, out); }
+static std::wstring HStr(void* o, int slot) {
+    HSTRING h = nullptr; std::wstring s;
+    if (SUCCEEDED(((HRESULT(STDMETHODCALLTYPE*)(void*, HSTRING*))Vt(o)[slot])(o, &h)) && h) { UINT32 n = 0; const wchar_t* p = WindowsGetStringRawBuffer(h, &n); if (p) s.assign(p, n); WindowsDeleteString(h); }
+    return s;
+}
+static bool GetB(void* o, int slot) { BYTE b = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, BYTE*))Vt(o)[slot])(o, &b); return b != 0; }
+static INT64 GetI64(void* o, int slot) { INT64 v = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, INT64*))Vt(o)[slot])(o, &v); return v; }
+static bool Await(void* op, void** res, DWORD ms = 2500) {   // wait for a WinRT async call (on the media thread only); takes the operation
+    if (!op) return false;
+    void* info = nullptr; bool ok = false;
+    if (SUCCEEDED(((IUnknown*)op)->QueryInterface(IID_KnobAsyncInfo, &info)) && info) {
+        DWORD t0 = GetTickCount(); int st = 0;
+        for (;;) {
+            st = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, int*))Vt(info)[7])(info, &st);
+            if (st != 0 || GetTickCount() - t0 > ms) break;
+            Sleep(3);
+        }
+        if (st == 1) ok = res ? SUCCEEDED(GetP(op, 8, res)) : true;   // Completed: IAsyncOperation<T>::GetResults
+        Rel(info);
+    }
+    Rel(op);
+    return ok;
+}
+struct MDelegate : IUnknown {   // the event handler Windows calls when a song, its state or the list of players changes
+    LONG ref = 1; WPARAM w;   // w 1: the list of players changed
+    explicit MDelegate(WPARAM x) : w(x) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** p) override {
+        static const IID agile = {0x94ea2b94, 0xe9cc, 0x49e0, {0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90}};
+        // a WinRT delegate's own IID is generated from its type (a version-5 UUID); anything else isn't implemented here
+        if (iid == IID_IUnknown || iid == agile || (iid.Data3 & 0xF000) == 0x5000) { *p = this; AddRef(); return S_OK; }
+        *p = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { LONG r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    virtual HRESULT STDMETHODCALLTYPE Invoke(void*, void*) { if (g_mediaTid) PostThreadMessageW(g_mediaTid, MC_REFRESH, w, 0); return S_OK; }
+    virtual ~MDelegate() {}   // after Invoke, so Invoke stays the fourth slot Windows calls
+};
+static std::wstring MediaAppName(const std::wstring& id) {   // "Spotify.exe", "308046B0AF4A39CB" or "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic" -> a name people know
+    static const struct { const wchar_t* k; const wchar_t* n; } known[] = {{L"spotify", L"Spotify"}, {L"msedge", L"Edge"}, {L"chrome", L"Chrome"}, {L"brave", L"Brave"},
+        {L"firefox", L"Firefox"}, {L"308046b0af4a39cb", L"Firefox"}, {L"opera", L"Opera"}, {L"vivaldi", L"Vivaldi"}, {L"zunemusic", L"Media Player"}, {L"zunevideo", L"Films & TV"},
+        {L"vlc", L"VLC"}, {L"applemusic", L"Apple Music"}, {L"itunes", L"iTunes"}, {L"tidal", L"TIDAL"}, {L"deezer", L"Deezer"}, {L"amazon", L"Amazon Music"},
+        {L"foobar", L"foobar2000"}, {L"musicbee", L"MusicBee"}, {L"aimp", L"AIMP"}, {L"discord", L"Discord"}, {L"mpc-", L"MPC"}, {L"potplayer", L"PotPlayer"}};
+    std::wstring l = ToLower(id);
+    for (auto& k : known) if (l.find(k.k) != std::wstring::npos) return k.n;
+    std::wstring s = id;
+    size_t b = s.find_last_of(L"\\!"); if (b != std::wstring::npos) s = s.substr(b + 1);
+    if (s.size() > 4 && ToLower(s.substr(s.size() - 4)) == L".exe") s.resize(s.size() - 4);
+    size_t d = s.find_last_of(L'.'); if (d != std::wstring::npos && d + 1 < s.size()) s = s.substr(d + 1);
+    if (!s.empty()) s[0] = towupper(s[0]);
+    return s.empty() ? std::wstring(L"Player") : s;
+}
+static void ReadSess(void* s, MSess& m) {
+    m.aumid = HStr(s, 6); m.app = MediaAppName(m.aumid);
+    void* pi = nullptr;
+    if (SUCCEEDED(GetP(s, 9, &pi)) && pi) {   // GetPlaybackInfo
+        int st = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, int*))Vt(pi)[7])(pi, &st); m.status = st;   // 4 playing, 5 paused
+        void* c = nullptr;
+        if (SUCCEEDED(GetP(pi, 6, &c)) && c) { m.canNext = GetB(c, 12); m.canPrev = GetB(c, 13); m.canPP = GetB(c, 16) || GetB(c, 6) || GetB(c, 7); m.canShuf = GetB(c, 17); m.canRep = GetB(c, 18); m.canSeek = GetB(c, 20); Rel(c); }
+        void* r = nullptr;
+        if (SUCCEEDED(GetP(pi, 9, &r)) && r) { int v = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, int*))Vt(r)[6])(r, &v); m.repeat = v == 2 ? 1 : v == 1 ? 2 : 0; Rel(r); }   // list = all, track = one
+        if (SUCCEEDED(GetP(pi, 11, &r)) && r) { BYTE b = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, BYTE*))Vt(r)[6])(r, &b); m.shuffle = b != 0; Rel(r); }
+        Rel(pi);
+    }
+    void* tl = nullptr;
+    if (SUCCEEDED(GetP(s, 8, &tl)) && tl) { INT64 st = GetI64(tl, 6); m.start = st; m.end = std::max<INT64>(0, GetI64(tl, 7) - st); m.pos = std::max<INT64>(0, GetI64(tl, 10) - st); m.updated = GetI64(tl, 11); Rel(tl); }
+    void* op = nullptr, *mp = nullptr;
+    if (SUCCEEDED(GetP(s, 7, &op)) && Await(op, &mp) && mp) {   // TryGetMediaPropertiesAsync
+        m.title = HStr(mp, 6); m.artist = HStr(mp, 9); if (m.artist.empty()) m.artist = HStr(mp, 8);
+        Rel(mp);
+    }
+}
+static Gdiplus::Bitmap* ReadCover(void* s) {   // the cover, squared and kept small (128 px): it's only ever shown small or blurred
+    Gdiplus::Bitmap* out = nullptr;
+    void* op = nullptr, *mp = nullptr, *ref = nullptr;
+    if (FAILED(GetP(s, 7, &op)) || !Await(op, &mp) || !mp) return nullptr;
+    if (SUCCEEDED(GetP(mp, 15, &ref)) && ref) {   // Thumbnail -> OpenReadAsync -> a stream GDI+ can read
+        void* op2 = nullptr, *ras = nullptr;
+        if (SUCCEEDED(GetP(ref, 6, &op2)) && Await(op2, &ras) && ras) {
+            IStream* st = nullptr;
+            if (SUCCEEDED(CreateStreamOverRandomAccessStream((IUnknown*)ras, IID_IStream, (void**)&st)) && st) {
+                Gdiplus::Bitmap* b = Gdiplus::Bitmap::FromStream(st);
+                if (b && b->GetLastStatus() == Ok && b->GetWidth() > 0 && b->GetHeight() > 0) {
+                    UINT w = b->GetWidth(), h = b->GetHeight(), sq = std::min(w, h);
+                    out = new Gdiplus::Bitmap(128, 128, PixelFormat32bppPARGB);
+                    Graphics g(out); g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+                    g.DrawImage(b, Rect(0, 0, 128, 128), (INT)(w - sq) / 2, (INT)(h - sq) / 2, (INT)sq, (INT)sq, UnitPixel);
+                }
+                delete b; st->Release();
+            }
+            Rel(ras);
+        }
+        Rel(ref);
+    }
+    Rel(mp);
+    return out;
+}
+static DWORD WINAPI MediaProc(LPVOID) {
+    RoInitialize(RO_INIT_MULTITHREADED);
+    MSG msg; PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // a queue for the events and the buttons
+    void* mgr = nullptr, *statics = nullptr; HSTRING cls = nullptr;
+    const wchar_t* cn = L"Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager";
+    WindowsCreateString(cn, (UINT32)wcslen(cn), &cls);
+    if (cls && SUCCEEDED(RoGetActivationFactory(cls, IID_GsmtcStatics, &statics)) && statics) { void* op = nullptr; if (SUCCEEDED(GetP(statics, 6, &op))) Await(op, &mgr, 5000); Rel(statics); }
+    if (cls) WindowsDeleteString(cls);
+    if (!mgr) { RoUninitialize(); return 0; }   // no media service (Windows 10 before 1809)
+    typedef HRESULT (STDMETHODCALLTYPE* PFN_ADD)(void*, void*, INT64*);
+    typedef HRESULT (STDMETHODCALLTYPE* PFN_REM)(void*, INT64);
+    MDelegate* del = new MDelegate(0), *delList = new MDelegate(1);
+    INT64 tCur = 0, tList = 0;
+    ((PFN_ADD)Vt(mgr)[8])(mgr, delList, &tCur);    // CurrentSessionChanged
+    ((PFN_ADD)Vt(mgr)[10])(mgr, delList, &tList);  // SessionsChanged
+    struct Sub { void* s; INT64 t1, t2; };
+    std::vector<Sub> subs;
+    int shown = -1;
+    std::wstring coverKey, lastTitle, lastId;
+    auto resub = [&]() {   // every player, so the list in the flyout and Up next stay right
+        for (auto& x : subs) { ((PFN_REM)Vt(x.s)[28])(x.s, x.t1); ((PFN_REM)Vt(x.s)[30])(x.s, x.t2); Rel(x.s); }
+        subs.clear(); shown = -1;
+        void* list = nullptr;
+        if (SUCCEEDED(GetP(mgr, 7, &list)) && list) {
+            UINT32 n = 0; ((HRESULT(STDMETHODCALLTYPE*)(void*, UINT32*))Vt(list)[7])(list, &n);
+            for (UINT32 i = 0; i < n && i < 12; i++) {
+                void* s = nullptr;
+                if (FAILED(((HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, void**))Vt(list)[6])(list, i, &s)) || !s) continue;
+                Sub x{s, 0, 0};
+                ((PFN_ADD)Vt(s)[27])(s, del, &x.t1);   // PlaybackInfoChanged
+                ((PFN_ADD)Vt(s)[29])(s, del, &x.t2);   // MediaPropertiesChanged
+                subs.push_back(x);
+            }
+            Rel(list);
+        }
+    };
+    auto send = [&]() {
+        MediaSnap* m = new MediaSnap;
+        void* cur = nullptr; std::wstring curId;
+        if (SUCCEEDED(GetP(mgr, 6, &cur)) && cur) { curId = HStr(cur, 6); Rel(cur); }
+        EnterCriticalSection(&g_mcs); std::wstring pick = g_mediaPick; LeaveCriticalSection(&g_mcs);
+        for (auto& x : subs) { MSess s; ReadSess(x.s, s); m->s.push_back(s); }
+        for (int i = 0; i < (int)m->s.size() && m->cur < 0; i++) if (!pick.empty() && m->s[i].aumid == pick) m->cur = i;   // the one you picked
+        for (int i = 0; i < (int)m->s.size() && m->cur < 0; i++) if (m->s[i].aumid == curId) m->cur = i;                   // else the one Windows shows
+        for (int i = 0; i < (int)m->s.size() && m->cur < 0; i++) if (m->s[i].status == 4) m->cur = i;
+        if (m->cur < 0 && !m->s.empty()) m->cur = 0;
+        shown = m->cur;
+        if (m->cur >= 0) {
+            MSess& c = m->s[m->cur];
+            std::wstring key = c.aumid + L"|" + c.title + L"|" + c.artist;
+            if (key != coverKey && !c.title.empty()) {
+                m->cover = ReadCover(subs[m->cur].s); m->newCover = true;
+                if (m->cover) coverKey = key;   // no cover yet (it often arrives a moment after the title): try again next time
+            }
+            if (!c.title.empty()) {
+                bool newSong = c.aumid == lastId && !lastTitle.empty() && c.title != lastTitle;
+                if (newSong && c.status == 4 && GetTickCount() - g_mediaCmdTick > 3000) m->why = 2;
+                lastId = c.aumid; lastTitle = c.title;
+            }
+        } else if (!coverKey.empty()) { coverKey.clear(); m->newCover = true; }
+        if (!PostMessageW(g_hwnd, WM_APP_MEDIA, 0, (LPARAM)m)) { delete m->cover; delete m; }
+    };
+    resub(); send();
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == MC_QUIT) break;
+        if (msg.message == MC_REFRESH) {   // events come in bursts: gather them, then read once
+            Sleep(60);
+            MSG m2; bool resubNeeded = msg.wParam == 1;
+            while (PeekMessageW(&m2, nullptr, MC_REFRESH, MC_REFRESH, PM_REMOVE)) if (m2.wParam == 1) resubNeeded = true;
+            UINT32 n = 0; void* list = nullptr;
+            if (SUCCEEDED(GetP(mgr, 7, &list)) && list) { ((HRESULT(STDMETHODCALLTYPE*)(void*, UINT32*))Vt(list)[7])(list, &n); Rel(list); }
+            if (resubNeeded || n != subs.size()) resub();   // a player opened or closed
+            send();
+        } else if (msg.message == MC_CMD && shown >= 0 && shown < (int)subs.size()) {
+            void* s = subs[shown].s, *op = nullptr;
+            switch ((int)msg.wParam) {
+            case MCMD_PLAYPAUSE: GetP(s, 20, &op); break;
+            case MCMD_NEXT: GetP(s, 16, &op); break;
+            case MCMD_PREV: GetP(s, 17, &op); break;
+            case MCMD_SHUFFLE: ((HRESULT(STDMETHODCALLTYPE*)(void*, BYTE, void**))Vt(s)[23])(s, (BYTE)(msg.lParam != 0), &op); break;
+            case MCMD_REPEAT: ((HRESULT(STDMETHODCALLTYPE*)(void*, int, void**))Vt(s)[21])(s, (int)msg.lParam, &op); break;
+            case MCMD_SEEK: ((HRESULT(STDMETHODCALLTYPE*)(void*, INT64, void**))Vt(s)[24])(s, (INT64)msg.lParam, &op); break;
+            }
+            if (op) Await(op, nullptr, 1500);
+            Sleep(120);   // the player needs a moment before it reports the new state
+            send();
+        }
+    }
+    for (auto& x : subs) { ((PFN_REM)Vt(x.s)[28])(x.s, x.t1); ((PFN_REM)Vt(x.s)[30])(x.s, x.t2); Rel(x.s); }
+    ((PFN_REM)Vt(mgr)[9])(mgr, tCur); ((PFN_REM)Vt(mgr)[11])(mgr, tList);
+    Rel(mgr); del->Release(); delList->Release();
+    RoUninitialize();
+    return 0;
+}
+static void MediaStart() {   // started the first time something needs it; idle (no polling) until Windows reports a change
+    if (g_mediaThread || g_demo) return;
+    g_mediaThread = CreateThread(nullptr, 0, MediaProc, nullptr, 0, &g_mediaTid);
+}
+static void MediaCmd(int c, LPARAM v = 0) { g_mediaCmdTick = GetTickCount(); if (g_mediaTid) PostThreadMessageW(g_mediaTid, MC_CMD, c, v); }
+static void MediaRefresh() { if (g_mediaTid) PostThreadMessageW(g_mediaTid, MC_REFRESH, 0, 0); }
+static MSess* MediaCur() { return g_ms.cur >= 0 && g_ms.cur < (int)g_ms.s.size() ? &g_ms.s[g_ms.cur] : nullptr; }
+static INT64 MediaPos(const MSess& m) {   // where the song is now: the last reported position plus the time since, while it plays
+    INT64 p = m.pos;
+    if (m.status == 4 && m.updated > 0) { FILETIME ft; GetSystemTimeAsFileTime(&ft); INT64 now = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime; p += std::max<INT64>(0, now - m.updated); }
+    return m.end > 0 ? std::min(p, m.end) : p;
+}
+static void RgbToHsl(float r, float g, float b, float& h, float& s, float& l) {
+    float mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b)), d = mx - mn;
+    l = (mx + mn) / 2; s = d < 1e-4f ? 0 : d / (1 - fabsf(2 * l - 1)); h = 0;
+    if (d >= 1e-4f) { if (mx == r) h = 60 * fmodf((g - b) / d, 6); else if (mx == g) h = 60 * ((b - r) / d + 2); else h = 60 * ((r - g) / d + 4); if (h < 0) h += 360; }
+}
+static void CoverColours() {   // the cover's colours: an accent for buttons and the bar, and two tints for the glow
+    g_coverHas = false;
+    if (!g_cover) return;
+    BitmapData bd; Rect rc(0, 0, (INT)g_cover->GetWidth(), (INT)g_cover->GetHeight());
+    if (g_cover->LockBits(&rc, ImageLockModeRead, PixelFormat32bppARGB, &bd) != Ok) return;
+    double acc[3][4] = {};   // whole, left half, right half: weighted r g b and weight
+    for (int y = 0; y < rc.Height; y += 2) {
+        const BYTE* row = (const BYTE*)bd.Scan0 + y * bd.Stride;
+        for (int x = 0; x < rc.Width; x += 2) {
+            float b = row[x * 4] / 255.f, g = row[x * 4 + 1] / 255.f, r = row[x * 4 + 2] / 255.f, h, s, l;
+            RgbToHsl(r, g, b, h, s, l);
+            float w = 0.05f + s * (1 - fabsf(2 * l - 1));   // colourful pixels count more than grey, black or white
+            for (int k : {0, x < rc.Width / 2 ? 1 : 2}) { acc[k][0] += r * w; acc[k][1] += g * w; acc[k][2] += b * w; acc[k][3] += w; }
+        }
+    }
+    g_cover->UnlockBits(&bd);
+    auto pick = [&](int k, float lMin, float lMax, float sMin) {
+        float r = (float)(acc[k][0] / acc[k][3]), g = (float)(acc[k][1] / acc[k][3]), b = (float)(acc[k][2] / acc[k][3]), h, s, l;
+        RgbToHsl(r, g, b, h, s, l);
+        return Hsl(h, std::max(s, sMin), std::max(lMin, std::min(lMax, l)));
+    };
+    g_coverAcc = T.dark ? pick(0, 0.52f, 0.66f, 0.45f) : pick(0, 0.38f, 0.48f, 0.45f);
+    g_coverC1 = pick(1, 0.35f, 0.6f, 0.3f); g_coverC2 = pick(2, 0.35f, 0.6f, 0.3f);
+    g_coverHas = true;
+}
+
+// ---------------------------------------------------------------- flyouts: media, Up next, lock keys (Settings › Flyouts)
+// Small windows that appear by themselves near the edge of a screen, never take focus, and stay hidden while
+// something runs full screen. Same surface as the panel (Solid or Glass); buttons take the cover's colour.
+enum { POP_MEDIA, POP_NEXT, POP_LOCK };
+static HWND g_pop = nullptr;
+static int g_popKind = -1, g_popW = 0, g_popH = 0, g_popDir = 0;   // g_popDir 1 arriving, -1 leaving, 0 resting
+static DWORD g_popT0 = 0, g_popHideAt = 0;
+static POINT g_popAt;                    // where it rests
+static int g_popSlide = 0;               // pixels it travels while arriving / leaving (signed)
+static bool g_popShown = false, g_popHover = false, g_popGlass = false, g_popList = false, g_popLv = false;
+static int g_popHot = -1, g_popDrag = -1; static float g_popSeek = 0;   // g_popDrag 7: dragging the progress bar
+static int g_popLockKey = 0; static bool g_popLockOn = false; static DWORD g_popLockT0 = 0;
+static bool g_insertOn = false;          // Insert / overwrite: no light for it, so Knob keeps count
+static Canvas g_cvPop;
+static Gdiplus::Bitmap* g_glowFull = nullptr, *g_glowRise = nullptr;   // the cover, very blurred (and faded upwards), built once per cover
+static std::vector<std::pair<int, RectF>> g_popHits;
+static bool g_popTry = false;            // Settings › Flyouts › Try: shows even when nothing is playing
+static MSess g_popNone;                  // what Try shows then
+static const wchar_t* LOCK_TXT[4][3] = {{L"Caps Lock", L"Caps Lock is on", L"Caps Lock is off"}, {L"Num Lock", L"Num Lock is on", L"Num Lock is off"},
+                                       {L"Scroll Lock", L"Scroll Lock is on", L"Scroll Lock is off"}, {L"Insert", L"Overwrite mode", L"Insert mode"}};
+static int PopDur() { return std::max(0, std::min(2000, g_fAnimMs)); }
+static Color PopAcc() { return g_fCover && g_coverHas ? g_coverAcc : T.accent; }
+static bool PopAnimatedGlow() { return g_popKind == POP_MEDIA && (g_fGlow == 3 || g_fGlow == 4 || g_fGlow == 5); }
+static void BoxBlur(std::vector<UINT32>& px, int w, int h, int r, int passes) {   // premultiplied ARGB, separable box blur (a few passes look Gaussian)
+    if (r < 1 || w < 2 || h < 2) return;
+    std::vector<UINT32> tmp(px.size());
+    auto pass = [&](const UINT32* src, UINT32* dst, int n, int stride, int count, int lineStride) {
+        for (int line = 0; line < count; line++) {
+            const UINT32* s = src + line * lineStride; UINT32* d = dst + line * lineStride;
+            int acc[4] = {}, div = 2 * r + 1;
+            auto add = [&](int i, int sign) { i = std::max(0, std::min(n - 1, i)); UINT32 c = s[i * stride]; for (int k = 0; k < 4; k++) acc[k] += sign * (int)((c >> (k * 8)) & 255); };
+            for (int i = -r; i <= r; i++) add(i, 1);
+            for (int i = 0; i < n; i++) {
+                d[i * stride] = (UINT32)(acc[0] / div) | ((UINT32)(acc[1] / div) << 8) | ((UINT32)(acc[2] / div) << 16) | ((UINT32)(acc[3] / div) << 24);
+                add(i + r + 1, 1); add(i - r, -1);
+            }
+        }
+    };
+    for (int p = 0; p < passes; p++) { pass(px.data(), tmp.data(), w, 1, h, w); pass(tmp.data(), px.data(), h, w, w, 1); }
+}
+static Gdiplus::Bitmap* BitmapFrom(const std::vector<UINT32>& px, int w, int h) {
+    Gdiplus::Bitmap* b = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB);
+    BitmapData bd; Rect rc(0, 0, w, h);
+    if (b->LockBits(&rc, ImageLockModeWrite, PixelFormat32bppPARGB, &bd) == Ok) {
+        for (int y = 0; y < h; y++) memcpy((BYTE*)bd.Scan0 + y * bd.Stride, px.data() + y * w, w * 4);
+        b->UnlockBits(&bd);
+    }
+    return b;
+}
+static void BuildGlows() {   // cover -> 8 px -> 64 px, blurred: a soft wash of its colours (cheap to draw at any size)
+    delete g_glowFull; delete g_glowRise; g_glowFull = g_glowRise = nullptr;
+    const int W = 64, H = 64;
+    std::vector<UINT32> px(W * H);
+    {
+        Gdiplus::Bitmap small(8, 8, PixelFormat32bppPARGB);
+        { Graphics g(&small); g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+          if (g_cover) g.DrawImage(g_cover, Rect(0, 0, 8, 8));
+          else { Color a = PopAcc(); LinearGradientBrush lb(PointF(0, 0), PointF(8, 8), a, Color(255, a.GetB(), a.GetR(), a.GetG())); g.FillRectangle(&lb, 0, 0, 8, 8); } }
+        Gdiplus::Bitmap big(W, H, PixelFormat32bppPARGB);
+        { Graphics g(&big); g.SetInterpolationMode(InterpolationModeBilinear); g.SetPixelOffsetMode(PixelOffsetModeHalf);
+          ImageAttributes ia; ia.SetWrapMode(WrapModeTileFlipXY); g.DrawImage(&small, Rect(0, 0, W, H), 0, 0, 8, 8, UnitPixel, &ia); }
+        BitmapData bd; Rect rc(0, 0, W, H);
+        if (big.LockBits(&rc, ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Ok) { for (int y = 0; y < H; y++) memcpy(px.data() + y * W, (BYTE*)bd.Scan0 + y * bd.Stride, W * 4); big.UnlockBits(&bd); }
+    }
+    BoxBlur(px, W, H, 4, 2);
+    for (auto& c : px) {   // a little more colour, like the design's saturate()
+        int b = c & 255, g = (c >> 8) & 255, r = (c >> 16) & 255, l = (r * 3 + g * 6 + b) / 10;
+        auto k = [&](int v) { return std::max(0, std::min(255, l + (v - l) * 13 / 10)); };
+        c = 0xFF000000u | (k(r) << 16) | (k(g) << 8) | k(b);
+    }
+    g_glowFull = BitmapFrom(px, W, H);
+    for (int y = 0; y < H; y++) {   // rising: strong at the bottom, gone by 85% of the way up
+        float up = 1 - y / (float)(H - 1), m = up <= .2f ? 1.f : up >= .85f ? 0.f : 1 - (up - .2f) / .65f;
+        for (int x = 0; x < W; x++) { UINT32 c = px[y * W + x]; UINT32 o = 0; for (int k = 0; k < 4; k++) o |= (UINT32)(((c >> (k * 8)) & 255) * m) << (k * 8); px[y * W + x] = o; }
+    }
+    g_glowRise = BitmapFrom(px, W, H);
+}
+static void DrawFaded(Graphics& g, Gdiplus::Bitmap* b, RectF r, float alpha) {
+    if (!b || alpha <= 0) return;
+    ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, alpha, 0}, {0, 0, 0, 0, 1}}};
+    ImageAttributes ia; ia.SetColorMatrix(&cm); ia.SetWrapMode(WrapModeTileFlipXY);
+    g.SetInterpolationMode(InterpolationModeBilinear);
+    g.DrawImage(b, r, 0, 0, (REAL)b->GetWidth(), (REAL)b->GetHeight(), UnitPixel, &ia);
+}
+static std::wstring Mmss(INT64 t100ns) { int s = (int)(t100ns / 10000000); wchar_t b[16]; swprintf(b, 16, L"%d:%02d", s / 60, s % 60); return b; }
+static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind the media flyout
+    bool lt = !T.dark; Color a = PopAcc();
+    float t = GetTickCount() / 1000.f;
+    switch (g_fGlow) {
+    case 1: DrawFaded(g, g_glowRise, RectF(-0.2f * W, 0.3f * H, 1.4f * W, 1.1f * H), lt ? .3f : .42f); break;   // rising glow
+    case 2: DrawFaded(g, g_glowFull, RectF(-0.15f * W, -0.3f * H, 1.3f * W, 1.6f * H), lt ? .38f : .55f); break;   // blurred cover
+    case 3: {   // aurora: two soft bands of the cover's colours drifting slowly
+        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.5f * H), .18f);
+        auto blob = [&](float cx, float cy, float rw, float rh, float rot, Color c, float al) {
+            GraphicsPath p; p.AddEllipse(-rw / 2, -rh / 2, rw, rh);
+            PathGradientBrush pb(&p); Color mid((BYTE)(al * 255), c.GetR(), c.GetG(), c.GetB()), edge(0, c.GetR(), c.GetG(), c.GetB());
+            pb.SetCenterColor(mid); int n = 1; pb.SetSurroundColors(&edge, &n);
+            Matrix m; m.Translate(cx, cy); m.Rotate(rot); GraphicsState st = g.Save(); g.MultiplyTransform(&m); g.FillPath(&pb, &p); g.Restore(st);
+        };
+        auto ease = [](float x) { return 0.5f - 0.5f * cosf(x * 3.14159265f); };
+        float p1 = ease(fmodf(t / 7, 2) < 1 ? fmodf(t / 7, 1) : 1 - fmodf(t / 7, 1)), p2 = ease(fmodf(t / 9, 2) < 1 ? fmodf(t / 9, 1) : 1 - fmodf(t / 9, 1));
+        Color c2 = g_coverHas ? g_coverC2 : a; float h2, s2, l2; RgbToHsl(c2.GetR() / 255.f, c2.GetG() / 255.f, c2.GetB() / 255.f, h2, s2, l2);
+        blob(W * (0.15f + 0.45f * 0.7f * p1), H * (0.5f + 0.1f - 0.18f * p1), 0.9f * W, 1.3f * H, -12 + 30 * p1, g_coverHas ? g_coverC1 : a, lt ? .3f : .45f);
+        blob(W * (0.85f - 0.5f * 0.7f * p2), H * (0.5f - 0.06f + 0.18f * p2), 0.9f * W, 1.3f * H, 10 - 26 * p2, Hsl(h2 + 35, std::max(s2, .4f), l2), lt ? .3f : .45f);
+        break;
+    }
+    case 4: {   // edge light: a line in the cover's colour travelling round the edge, with a soft glow around it
+        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.4f * H), .14f);
+        float head = fmodf(t / 3.2f, 1.f) * 360.f, rad = S(8), cx = W / 2, cy = H / 2;
+        std::vector<PointF> pts;   // the rounded edge, one point every few pixels
+        auto arc = [&](float ax, float ay, float a0) { for (int i = 0; i <= 6; i++) { float an = (a0 + i * 15) * 3.14159265f / 180; pts.push_back(PointF(ax + rad * cosf(an), ay + rad * sinf(an))); } };
+        float in = S(1);
+        auto line = [&](PointF p0, PointF p1) { int n = std::max(2, (int)(hypotf(p1.X - p0.X, p1.Y - p0.Y) / S(4))); for (int i = 0; i < n; i++) pts.push_back(PointF(p0.X + (p1.X - p0.X) * i / n, p0.Y + (p1.Y - p0.Y) * i / n)); };
+        line(PointF(in + rad, in), PointF(W - in - rad, in)); arc(W - in - rad, in + rad, 270);
+        line(PointF(W - in, in + rad), PointF(W - in, H - in - rad)); arc(W - in - rad, H - in - rad, 0);
+        line(PointF(W - in - rad, H - in), PointF(in + rad, H - in)); arc(in + rad, H - in - rad, 90);
+        line(PointF(in, H - in - rad), PointF(in, in + rad)); arc(in + rad, in + rad, 180);
+        auto f = [](float u) { return u < .45f ? 0.f : u < .68f ? (u - .45f) / .23f * .55f : u < .8f ? .55f + (u - .68f) / .12f * .45f : u < .9f ? 1 - (u - .8f) / .1f * .45f : .55f * (1 - (u - .9f) / .1f); };
+        for (int pass = 0; pass < 4; pass++) {   // three wide faint strokes for the glow, then the line
+            static const float wd[4] = {12, 8, 5, 2}, al[4] = {.12f, .16f, .22f, .55f};
+            for (size_t i = 0; i + 1 < pts.size() + 1; i++) {
+                PointF p0 = pts[i], p1 = pts[(i + 1) % pts.size()];
+                float ang = atan2f((p0.X + p1.X) / 2 - cx, -((p0.Y + p1.Y) / 2 - cy)) * 180 / 3.14159265f; if (ang < 0) ang += 360;
+                float u = fmodf(ang - head + 720.f, 360.f) / 360.f, k = f(u) * al[pass];
+                if (k < 0.01f) continue;
+                Pen pen(Color((BYTE)(k * 255), a.GetR(), a.GetG(), a.GetB()), S(wd[pass])); pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound);
+                g.DrawLine(&pen, p0, p1);
+            }
+        }
+        break;
+    }
+    case 5: {   // pulse with the music: 22 blurred bars rising from the bottom edge (zero = the edge)
+        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.4f * H), .1f);
+        const int n = 22, bw = 88, bh = 40; std::vector<UINT32> px(bw * bh, 0);
+        for (int k = 0; k < n; k++) {
+            float v = LvBar(k, n) * 0.72f; int top = bh - (int)(v * bh), x0 = k * bw / n, x1 = (k + 1) * bw / n - 1;
+            for (int y = std::max(0, top); y < bh; y++) {
+                float fy = (bh - y) / (float)std::max(1, bh - top), m = 1 - 0.6f * fy;   // full at the bottom, 40% at the top of the bar
+                UINT32 c = ((UINT32)(255 * m) << 24) | ((UINT32)(a.GetR() * m) << 16) | ((UINT32)(a.GetG() * m) << 8) | (UINT32)(a.GetB() * m);
+                for (int x = x0; x < x1; x++) px[y * bw + x] = c;
+            }
+        }
+        BoxBlur(px, bw, bh, 2, 2);
+        Gdiplus::Bitmap* b = BitmapFrom(px, bw, bh);
+        DrawFaded(g, b, RectF(0.02f * W, 0, 0.96f * W, H), lt ? .5f : .6f);
+        delete b;
+        break;
+    }
+    }
+}
+static void PopIconBtn(Graphics& g, int id, RectF r, const char* icon, Color c, bool enabled, float size = 15) {
+    if (enabled) g_popHits.push_back({id, r});
+    if (enabled && g_popHot == id) FillRound(g, T.subtle2, r, S(6));
+    Icon(g, icon, S(size), enabled ? c : WithAlpha(c, 77), r.X + r.Width / 2, r.Y + r.Height / 2);
+}
+static void PaintPop(HDC hdc) {
+    int w = g_popW, h = g_popH;
+    if (w <= 0 || h <= 0) return;
+    void* bits = nullptr;
+    HBITMAP dib = CanvasFor(g_cvPop, hdc, w, h, &bits);
+    if (!dib) return;
+    HDC mdc = CreateCompatibleDC(hdc); HGDIOBJ old = SelectObject(mdc, dib);
+    g_popHits.clear();
+    {
+        Gdiplus::Bitmap canvas(w, h, w * 4, PixelFormat32bppPARGB, (BYTE*)bits);
+        Graphics g(&canvas);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(g_popGlass ? TextRenderingHintAntiAliasGridFit : TextRenderingHintClearTypeGridFit);
+        g.SetPixelOffsetMode(PixelOffsetModeHalf);
+        g.SetCompositingMode(CompositingModeSourceCopy);
+        { Color sf = g_popGlass ? T.surface : (T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243)); SolidBrush b(sf); g.FillRectangle(&b, 0, 0, w, h); }
+        g.SetCompositingMode(CompositingModeSourceOver);
+        float W = (float)w, H = (float)h;
+        Color acc = PopAcc();
+        Font fT(g_famSemi, S(13.5f), FontStyleRegular, UnitPixel), fA(g_famText, S(12), FontStyleRegular, UnitPixel), fTime(g_famText, S(10.5f), FontStyleRegular, UnitPixel);
+        Font fLbl(g_famSemi, S(11.5f), FontStyleRegular, UnitPixel), fLock(g_famSemi, S(13.5f), FontStyleBold, UnitPixel), fChip(g_famText, S(11), FontStyleRegular, UnitPixel);
+        MSess* m = MediaCur();
+        if (!m && g_popTry) { g_popNone = MSess(); g_popNone.title = L"Nothing is playing"; g_popNone.artist = L"Play something and it shows up here"; g_popNone.app = L"Knob"; m = &g_popNone; }
+        auto cover = [&](RectF r, float rad, bool shadow) {
+            if (shadow) { FillRound(g, Color(40, 0, 0, 0), RectF(r.X, r.Y + S(3), r.Width, r.Height + S(1)), rad + S(1)); FillRound(g, Color(30, 0, 0, 0), RectF(r.X - S(1), r.Y + S(2), r.Width + S(2), r.Height + S(4)), rad + S(2)); }
+            GraphicsPath p; AddRound(p, r, rad);
+            if (g_cover) { GraphicsState st = g.Save(); g.SetClip(&p); g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(g_cover, r); g.Restore(st); }
+            else { LinearGradientBrush lb(PointF(r.X, r.Y), PointF(r.X + r.Width, r.Y + r.Height), acc, WithAlpha(acc, 140)); g.FillPath(&lb, &p); Icon(g, "mPlay", r.Width * .4f, Color(230, 255, 255, 255), r.X + r.Width / 2, r.Y + r.Height / 2); }
+            Pen edge(Color(20, 255, 255, 255), S(1)); g.DrawPath(&edge, &p);
+        };
+        auto textCol = [&](const std::wstring& t, const std::wstring& a, RectF r, bool centre) {
+            StringFormat sf; sf.SetAlignment(centre ? StringAlignmentCenter : StringAlignmentNear); sf.SetTrimming(StringTrimmingEllipsisCharacter); sf.SetFormatFlags(StringFormatFlagsNoWrap);
+            SolidBrush b1(T.t1), b2(T.t2);
+            g.DrawString(t.c_str(), -1, &fT, RectF(r.X, r.Y, r.Width, S(19)), &sf, &b1);
+            g.DrawString(a.c_str(), -1, &fA, RectF(r.X, r.Y + S(20), r.Width, S(17)), &sf, &b2);
+        };
+        if (g_popKind == POP_MEDIA && m) {
+            bool compact = g_fLayout == 1;
+            INT64 pos = g_popDrag == 7 ? (INT64)(g_popSeek * m->end) : MediaPos(*m);
+            float frac = m->end > 0 ? std::max(0.f, std::min(1.f, (float)pos / m->end)) : 0.f;
+            if (g_fGlow) PopGlow(g, W, H);
+            auto bar = [&](RectF tr) {   // the track, the part played, and the knob when the mouse is on it
+                g_popHits.push_back({7, RectF(tr.X - S(4), tr.Y - S(6), tr.Width + S(8), tr.Height + S(12))});
+                FillRound(g, T.track, tr, tr.Height / 2);
+                if (frac > 0) FillRound(g, acc, RectF(tr.X, tr.Y, std::max(tr.Height, tr.Width * frac), tr.Height), tr.Height / 2);
+                if (g_popHot == 7 || g_popDrag == 7) { float kx = tr.X + tr.Width * frac, cy = tr.Y + tr.Height / 2; SolidBrush sh(Color(70, 0, 0, 0)); g.FillEllipse(&sh, kx - S(6), cy - S(5), S(12), S(12)); SolidBrush wb(Color(255, 255, 255, 255)); g.FillEllipse(&wb, kx - S(6), cy - S(6), S(12), S(12)); }
+            };
+            bool playing = m->status == 4;
+            if (!compact) {
+                cover(RectF(S(14), S(18), S(58), S(58)), S(10), true);
+                textCol(m->title, m->artist, RectF(S(84), S(36), W - S(84) - S(14), S(40)), g_fCentre);
+                float cy = S(103), x = (W - S(198)) / 2;
+                PopIconBtn(g, 1, RectF(x, cy - S(16), S(32), S(32)), "mShuf", m->shuffle && m->canShuf ? acc : T.t2, m->canShuf);
+                if (m->shuffle && m->canShuf) { SolidBrush d(acc); g.FillEllipse(&d, x + S(14), cy + S(12), S(4), S(4)); }
+                x += S(38); PopIconBtn(g, 2, RectF(x, cy - S(16), S(32), S(32)), "mPrev", T.t2, m->canPrev);
+                x += S(38);
+                { RectF pr(x + S(4), cy - S(19), S(38), S(38)); g_popHits.push_back({3, pr}); SolidBrush pb(g_popHot == 3 ? Color(255, std::min(255, acc.GetR() + 20), std::min(255, acc.GetG() + 20), std::min(255, acc.GetB() + 20)) : acc); g.FillEllipse(&pb, pr);
+                  Icon(g, playing ? "mPause" : "mPlay", S(16), Color(255, 255, 255, 255), pr.X + pr.Width / 2 + (playing ? 0 : S(1)), pr.Y + pr.Height / 2); }
+                x += S(52); PopIconBtn(g, 4, RectF(x, cy - S(16), S(32), S(32)), "mNext", T.t2, m->canNext);
+                x += S(38); PopIconBtn(g, 5, RectF(x, cy - S(16), S(32), S(32)), "mRep", m->repeat && m->canRep ? acc : T.t2, m->canRep);
+                if (m->repeat && m->canRep) { SolidBrush d(acc); g.FillEllipse(&d, x + S(14), cy + S(12), S(4), S(4)); if (m->repeat == 2) Text(g, L"1", &fChip, acc, RectF(x + S(20), cy - S(16), S(10), S(12))); }
+                if (g_fPlayer) {   // which player; a list to switch when there's more than one
+                    bool many = g_ms.s.size() > 1;
+                    float tw2 = std::min(S(60), TextW(g, m->app.c_str(), &fChip)), cw = S(4) + S(13) + S(5) + tw2 + (many ? S(16) : 0) + S(7);
+                    RectF chip(W - S(14) - cw, cy - S(10), cw, S(20));
+                    if (many) g_popHits.push_back({6, chip});
+                    FillRound(g, g_popList || (many && g_popHot == 6) ? T.subtle3 : T.subtle2, chip, S(10));
+                    static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
+                    unsigned hsh = 0; for (wchar_t ch : m->app) hsh = hsh * 31 + ch;
+                    RectF ic(chip.X + S(4), chip.Y + S(3.5f), S(13), S(13)); FillRound(g, Hex(tint[hsh % 6]), ic, S(3));
+                    Font fI(g_famSemi, S(8), FontStyleBold, UnitPixel); Text(g, m->app.substr(0, 1).c_str(), &fI, Color(255, 255, 255, 255), ic, StringAlignmentCenter);
+                    Text(g, m->app.c_str(), &fChip, g_popList || g_popHot == 6 ? T.t1 : T.t2, RectF(ic.X + S(18), chip.Y, tw2 + S(2), chip.Height));
+                    if (many) Icon(g, "chevron", S(11), T.t2, chip.X + chip.Width - S(7) - S(5.5f), chip.Y + chip.Height / 2, g_popList ? 180.f : 0.f);
+                }
+                std::wstring a0 = Mmss(pos), a1 = Mmss(m->end);
+                float tw0 = TextW(g, L"00:00", &fTime);
+                Text(g, a0.c_str(), &fTime, T.t3, RectF(S(14), S(130), tw0, S(16)));
+                Text(g, a1.c_str(), &fTime, T.t3, RectF(W - S(14) - tw0, S(130), tw0, S(16)), StringAlignmentFar);
+                if (m->canSeek || m->end > 0) bar(RectF(S(14) + tw0 + S(8), S(136), W - 2 * (S(14) + tw0 + S(8)), S(4)));
+                if (g_fStayMs == 0) {   // stays until you close it
+                    RectF xr(W - S(10) - S(22), S(8), S(22), S(22)); g_popHits.push_back({8, xr});
+                    if (g_popHot == 8) FillRound(g, T.subtle2, xr, S(6));
+                    Icon(g, "exit", S(10), g_popHot == 8 ? T.t1 : T.t3, xr.X + S(11), xr.Y + S(11));
+                }
+                if (g_popList) {   // the players, opening upwards over the cover
+                    float rowH = S(30), lw = S(190);
+                    for (auto& s2 : g_ms.s) lw = std::max(lw, std::min(S(300), S(28) + TextW(g, (s2.app + L" · " + s2.title).c_str(), &fA)));
+                    int n = (int)g_ms.s.size(), fit = std::max(1, (int)((cy - S(10) - S(6) - S(8)) / rowH));
+                    RectF box(W - S(14) - lw, std::max(S(6), cy - S(10) - S(6) - std::min(n, fit) * rowH - S(8)), lw, std::min(n, fit) * rowH + S(8));
+                    FillRound(g, Color(90, 0, 0, 0), RectF(box.X, box.Y + S(3), box.Width, box.Height + S(2)), S(9));
+                    FillRound(g, T.dark ? Color(255, 44, 44, 44) : Color(255, 251, 251, 251), box, S(8));
+                    for (int i = 0; i < std::min(n, fit); i++) {
+                        RectF it(box.X + S(4), box.Y + S(4) + i * rowH, box.Width - S(8), rowH);
+                        g_popHits.push_back({100 + i, it});
+                        if (g_popHot == 100 + i) FillRound(g, T.subtle2, it, S(5));
+                        bool sel = i == g_ms.cur;
+                        Text(g, (g_ms.s[i].app + L" · " + g_ms.s[i].title).c_str(), sel ? &fLbl : &fA, sel ? acc : T.t1, RectF(it.X + S(10), it.Y, it.Width - S(14), it.Height));
+                    }
+                }
+            } else {   // compact: one slim row
+                cover(RectF(S(12), S(10), S(44), S(44)), S(8), false);
+                float cx0 = W - S(12) - S(106);
+                textCol(m->title, m->artist, RectF(S(66), S(13), cx0 - S(66) - S(10), S(40)), false);
+                float cy = S(32), x = cx0;
+                PopIconBtn(g, 2, RectF(x, cy - S(16), S(32), S(32)), "mPrev", T.t2, m->canPrev);
+                x += S(36);
+                { RectF pr(x, cy - S(17), S(34), S(34)); g_popHits.push_back({3, pr}); SolidBrush pb(acc); g.FillEllipse(&pb, pr); Icon(g, playing ? "mPause" : "mPlay", S(15), Color(255, 255, 255, 255), pr.X + pr.Width / 2 + (playing ? 0 : S(1)), pr.Y + pr.Height / 2); }
+                x += S(38); PopIconBtn(g, 4, RectF(x, cy - S(16), S(32), S(32)), "mNext", T.t2, m->canNext);
+                if (m->end > 0) bar(RectF(S(12), H - S(7) - S(2), W - S(24), S(4)));
+            }
+        } else if (g_popKind == POP_NEXT && m) {   // Up next: the song that just started on its own
+            RectF nx(S(12), (H - S(22)) / 2, S(22), S(22)); SolidBrush nb(acc); g.FillEllipse(&nb, nx);
+            Icon(g, "mNext", S(13), Color(255, 255, 255, 255), nx.X + S(11), nx.Y + S(11));
+            float lw = TextW(g, L"Up next", &fLbl);
+            Text(g, L"Up next", &fLbl, T.t2, RectF(S(44), 0, lw + S(4), H));
+            float cx = S(44) + lw + S(13);
+            cover(RectF(cx, (H - S(32)) / 2, S(32), S(32)), S(7), false);
+            textCol(m->title, m->artist, RectF(cx + S(42), (H - S(37)) / 2, W - cx - S(42) - S(16), S(40)), false);
+        } else if (g_popKind == POP_LOCK) {   // lock keys: the lock closes or opens, the words change, the bar grows or shrinks
+            float t = (GetTickCount() - g_popLockT0) / 1000.f, ta = std::max(0.f, t - 0.14f);
+            bool still = g_fAnimMs == 0;
+            auto backOut = [](float x) { x = std::max(0.f, std::min(1.f, x)); float c1 = 1.70158f, c3 = c1 + 1; return 1 + c3 * powf(x - 1, 3) + c1 * powf(x - 1, 2); };
+            auto easeIO = [](float x) { x = std::max(0.f, std::min(1.f, x)); return x < .5f ? 4 * x * x * x : 1 - powf(-2 * x + 2, 3) / 2; };
+            float ks = still ? 1 : backOut(ta / 0.45f), kt = still ? 1 : easeIO(ta / 0.3f), kb = still ? 1 : easeIO(ta / 0.35f);
+            bool on = g_popLockOn;
+            {   // the lock, 20 x 22 units
+                float u = S(1), lx = S(14), ly = (H - S(22)) / 2;
+                float openA = on ? 25 * (1 - ks) : 25 * ks;   // degrees the shackle is turned open
+                GraphicsState st = g.Save();
+                Matrix mx; mx.Translate(lx + 14 * u, ly + 10 * u); mx.Rotate(openA); mx.Translate(-14 * u, -10 * u + (openA > 0.5f ? -u * openA / 25 : 0)); g.MultiplyTransform(&mx);
+                Pen sp(T.t1, S(1.8f)); sp.SetStartCap(LineCapRound); sp.SetEndCap(LineCapRound);
+                GraphicsPath sh; sh.AddLine(6 * u, 10 * u, 6 * u, 7 * u); sh.AddArc(6 * u, 3 * u, 8 * u, 8 * u, 180, 180); sh.AddLine(14 * u, 7 * u, 14 * u, 10 * u);
+                g.DrawPath(&sp, &sh);
+                g.Restore(st);
+                FillRound(g, T.t1, RectF(lx + 3.5f * u, ly + 10 * u, 13 * u, 10 * u), 2.6f * u);
+                SolidBrush hole(g_popGlass ? Color(255, T.dark ? 40 : 230, T.dark ? 40 : 230, T.dark ? 40 : 230) : (T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243)));
+                g.FillEllipse(&hole, lx + 8.6f * u, ly + 13.6f * u, 2.8f * u, 2.8f * u);
+            }
+            int k = std::max(0, std::min(3, g_popLockKey));
+            const wchar_t* now = on ? LOCK_TXT[k][1] : LOCK_TXT[k][2], *was = on ? LOCK_TXT[k][2] : LOCK_TXT[k][1];
+            float tx = S(14) + S(20) + S(11), tw = W - tx - S(18), ty = (H - S(24)) / 2;
+            auto word = [&](const wchar_t* s, float alpha, float dy) {
+                if (alpha <= 0.01f) return;
+                StringFormat sf; sf.SetAlignment(StringAlignmentCenter); SolidBrush b(WithAlpha(T.t1, (int)(T.t1.GetA() * alpha)));
+                g.DrawString(s, -1, &fLock, RectF(tx, ty + dy - S(1), tw, S(20)), &sf, &b);
+            };
+            word(was, 1 - kt, -S(5) * kt); word(now, kt, S(5) * (1 - kt));
+            float bw0 = on ? S(36) : S(60), bw1 = on ? S(60) : S(36), bwv = bw0 + (bw1 - bw0) * kb;
+            Color off = WithAlpha(T.t3, T.t3.GetA() / 2), onc = T.accent;
+            Color from = on ? off : onc, to = on ? onc : off;
+            auto lerp = [&](int a2, int b2) { return (BYTE)(a2 + (b2 - a2) * kb); };
+            Color bc(lerp(from.GetA(), to.GetA()), lerp(from.GetR(), to.GetR()), lerp(from.GetG(), to.GetG()), lerp(from.GetB(), to.GetB()));
+            FillRound(g, bc, RectF(tx + (tw - bwv) / 2, ty + S(21), bwv, S(3)), S(1.5f));
+        }
+    }
+    BitBlt(hdc, 0, 0, w, h, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, old); DeleteDC(mdc);
+}
+static bool FullscreenBusy() {   // a game, a presentation or a full-screen app is in front: no flyouts
+    QUERY_USER_NOTIFICATION_STATE q;
+    return SUCCEEDED(SHQueryUserNotificationState(&q)) && (q == QUNS_BUSY || q == QUNS_RUNNING_D3D_FULL_SCREEN || q == QUNS_PRESENTATION_MODE);
+}
+static void PopPlace(bool atRest, float k) {   // k 0..1 of the way in
+    int dx = 0, dy = (int)lroundf(g_popSlide * (1 - k));
+    SetWindowPos(g_pop, HWND_TOPMOST, g_popAt.x + dx, g_popAt.y + dy, g_popW, g_popH, SWP_NOACTIVATE | (atRest ? 0 : SWP_NOSIZE));
+    if (!g_popGlass) SetLayeredWindowAttributes(g_pop, 0, (BYTE)lroundf(255 * std::max(0.f, std::min(1.f, k))), LWA_ALPHA);
+}
+static void PopTimer() {
+    int ms = g_popDir != 0 || (g_popKind == POP_LOCK && GetTickCount() - g_popLockT0 < 700) || g_popDrag >= 0 ? 15 : PopAnimatedGlow() ? 33 : 250;
+    SetTimer(g_pop, 1, ms, nullptr);
+}
+static void PopEnd() {   // gone: let go of what only the flyout needed
+    KillTimer(g_pop, 1);
+    ShowWindow(g_pop, SW_HIDE);
+    g_popShown = false; g_popDir = 0; g_popList = false; g_popHot = -1; g_popDrag = -1; g_popTry = false;
+    if (g_popLv) { g_popLv = false; LevelsStop(); }
+    CanvasFree(g_cvPop);
+}
+static void PopHide() {
+    if (!g_popShown || g_popDir == -1) return;
+    if (PopDur() == 0) { PopEnd(); return; }
+    g_popDir = -1; g_popT0 = GetTickCount(); PopTimer();
+}
+static void PopArm() {   // how long it stays: the setting, longer while the mouse is on it; media can stay until closed
+    int ms = std::max(0, std::min(60000, g_fStayMs));
+    if (!ms && g_popKind != POP_MEDIA) ms = 2000;
+    g_popHideAt = ms ? GetTickCount() + ms : 0;
+}
+static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+static void PopApplyStyle() {
+    bool wantGlass = g_style == 1 && TransparencyOn() && T.glass;
+    LONG ex = GetWindowLongW(g_pop, GWL_EXSTYLE);
+    LONG want = wantGlass ? (ex & ~WS_EX_LAYERED) : (ex | WS_EX_LAYERED);
+    if (want != ex) SetWindowLongW(g_pop, GWL_EXSTYLE, want);
+    int none = 1; DwmSetWindowAttribute(g_pop, 38, &none, sizeof(none));
+    g_popGlass = wantGlass && SetAccent(g_pop, 4, T.dark ? 0xB8141414 : 0xA8F3F3F3);
+    if (!g_popGlass) SetAccent(g_pop, 0, 0);
+    MARGINS mg = g_popGlass ? MARGINS{-1, -1, -1, -1} : MARGINS{0, 0, 0, 0}; DwmExtendFrameIntoClientArea(g_pop, &mg);
+    BOOL dark = T.dark; DwmSetWindowAttribute(g_pop, 20, &dark, sizeof(dark));
+    DWORD pref = 2; DwmSetWindowAttribute(g_pop, 33, &pref, sizeof(pref));
+    COLORREF bc = 0xFFFFFFFE; DwmSetWindowAttribute(g_pop, 34, &bc, sizeof(bc));
+}
+static void PopShow(int kind) {
+    if ((kind == POP_MEDIA || kind == POP_NEXT) && !MediaCur() && !g_popTry) return;
+    if (FullscreenBusy()) return;
+    if (!g_pop) {
+        WNDCLASSW wc = {}; wc.lpfnWndProc = PopProc; wc.hInstance = g_inst; wc.lpszClassName = L"KnobPop"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        RegisterClassW(&wc);
+        g_pop = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED, L"KnobPop", L"", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, g_inst, nullptr);
+        if (!g_pop) return;
+    }
+    bool wasShown = g_popShown && g_popDir != -1, sameKind = wasShown && g_popKind == kind;
+    if (wasShown && !sameKind && g_popKind == POP_MEDIA && kind == POP_NEXT) return;   // the media flyout is up: it shows the new song itself
+    PopApplyStyle();
+    HMONITOR hm;
+    if (g_fScreen == 1) { POINT pt; GetCursorPos(&pt); hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST); }
+    else if (g_fScreen == 2) hm = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+    else hm = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
+    if (!g_visible && !g_set) ApplyDpi((int)dx);   // the panel and Settings keep their own size while open
+    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
+    RECT wa = mi.rcWork;
+    int w = (int)S(380), hh = 0;
+    if (kind == POP_MEDIA) hh = (int)S(g_fLayout ? 68 : 158);
+    else if (kind == POP_NEXT) hh = (int)S(52);
+    else {
+        int k = std::max(0, std::min(3, g_popLockKey));
+        Font fLock(g_famSemi, S(13.5f), FontStyleBold, UnitPixel);
+        float tw = std::max(S(60), std::max(MeasureW(LOCK_TXT[k][1], &fLock), MeasureW(LOCK_TXT[k][2], &fLock))) + S(4);
+        w = (int)(S(14) + S(20) + S(11) + tw + S(18)); hh = (int)S(48);
+    }
+    g_popW = w; g_popH = hh; g_popKind = kind;
+    int mH = (int)S(24), mB = (int)S(12);
+    int x = g_fPos == 1 || g_fPos == 4 ? wa.left + mH : g_fPos == 2 || g_fPos == 5 ? wa.right - mH - w : wa.left + (wa.right - wa.left - w) / 2;
+    bool top = g_fPos >= 3;
+    int y = top ? wa.top + mH : wa.bottom - mB - hh;
+    g_popAt = POINT{x, y}; g_popSlide = (int)S(20) * (top ? -1 : 1);
+    if (!sameKind) { g_popList = false; g_popHot = -1; }
+    if (kind == POP_MEDIA && g_fGlow == 5 && !g_popLv) { g_popLv = true; LevelsStart(); }
+    if ((kind != POP_MEDIA || g_fGlow != 5) && g_popLv) { g_popLv = false; LevelsStop(); }
+    PopArm();
+    if (wasShown) { if (g_popDir == 0) PopPlace(true, 1); }
+    else {
+        g_popShown = true;
+        if (PopDur() > 0) { g_popDir = 1; g_popT0 = GetTickCount(); PopPlace(true, 0); }
+        else { g_popDir = 0; PopPlace(true, 1); }
+        ShowWindow(g_pop, SW_SHOWNOACTIVATE);
+    }
+    PopTimer();
+    InvalidateRect(g_pop, nullptr, FALSE);
+}
+static void PopLockKey(int k, bool on) {   // a lock key changed: show the old state turning into the new one
+    if (!g_popLock || !(g_lkKeys & (1 << k))) return;
+    g_popLockKey = k; g_popLockOn = on; g_popLockT0 = GetTickCount();
+    PopShow(POP_LOCK);
+}
+static void PopClick(int id) {
+    MSess* m = MediaCur();
+    if (id == 8) { PopHide(); return; }
+    if (id == 6) { g_popList = !g_popList; InvalidateRect(g_pop, nullptr, FALSE); return; }
+    if (id >= 100) {   // picked a player: it stays the one shown until you pick another or it closes
+        int i = id - 100;
+        if (i < (int)g_ms.s.size()) { EnterCriticalSection(&g_mcs); g_mediaPick = g_ms.s[i].aumid; LeaveCriticalSection(&g_mcs); g_ms.cur = i; MediaRefresh(); }
+        g_popList = false; InvalidateRect(g_pop, nullptr, FALSE); return;
+    }
+    g_popList = false;
+    if (!m) return;
+    if (id == 3) { MediaCmd(MCMD_PLAYPAUSE); m->status = m->status == 4 ? 5 : 4; }   // shown at once; the player confirms a moment later
+    if (id == 2) MediaCmd(MCMD_PREV);
+    if (id == 4) MediaCmd(MCMD_NEXT);
+    if (id == 1) { m->shuffle = !m->shuffle; MediaCmd(MCMD_SHUFFLE, m->shuffle); }
+    if (id == 5) { m->repeat = (m->repeat + 1) % 3; MediaCmd(MCMD_REPEAT, m->repeat == 1 ? 2 : m->repeat == 2 ? 1 : 0); }
+    InvalidateRect(g_pop, nullptr, FALSE);
+}
+static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); PaintPop(dc); EndPaint(h, &ps); return 0; }
+    case WM_ERASEBKGND: return 1;
+    case WM_TIMER: {
+        DWORD now = GetTickCount();
+        if (g_popDir != 0) {
+            float t = std::min(1.f, (now - g_popT0) / (float)std::max(1, PopDur()));
+            float k = g_popDir == 1 ? 1 - powf(1 - t, 3) : 1 - t * t * t;   // arriving eases out, leaving eases in
+            PopPlace(false, k);
+            if (t >= 1) { if (g_popDir == -1) { PopEnd(); return 0; } g_popDir = 0; }
+        }
+        if (g_popDir == 0 && !g_popHover && g_popDrag < 0 && !g_popList && g_popHideAt && (int)(now - g_popHideAt) >= 0) { PopHide(); return 0; }
+        PopTimer();
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
+        if (!g_popHover) { g_popHover = true; TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0}; TrackMouseEvent(&tme); }
+        if (g_popDrag == 7) {
+            for (auto& ht : g_popHits) if (ht.first == 7) { RectF r = ht.second; g_popSeek = std::max(0.f, std::min(1.f, (x - r.X - S(4)) / (r.Width - S(8)))); }
+            InvalidateRect(h, nullptr, FALSE); return 0;
+        }
+        int hot = -1; for (auto& ht : g_popHits) if (InRect(ht.second, x, y)) hot = ht.first;
+        if (hot != g_popHot) { g_popHot = hot; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_popHover = false; g_popHot = -1;
+        if (g_popHideAt) g_popHideAt = std::max(g_popHideAt, GetTickCount() + 1200);   // a moment more after the mouse leaves
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
+        int hit = -1; for (auto& ht : g_popHits) if (InRect(ht.second, x, y)) hit = ht.first;
+        if (hit == 7) {   // drag the progress bar to move in the song
+            for (auto& ht : g_popHits) if (ht.first == 7) { RectF r = ht.second; g_popSeek = std::max(0.f, std::min(1.f, (x - r.X - S(4)) / (r.Width - S(8)))); }
+            g_popDrag = 7; SetCapture(h); PopTimer(); InvalidateRect(h, nullptr, FALSE); return 0;
+        }
+        if (hit < 0) { if (g_popList) { g_popList = false; InvalidateRect(h, nullptr, FALSE); } return 0; }
+        PopClick(hit);
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (g_popDrag == 7) {
+            g_popDrag = -1; ReleaseCapture();
+            if (MSess* m = MediaCur()) {
+                INT64 p = (INT64)(g_popSeek * m->end);
+                MediaCmd(MCMD_SEEK, (LPARAM)(p + m->start));
+                FILETIME ft; GetSystemTimeAsFileTime(&ft); m->pos = p; m->updated = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;   // stays where you let go
+            }
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
+    case WM_CAPTURECHANGED: if (g_popDrag >= 0 && (HWND)lp != h) g_popDrag = -1; return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void MediaApply(MediaSnap* m) {   // a new snapshot from the media thread
+    if (m->newCover) { delete g_cover; g_cover = m->cover; m->cover = nullptr; CoverColours(); BuildGlows(); }
+    int why = m->why;
+    g_ms.s = std::move(m->s); g_ms.cur = m->cur;
+    delete m->cover; delete m;
+    if (why == 2 && g_popNext) PopShow(POP_NEXT);
+    if (g_popShown && g_pop) { if (!MediaCur() && g_popKind != POP_LOCK && !g_popTry) PopHide(); else InvalidateRect(g_pop, nullptr, FALSE); }
+}
+static void FlyoutKeysSync();   // listen to the keyboard only while a flyout that needs it is on
+
+// ---------------------------------------------------------------- Party screen
+// A screen of soft light that moves with the music, in the cover's colours. The light is drawn small (320 px wide)
+// and blurred on the CPU, then Direct2D stretches it to the screen on the graphics card, so it stays light.
+// Only exists while it's on screen: any key or mouse move fades it out and frees everything.
+static const wchar_t* PARTY_LOOKS[4] = {L"Glow waves", L"Mirror bars", L"Aurora", L"Light line"};
+static HWND g_party = nullptr;
+static ID2D1Factory* g_d2f = nullptr;
+static ID2D1HwndRenderTarget* g_prt = nullptr;
+static ID2D1Bitmap* g_pbmp = nullptr, *g_pinfo = nullptr;
+static ID2D1SolidColorBrush* g_pline = nullptr;
+static int g_pw = 0, g_ph = 0, g_pDir = 0, g_pA = 0;   // low-res size; fade direction and alpha
+static DWORD g_pT0 = 0, g_pTick = 0; static POINT g_pPt;
+static float g_pTime = 0; static bool g_pLive = false;   // fully started (levels on, cursor hidden)
+static std::vector<float> g_pbuf;      // r g b per low-res pixel
+static std::wstring g_pInfoKey;
+static HMONITOR PickMonitor(const std::wstring& name) {   // "" = main screen, else the screen with that name
+    if (!name.empty()) for (auto& m : g_mons) if (m.name == name && m.cloneOf < 0) return MonitorFromRect(&m.rc, MONITOR_DEFAULTTONEAREST);
+    return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+static void PartyFree() {
+    if (g_pinfo) { g_pinfo->Release(); g_pinfo = nullptr; }
+    if (g_pline) { g_pline->Release(); g_pline = nullptr; }
+    if (g_pbmp) { g_pbmp->Release(); g_pbmp = nullptr; }
+    if (g_prt) { g_prt->Release(); g_prt = nullptr; }
+    std::vector<float>().swap(g_pbuf); g_pInfoKey.clear();
+}
+static std::vector<std::wstring> ScreenNames() { std::vector<std::wstring> v; for (auto& m : g_mons) if (m.cloneOf < 0 && std::find(v.begin(), v.end(), m.name) == v.end()) v.push_back(m.name); return v; }
+static void PartyEnd() {
+    if (!g_party || g_pDir == -1) return;
+    g_pDir = -1; g_pT0 = GetTickCount();
+}
+static void PartyInfoBitmap() {   // the cover, title and artist for the corner, drawn once per song with GDI+
+    MSess* m = MediaCur();
+    std::wstring key = m && g_partyInfo ? m->title + L"|" + m->artist + L"|" + m->app + (g_cover ? L"c" : L"") : L"";
+    if (key == g_pInfoKey && (g_pinfo || key.empty())) return;
+    g_pInfoKey = key;
+    if (g_pinfo) { g_pinfo->Release(); g_pinfo = nullptr; }
+    if (key.empty() || !g_prt) return;
+    const int w = (int)S(420), h = (int)S(48);
+    Gdiplus::Bitmap bmp(w, h, PixelFormat32bppPARGB);
+    {
+        Graphics g(&bmp); g.Clear(Color(0, 0, 0, 0)); g.SetSmoothingMode(SmoothingModeAntiAlias); g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        RectF cr(0, 0, S(48), S(48)); GraphicsPath p; AddRound(p, cr, S(8));
+        if (g_cover) { g.SetClip(&p); g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(g_cover, cr); g.ResetClip(); }
+        else { SolidBrush b(PopAcc()); g.FillPath(&b, &p); }
+        Font f1(g_famSemi, S(14), FontStyleRegular, UnitPixel), f2(g_famText, S(12), FontStyleRegular, UnitPixel);
+        StringFormat sf; sf.SetTrimming(StringTrimmingEllipsisCharacter); sf.SetFormatFlags(StringFormatFlagsNoWrap);
+        SolidBrush b1(Color(191, 255, 255, 255)), b2(Color(134, 255, 255, 255));
+        g.DrawString(m->title.c_str(), -1, &f1, RectF(S(60), S(5), w - S(60), S(20)), &sf, &b1);
+        g.DrawString((m->artist + L" · " + m->app).c_str(), -1, &f2, RectF(S(60), S(25), w - S(60), S(18)), &sf, &b2);
+    }
+    BitmapData bd; Rect rc(0, 0, w, h);
+    if (bmp.LockBits(&rc, ImageLockModeRead, PixelFormat32bppPARGB, &bd) == Ok) {
+        D2D1_BITMAP_PROPERTIES bp = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96, 96};
+        g_prt->CreateBitmap(D2D1::SizeU(w, h), bd.Scan0, bd.Stride, bp, &g_pinfo);
+        bmp.UnlockBits(&bd);
+    }
+}
+static void PartyFrame() {
+    if (!g_prt && g_d2f && g_party) {   // the graphics card was reset: make a new target
+        RECT rc; GetClientRect(g_party, &rc);
+        g_d2f->CreateHwndRenderTarget(D2D1::RenderTargetProperties(), D2D1::HwndRenderTargetProperties(g_party, D2D1::SizeU(rc.right, rc.bottom)), &g_prt);
+    }
+    if (!g_prt) return;
+    if (!g_pbmp) {
+        D2D1_BITMAP_PROPERTIES bp = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE}, 96, 96};
+        if (FAILED(g_prt->CreateBitmap(D2D1::SizeU(g_pw, g_ph), bp, &g_pbmp))) return;
+    }
+    g_pTime += 0.033f;
+    const int W = g_pw, H = g_ph; float t = g_pTime;
+    std::vector<float>& b = g_pbuf; b.assign((size_t)W * H * 3, 0.f);
+    Color a = PopAcc(); float ar = a.GetR() / 255.f, ag = a.GetG() / 255.f, ab = a.GetB() / 255.f;
+    auto add = [&](int x, int y, float r, float g, float bl, float k) { if (x < 0 || y < 0 || x >= W || y >= H) return; float* p = &b[((size_t)y * W + x) * 3]; p[0] += r * k; p[1] += g * k; p[2] += bl * k; };
+    auto blur = [&](int r, int passes) {   // separable box blur on the float buffer
+        if (r < 1) return;
+        std::vector<float> tmp(b.size());
+        for (int pass = 0; pass < passes; pass++) {
+            for (int dir = 0; dir < 2; dir++) {
+                const std::vector<float>& src = dir ? tmp : b; std::vector<float>& dst = dir ? b : tmp;
+                int n = dir ? H : W, lines = dir ? W : H;
+                for (int ln = 0; ln < lines; ln++) {
+                    float acc[3] = {};
+                    auto at = [&](int i) -> const float* { i = std::max(0, std::min(n - 1, i)); return &src[(dir ? ((size_t)i * W + ln) : ((size_t)ln * W + i)) * 3]; };
+                    for (int i = -r; i <= r; i++) { const float* p = at(i); acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; }
+                    for (int i = 0; i < n; i++) {
+                        float* d = &dst[(dir ? ((size_t)i * W + ln) : ((size_t)ln * W + i)) * 3];
+                        d[0] = acc[0] / (2 * r + 1); d[1] = acc[1] / (2 * r + 1); d[2] = acc[2] / (2 * r + 1);
+                        const float* pa = at(i + r + 1), *pr = at(i - r);
+                        for (int k = 0; k < 3; k++) acc[k] += pa[k] - pr[k];
+                    }
+                }
+            }
+        }
+    };
+    float sc = W / 320.f;
+    std::vector<D2D1_POINT_2F> line;
+    if (g_partyLook == 0 || g_partyLook == 1) {   // bars: glow waves rise from the bottom; mirror bars grow both ways from the middle
+        bool mir = g_partyLook == 1; int n = mir ? 48 : 32;
+        float x0 = mir ? W * 0.03f : -W * 0.04f, span = mir ? W * 0.94f : W * 1.08f, gap = (mir ? 1.2f : 1.5f) * sc, bw = span / n - gap;
+        for (int k = 0; k < n; k++) {
+            float v = LvBar(k, n) * (mir ? 0.9f : 1.0f), hgt = v * H, bx = x0 + k * (bw + gap);
+            for (int y = 0; y < H; y++) {
+                float m;
+                if (mir) { float d = fabsf(y - H / 2.f) / std::max(1.f, hgt / 2); if (d > 1) continue; m = 1 - 0.6f * d; }
+                else { float fromB = (H - 1 - y) / std::max(1.f, hgt); if (fromB > 1) continue; m = 1 - 0.65f * fromB; }
+                for (int x = (int)bx; x < (int)(bx + bw); x++) add(x, y, ar, ag, ab, m);
+            }
+        }
+        if (mir) blur((int)lroundf(1 * sc), 2); else blur((int)lroundf(4 * sc), 3);
+        float o = mir ? 0.85f : 0.75f; for (auto& v : b) v *= o;
+    } else if (g_partyLook == 2) {   // aurora: three curtains of soft light rays hanging from slow wavy lines; the music lifts the rays
+        float bass = (g_lv[0] + g_lv[1] + g_lv[2]) / 3;
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {   // the night sky, a touch of colour low down
+            float dx = (x - W / 2.f) / (W * 0.6f), dy = (y - H) / (H * 0.7f), d = std::min(1.f, sqrtf(dx * dx + dy * dy));
+            add(x, y, ar * 0.1f + 0.008f, ag * 0.1f + 0.024f, ab * 0.1f + 0.067f, 0.9f * (1 - d));
+        }
+        static const float base[3][3] = {{0.24f, 1.0f, 0.63f}, {0.18f, 0.85f, 1.0f}, {0.70f, 0.42f, 1.0f}};
+        static const float mixA[3] = {0.35f, 0.30f, 0.30f}, op[3] = {1.0f, 0.75f, 0.55f};
+        for (int l = 0; l < 3; l++) {
+            float cr = ar * mixA[l] + base[l][0] * (1 - mixA[l]), cg = ag * mixA[l] + base[l][1] * (1 - mixA[l]), cb = ab * mixA[l] + base[l][2] * (1 - mixA[l]);
+            const int rays = 64;
+            for (int k = 0; k < rays; k++) {
+                float x = k / (float)(rays - 1), bi = LvBar((int)(x * 31), 32);
+                float bottom = (34 + l * 9 + sinf(x * 3.1f + t * .32f + l * 1.9f) * 10 + sinf(x * 7.3f - t * .47f + l) * 4) / 100.f * H;
+                float hgt = (14 + l * 4 + bi * (34 - l * 6) + sinf(k * .9f + t * 1.3f + l) * 3 + bass * 6) / 100.f * H;
+                float cx = x * W, half = W * 0.012f;
+                for (int yy = 0; yy < (int)hgt; yy++) {
+                    float u = yy / std::max(1.f, hgt);   // 0 at the bottom of the ray
+                    float m = u < .06f ? u / .06f : u < .35f ? 1 - (u - .06f) / .29f * .45f : .55f * (1 - (u - .35f) / .65f);
+                    int y = (int)(H - bottom - yy);
+                    for (int xx = (int)(cx - half); xx <= (int)(cx + half); xx++) add(xx, y, cr, cg, cb, m * op[l] * 0.55f);
+                }
+            }
+        }
+        blur((int)lroundf(2 * sc), 2);
+    } else {   // light line: one smooth line across the middle; each part of the song swings it up or down
+        const int n = 40;
+        std::vector<PointF> pts; pts.push_back(PointF(0, H / 2.f));
+        for (int k = 0; k < n; k++) pts.push_back(PointF((k + .5f) / n * W, H / 2.f - LvBar(k, n) * H * 0.44f * sinf(k * 1.1f + t * 2.4f)));
+        pts.push_back(PointF((float)W, H / 2.f));
+        std::vector<PointF> curve;   // quadratic curves through the midpoints
+        curve.push_back(pts[0]);
+        for (size_t i = 1; i + 1 < pts.size(); i++) {
+            PointF p0 = curve.back(), c = pts[i], e((pts[i].X + pts[i + 1].X) / 2, (pts[i].Y + pts[i + 1].Y) / 2);
+            for (int s = 1; s <= 4; s++) { float u = s / 4.f, v = 1 - u; curve.push_back(PointF(v * v * p0.X + 2 * v * u * c.X + u * u * e.X, v * v * p0.Y + 2 * v * u * c.Y + u * u * e.Y)); }
+        }
+        curve.push_back(pts.back());
+        float rad = 4.8f * sc;
+        for (size_t i = 0; i + 1 < curve.size(); i++) {   // the wide glow, stamped along the line
+            PointF p0 = curve[i], p1 = curve[i + 1]; int steps = std::max(1, (int)(hypotf(p1.X - p0.X, p1.Y - p0.Y)));
+            for (int s = 0; s < steps; s++) {
+                float px = p0.X + (p1.X - p0.X) * s / steps, py = p0.Y + (p1.Y - p0.Y) * s / steps;
+                for (int y = (int)(py - rad); y <= (int)(py + rad); y++) for (int x = (int)(px - rad); x <= (int)(px + rad); x++) {
+                    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                    float* p = &b[((size_t)y * W + x) * 3]; float k = 0.5f * (1 - hypotf(x - px, y - py) / rad); if (k <= 0) continue;
+                    p[0] = std::max(p[0], ar * k); p[1] = std::max(p[1], ag * k); p[2] = std::max(p[2], ab * k);
+                }
+            }
+        }
+        blur((int)lroundf(3 * sc), 3);
+        float kx = 0, ky = 0; RECT rc; GetClientRect(g_party, &rc); kx = (rc.right - rc.left) / (float)W; ky = (rc.bottom - rc.top) / (float)H;
+        for (auto& p : curve) line.push_back(D2D1::Point2F(p.X * kx, p.Y * ky));
+    }
+    std::vector<UINT32> px((size_t)W * H);
+    for (size_t i = 0; i < px.size(); i++) {
+        auto c8 = [](float v) { return (UINT32)std::max(0, std::min(255, (int)(v * 255))); };
+        px[i] = 0xFF000000u | (c8(b[i * 3]) << 16) | (c8(b[i * 3 + 1]) << 8) | c8(b[i * 3 + 2]);
+    }
+    g_pbmp->CopyFromMemory(nullptr, px.data(), W * 4);
+    PartyInfoBitmap();
+    g_prt->BeginDraw();
+    D2D1_SIZE_F sz = g_prt->GetSize();
+    g_prt->DrawBitmap(g_pbmp, D2D1::RectF(0, 0, sz.width, sz.height), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    if (!line.empty()) {
+        if (!g_pline) g_prt->CreateSolidColorBrush(D2D1::ColorF(ar, ag, ab, 1.f), &g_pline);
+        if (g_pline) { g_pline->SetColor(D2D1::ColorF(ar, ag, ab, 1.f)); for (size_t i = 0; i + 1 < line.size(); i++) g_prt->DrawLine(line[i], line[i + 1], g_pline, S(3)); }
+    }
+    if (g_pinfo) { D2D1_SIZE_F is = g_pinfo->GetSize(); g_prt->DrawBitmap(g_pinfo, D2D1::RectF(S(36), sz.height - S(32) - is.height, S(36) + is.width, sz.height - S(32)), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR); }
+    if (g_prt->EndDraw() == (HRESULT)D2DERR_RECREATE_TARGET) PartyFree();
+}
+static LRESULT CALLBACK PartyProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND: { RECT r; GetClientRect(h, &r); FillRect((HDC)wp, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }
+    case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
+    case WM_TIMER: {
+        if (g_pDir != 0) {
+            float k = std::min(1.f, (GetTickCount() - g_pT0) / (float)BLACK_FADE), e = k * k * (3 - 2 * k);
+            g_pA = g_pDir == 1 ? (int)(255 * e) : (int)(255 * (1 - e));
+            SetLayeredWindowAttributes(h, 0, (BYTE)g_pA, LWA_ALPHA);
+            if (k >= 1) { if (g_pDir == -1) { DestroyWindow(h); return 0; } g_pDir = 0; }
+        }
+        PartyFrame();
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (GetTickCount() - g_pTick < 800) return 0;   // ignore the click that started it
+        POINT p; GetCursorPos(&p);
+        if (abs(p.x - g_pPt.x) > 6 || abs(p.y - g_pPt.y) > 6) PartyEnd();
+        return 0;
+    }
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_MOUSEWHEEL:
+        if (GetTickCount() - g_pTick > 300) PartyEnd();
+        return 0;
+    case WM_DESTROY:
+        KillTimer(h, 1);
+        PartyFree();
+        if (g_d2f) { g_d2f->Release(); g_d2f = nullptr; }
+        g_party = nullptr; g_pDir = 0;
+        if (g_pLive) { g_pLive = false; LevelsStop(); ShowCursor(TRUE); ApplyKeepAwake(); }   // the screen may sleep again (unless Keep awake is on)
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void PartyStart() {
+    if (g_party) { PartyEnd(); return; }   // the shortcut again ends it
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = PartyProc; wc.hInstance = g_inst; wc.lpszClassName = L"KnobParty"; wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); RegisterClassW(&wc); reg = true; }
+    if (!g_d2f) {   // Direct2D is loaded only for the party screen
+        typedef HRESULT (WINAPI* PFN_D2DCF)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**);
+        static HMODULE d2d = LoadLibraryW(L"d2d1.dll");
+        PFN_D2DCF cf = d2d ? (PFN_D2DCF)GetProcAddress(d2d, "D2D1CreateFactory") : nullptr;
+        if (!cf || FAILED(cf(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), nullptr, (void**)&g_d2f))) return;
+    }
+    MediaStart(); MediaRefresh();
+    HMONITOR hm = PickMonitor(g_partyScr);
+    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
+    RECT r = mi.rcMonitor; int w = r.right - r.left, h = r.bottom - r.top;
+    g_party = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, L"KnobParty", L"", WS_POPUP, r.left, r.top, w, h, nullptr, nullptr, g_inst, nullptr);
+    if (!g_party) return;
+    SetLayeredWindowAttributes(g_party, 0, 0, LWA_ALPHA);
+    D2D1_RENDER_TARGET_PROPERTIES rp = D2D1::RenderTargetProperties();
+    if (FAILED(g_d2f->CreateHwndRenderTarget(rp, D2D1::HwndRenderTargetProperties(g_party, D2D1::SizeU(w, h)), &g_prt))) { DestroyWindow(g_party); return; }
+    g_pw = 320; g_ph = std::max(90, 320 * h / std::max(1, w));
+    g_pTime = 0; g_pInfoKey.clear();
+    ShowWindow(g_party, SW_SHOW); SetForegroundWindow(g_party);
+    ShowCursor(FALSE);   // undone in WM_DESTROY (g_pLive)
+    GetCursorPos(&g_pPt); g_pTick = GetTickCount();
+    g_pDir = 1; g_pT0 = GetTickCount(); g_pA = 0;
+    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);   // a party: the screen stays on
+    LevelsStart(); g_pLive = true;
+    SetTimer(g_party, 1, 33, nullptr);
+}
+
+// ---------------------------------------------------------------- Turn off displays: the timer, and the clock on the black screen
+static void ScreenOffNow() { g_offAt = 0; KillTimer(g_hwnd, TIMER_OFFAT); HideFlyout(); SetTimer(g_hwnd, TIMER_SCREENOFF, 500, nullptr); }   // after the click settles
+static void ScreenOffRequest() {   // the button or the shortcut: right away, or start (or cancel) the timer from Settings
+    if (g_offAt) { g_offAt = 0; KillTimer(g_hwnd, TIMER_OFFAT); if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    int mins = OFF_MIN[std::max(0, std::min(4, g_offDelay))];
+    if (!mins) { ScreenOffNow(); return; }
+    g_offAt = GetTickCount() + mins * 60000u; if (!g_offAt) g_offAt = 1;
+    SetTimer(g_hwnd, TIMER_OFFAT, 1000, nullptr);
+    if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+static std::wstring OffLeft() { int s = g_offAt ? std::max(0, (int)(g_offAt - GetTickCount()) / 1000) : 0; wchar_t b[24]; swprintf(b, 24, L"Off in %d:%02d", s / 60, s % 60); return b; }
+static bool IsClockScreen(const RECT& rc) {   // does this screen show the clock on the black screen?
+    if (!g_offClock) return false;
+    if (g_clockScr == L"*") return true;
+    HMONITOR want = PickMonitor(g_clockScr);
+    MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(want, &mi);
+    return EqualRect(&mi.rcMonitor, &rc) != 0;
+}
+static void PaintClock(HWND h, HDC dc) {   // dim grey time and date, like a phone's always-on screen; drifts a little every minute
+    RECT rc; GetClientRect(h, &rc); int w = rc.right, hh = rc.bottom;
+    HDC mdc = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, w, hh); HGDIOBJ old = SelectObject(mdc, bm);
+    {
+        Graphics g(mdc); g.Clear(Color(255, 0, 0, 0)); g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        static FontFamily* thin = nullptr; if (!thin) thin = PickFamily({L"Segoe UI Variable Display Light", L"Segoe UI Light", L"Segoe UI"});
+        float big = std::max(64.f * g_scale, std::min(150.f * g_scale, w * 0.11f)), small = std::max(14.f * g_scale, std::min(20.f * g_scale, w * 0.016f));
+        wchar_t tb[64] = {}, db[128] = {};
+        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS | TIME_NOTIMEMARKER, nullptr, nullptr, tb, 64);
+        GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"dddd, MMMM d", db, 128, nullptr);
+        std::wstring ts = tb; while (!ts.empty() && ts.back() == L' ') ts.pop_back();
+        LONG_PTR seed = GetWindowLongPtrW(h, GWLP_USERDATA) >> 1;   // the drift for this minute
+        float dx = ((seed % 97) / 48.f - 1) * w * 0.06f, dy = (((seed / 97) % 97) / 48.f - 1) * hh * 0.06f;
+        Font ft(thin, big, FontStyleRegular, UnitPixel), fd(g_famText, small, FontStyleRegular, UnitPixel);
+        StringFormat sf; sf.SetAlignment(StringAlignmentCenter);
+        SolidBrush b1(Color(255, 92, 92, 92)), b2(Color(255, 74, 74, 74));
+        float cy = hh / 2.f + dy;
+        g.DrawString(ts.c_str(), -1, &ft, RectF(dx, cy - big * 0.75f, (float)w, big * 1.3f), &sf, &b1);
+        g.DrawString(db, -1, &fd, RectF(dx, cy + big * 0.5f, (float)w, small * 2), &sf, &b2);
+    }
+    BitBlt(dc, 0, 0, w, hh, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, old); DeleteObject(bm); DeleteDC(mdc);
+}
+
+// ---------------------------------------------------------------- refresh rate on battery
+static void RateBatApply() {   // the laptop screen: 60 Hz on battery, its highest on power (only when the power source changes)
+    if (!g_rateBat || !g_monsLoaded) return;
+    SYSTEM_POWER_STATUS ps; if (!GetSystemPowerStatus(&ps) || ps.ACLineStatus > 1) return;
+    bool bat = ps.ACLineStatus == 0;
+    for (int i = 0; i < (int)g_mons.size(); i++) {
+        MonUI& m = g_mons[i];
+        if (!m.internal || m.rates.size() < 2) continue;
+        int lo = *std::min_element(m.rates.begin(), m.rates.end()), hi = *std::max_element(m.rates.begin(), m.rates.end());
+        int want = bat ? (std::find(m.rates.begin(), m.rates.end(), 60) != m.rates.end() ? 60 : lo) : hi;
+        if (want != m.rate) SetRefreshRate(i, want);
+    }
+}
+
+// ---------------------------------------------------------------- arrangement at real size (Settings › Display)
+// Windows lines screens up by their pixels, so a small sharp laptop screen looks bigger than a large monitor and the
+// edges between them don't meet. Here they're drawn at their real size; drag one where it is on your desk and Apply
+// tells Windows. Nothing runs afterwards: the mouse simply crosses where the edges really meet.
+struct ArrScreen { int mon = -1; float wmm = 0, hmm = 0; };
+static ArrScreen g_arrMain, g_arrOther;
+static int g_arrSide = 0;            // where the other screen sits: 0 above, 1 right, 2 below, 3 left of the main one
+static float g_arrOff = 0;           // its centre's offset along that edge, in mm
+static bool g_arrPix = false, g_arrDrag = false, g_arrDirty = false;
+static PointF g_arrGrab, g_arrGrabC; static std::wstring g_arrMsg;
+static bool g_lockPop[4] = {};   // Try: the state each lock key showed last
+static RectF g_arrRMain, g_arrROther; static float g_arrScale = 1;   // last drawn: px per mm
+static bool EdidSize(const std::wstring& gdi, float& wmm, float& hmm) {   // the screen's real size, from its EDID
+    DISPLAY_DEVICEW dd = {sizeof(dd)};
+    if (!EnumDisplayDevicesW(gdi.c_str(), 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME)) return false;
+    std::wstring id = dd.DeviceID;   // \\?\DISPLAY#DELA1C4#5&2d4e8a3&0&UID4353#{...}
+    std::vector<std::wstring> part; std::wstring cur;
+    for (wchar_t c : id) { if (c == L'#') { part.push_back(cur); cur.clear(); } else cur += c; }
+    if (part.size() < 3) return false;
+    std::wstring key = L"SYSTEM\\CurrentControlSet\\Enum\\DISPLAY\\" + part[1] + L"\\" + part[2] + L"\\Device Parameters";
+    BYTE e[256]; DWORD sz = sizeof(e);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"EDID", RRF_RT_REG_BINARY, nullptr, e, &sz) != ERROR_SUCCESS || sz < 128) return false;
+    int w = e[66] | ((e[68] & 0xF0) << 4), h = e[67] | ((e[68] & 0x0F) << 8);   // first detailed timing: mm
+    if (w < 100 || h < 60) { w = e[21] * 10; h = e[22] * 10; }                   // else the basic block: cm
+    if (w < 100 || h < 60) return false;
+    wmm = (float)w; hmm = (float)h;
+    return true;
+}
+static bool ArrReady() {   // two screens side by side (not duplicated), both with a known size
+    std::vector<int> act; for (int i = 0; i < (int)g_mons.size(); i++) if (g_mons[i].cloneOf < 0 && g_mons[i].rc.right > g_mons[i].rc.left) act.push_back(i);
+    if (act.size() != 2) return false;
+    int mi = g_mons[act[0]].rc.left == 0 && g_mons[act[0]].rc.top == 0 ? act[0] : act[1], oi = mi == act[0] ? act[1] : act[0];
+    if (g_arrMain.mon != mi || g_arrOther.mon != oi) {   // (re)read the sizes and start from what Windows has now
+        g_arrMain = ArrScreen(); g_arrOther = ArrScreen();
+        if (g_demo) { g_arrMain = {mi, 302, 189}; g_arrOther = {oi, 598, 336}; }
+        else if (!EdidSize(g_mons[mi].gdi, g_arrMain.wmm, g_arrMain.hmm) || !EdidSize(g_mons[oi].gdi, g_arrOther.wmm, g_arrOther.hmm)) return false;
+        g_arrMain.mon = mi; g_arrOther.mon = oi;
+        const RECT& a = g_mons[mi].rc; const RECT& b = g_mons[oi].rc;
+        float mmpx = g_arrMain.wmm / std::max(1L, a.right - a.left);
+        if (b.bottom <= a.top) g_arrSide = 0; else if (b.left >= a.right) g_arrSide = 1; else if (b.top >= a.bottom) g_arrSide = 2; else g_arrSide = 3;
+        g_arrOff = g_arrSide % 2 == 0 ? ((b.left + b.right) / 2.f - (a.left + a.right) / 2.f) * mmpx : ((b.top + b.bottom) / 2.f - (a.top + a.bottom) / 2.f) * mmpx;
+        g_arrDirty = false;
+    }
+    return g_arrMain.wmm > 0 && g_arrOther.wmm > 0;
+}
+static void ArrClamp() {   // they always share at least a bit of edge
+    float half = g_arrSide % 2 == 0 ? (g_arrMain.wmm + g_arrOther.wmm) / 2 : (g_arrMain.hmm + g_arrOther.hmm) / 2;
+    g_arrOff = std::max(-half + 40, std::min(half - 40, g_arrOff));
+}
+static bool ArrApply() {   // the middle of the shared edge lines up exactly; the rest as near as pixels allow
+    if (!ArrReady()) return false;
+    const MonUI& M = g_mons[g_arrMain.mon]; const MonUI& O = g_mons[g_arrOther.mon];
+    int mw = M.rc.right - M.rc.left, mh = M.rc.bottom - M.rc.top, ow = O.rc.right - O.rc.left, oh = O.rc.bottom - O.rc.top;
+    int x = 0, y = 0;
+    if (g_arrSide % 2 == 0) {
+        float c = g_arrMain.wmm / 2 + g_arrOff, a0 = std::max(0.f, c - g_arrOther.wmm / 2), a1 = std::min(g_arrMain.wmm, c + g_arrOther.wmm / 2), mid = (a0 + a1) / 2;
+        float pm = mid * mw / g_arrMain.wmm, po = (mid - (c - g_arrOther.wmm / 2)) * ow / g_arrOther.wmm;
+        x = M.rc.left + (int)lroundf(pm - po); y = g_arrSide == 0 ? M.rc.top - oh : M.rc.bottom;
+    } else {
+        float c = g_arrMain.hmm / 2 + g_arrOff, a0 = std::max(0.f, c - g_arrOther.hmm / 2), a1 = std::min(g_arrMain.hmm, c + g_arrOther.hmm / 2), mid = (a0 + a1) / 2;
+        float pm = mid * mh / g_arrMain.hmm, po = (mid - (c - g_arrOther.hmm / 2)) * oh / g_arrOther.hmm;
+        y = M.rc.top + (int)lroundf(pm - po); x = g_arrSide == 1 ? M.rc.right : M.rc.left - ow;
+    }
+    if (g_demo) { g_arrDirty = false; return true; }
+    DEVMODEW dm = {}; dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(O.gdi.c_str(), ENUM_CURRENT_SETTINGS, &dm)) return false;
+    dm.dmFields = DM_POSITION; dm.dmPosition.x = x; dm.dmPosition.y = y;
+    if (ChangeDisplaySettingsExW(O.gdi.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr) != DISP_CHANGE_SUCCESSFUL) return false;
+    ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    g_arrDirty = false;
+    return true;
+}
+
+// ---------------------------------------------------------------- keys for the flyouts: media keys and lock keys, heard without taking them
+// Raw input with INPUTSINK only listens (the key still does its normal job), and only while a flyout that needs it is on.
+static bool g_rawOn = false;
+static int g_lockPending = -1; static bool g_lockKnown[4] = {}; static bool g_lockLast[4] = {};
+static void FlyoutKeysSync() {
+    if (g_popMedia || g_popNext) MediaStart();
+    bool want = g_popMedia || g_popLock;
+    if (want == g_rawOn || !g_hwnd) return;
+    RAWINPUTDEVICE rid = {0x01, 0x06, want ? (DWORD)RIDEV_INPUTSINK : (DWORD)RIDEV_REMOVE, want ? g_hwnd : nullptr};
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid))) g_rawOn = want;
+}
+static void FlyoutKey(USHORT vk) {
+    if (vk >= VK_MEDIA_NEXT_TRACK && vk <= VK_MEDIA_PLAY_PAUSE && g_popMedia) {
+        g_mediaCmdTick = GetTickCount(); MediaStart(); MediaRefresh();
+        SetTimer(g_hwnd, TIMER_POPKEY, 220, nullptr);   // a moment for the player to react, then show what it's doing
+        return;
+    }
+    int k = vk == VK_CAPITAL ? 0 : vk == VK_NUMLOCK ? 1 : vk == VK_SCROLL ? 2 : vk == VK_INSERT ? 3 : -1;
+    if (k < 0 || !g_popLock || !(g_lkKeys & (1 << k))) return;
+    g_lockPending = k; SetTimer(g_hwnd, TIMER_LOCKKEY, 40, nullptr);
+}
+static void FlyoutLockNow() {
+    int k = g_lockPending; g_lockPending = -1;
+    if (k < 0) return;
+    bool on;
+    if (k == 3) on = g_insertOn = !g_insertOn;   // Insert has no light: Knob keeps count
+    else {
+        static const int vks[3] = {VK_CAPITAL, VK_NUMLOCK, VK_SCROLL};
+        on = (GetKeyState(vks[k]) & 1) != 0;
+        if (g_lockKnown[k] && on == g_lockLast[k]) on = !on;   // the state hadn't reached this app yet: every press flips it
+    }
+    g_lockKnown[k] = true; g_lockLast[k] = on;
+    PopLockKey(k, on);
+}
+
 // ---------------------------------------------------------------- settings window
-enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_APPEAR, SP_ABOUT, SP_COUNT };
-static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Appearance", L"About"};
-static const wchar_t SP_GLYPHS[SP_COUNT] = {0xE713, 0xE767, 0xE7F4, 0xE790, 0xE946};
-enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT, SK_HKDEL, SK_HKADD, SK_RTSRC, SK_RTDST, SK_RTDELAY, SK_NLSL };
+enum { SP_GENERAL, SP_SOUND, SP_DISPLAY, SP_FLYOUTS, SP_APPEAR, SP_ABOUT, SP_COUNT };
+static const wchar_t* SP_NAMES[SP_COUNT] = {L"General", L"Sound", L"Display", L"Flyouts", L"Appearance", L"About"};
+enum SKind { SK_NAV, SK_SWITCH, SK_LINK, SK_BUTTON, SK_STYLE, SK_SWATCH, SK_HK, SK_STEP, SK_PAPPLY, SK_PUPDATE, SK_PRENAME, SK_PDELETE, SK_PNEW, SK_DELAY, SK_RESETHK, SK_ACCMODE, SK_COLOR, SK_THEME, SK_DDBTN, SK_DDOPT, SK_HKDEL, SK_HKADD, SK_RTSRC, SK_RTDST, SK_RTDELAY, SK_NLSL, SK_ARR, SK_ARRVIEW, SK_CHIP, SK_MS };
 static int g_sddOpen = -1;
 static float g_sddScroll = 0, g_sddMax = 0;   // an open list taller than the window scrolls on its own
 static RectF g_sddRect;
-static float g_segPos[3] = {-1, -1, -1};   // animated pill position: theme, style, accent
+static float g_segPos[4] = {-1, -1, -1, -1};   // animated pill position: theme, style, accent, arrangement view
 static float SegPos(int which, int target) {   // eases towards the selected option; keeps repainting until it gets there
     float& p = g_segPos[which];
     if (p < 0) p = (float)target;
@@ -4506,6 +5857,7 @@ static void RtDisconnect(const RtLine& l) {   // clicked a line: that sound stop
 }
 static PointF g_rtMouse;
 static int g_editDelay = -1;    // speaker whose delay is being typed
+static int g_editMs = -1;       // Settings › Flyouts: which time is being typed (0 stay, 1 animation)
 static std::vector<int> g_hkAddMap;   // "Add a shortcut" list row -> action
 static PointF Bez(const RtLine& l, float t) { float u = 1 - t; return PointF(u*u*u*l.p[0].X + 3*u*u*t*l.p[1].X + 3*u*t*t*l.p[2].X + t*t*t*l.p[3].X,
                                                                         u*u*u*l.p[0].Y + 3*u*u*t*l.p[1].Y + 3*u*t*t*l.p[2].Y + t*t*t*l.p[3].Y); }
@@ -4571,6 +5923,17 @@ static bool HandleCaptureKey(UINT vk) {   // shared by the flyout and the settin
 
 static void CommitRename(bool keep) {
     if (!g_edit) return;
+    if (g_editMs >= 0) {   // a time in milliseconds
+        if (keep) {
+            wchar_t b[16]; GetWindowTextW(g_edit, b, 16);
+            int v = _wtoi(b);
+            if (g_editMs == 0) g_fStayMs = std::max(0, std::min(60000, v)); else g_fAnimMs = std::max(0, std::min(2000, v));
+            SaveSettings();
+        }
+        HWND e = g_edit; g_edit = nullptr; g_editMs = -1; DestroyWindow(e);
+        if (g_set) InvalidateRect(g_set, nullptr, FALSE);
+        return;
+    }
     if (g_editDelay >= 0) {   // typed sync delay
         if (keep && g_editDelay < (int)g_out.size()) {
             wchar_t b[16]; GetWindowTextW(g_edit, b, 16);
@@ -4628,6 +5991,21 @@ static void StartDelayEdit(int i) {
     g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(ShownDelay(g_out[i].id)).c_str(), WS_CHILD | WS_VISIBLE | ES_CENTER | ES_NUMBER, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
     SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
     SendMessageW(g_edit, EM_LIMITTEXT, 3, 0);
+    g_editProc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
+    SendMessageW(g_edit, EM_SETSEL, 0, -1);
+    g_editRect = RectF();
+    InvalidateRect(g_set, nullptr, FALSE);
+    SetFocus(g_edit);
+}
+static void StartMsEdit(int id) {
+    CommitRename(true);
+    if (!g_set) return;
+    g_editMs = id;
+    if (g_editFont) DeleteObject(g_editFont);
+    g_editFont = CreateFontW(-(int)S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(id == 0 ? g_fStayMs : g_fAnimMs).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
+    SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
+    SendMessageW(g_edit, EM_LIMITTEXT, 5, 0);
     g_editProc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
     SendMessageW(g_edit, EM_SETSEL, 0, -1);
     g_editRect = RectF();
@@ -4699,7 +6077,7 @@ static void PaintSettings(HDC hdc) {
             bool sel = g_setPage == i;
             if (sel) { FillRound(g, T.subtle2, r, S(6)); FillRound(g, T.accent, RectF(r.X, r.Y + S(10), S(3), S(16)), S(1.5f)); }
             else if (isHover(SK_NAV, i)) FillRound(g, T.subtle, r, S(6));
-            static const char* navIcons[SP_COUNT] = {"gear", "speaker", "monitor", "palette", "info"};
+            static const char* navIcons[SP_COUNT] = {"gear", "speaker", "monitor", "mFlyout", "palette", "info"};
             Icon(g, navIcons[i], S(16), T.t1, r.X + S(20), r.Y + r.Height / 2);
             Text(g, SP_NAMES[i], sel ? &fNav600 : &fBody13, T.t1, RectF(r.X + S(39), r.Y, r.Width - S(44), r.Height));
         }
@@ -4780,6 +6158,17 @@ static void PaintSettings(HDC hdc) {
             add(SK_SWITCH, id, r);
             draw(r, isHover(SK_SWITCH, id) ? cardHover : card);
             switchRight(r, on);
+            cardEnd(r);
+        };
+        auto msCard = [&](int id, const wchar_t* t, const wchar_t* d, int v) {   // a time, typed in milliseconds
+            RectF r; auto draw = cardStart(t, d, S(130), -1, r); draw(r, card);
+            RectF b(r.X + r.Width - S(18) - S(130), r.Y + r.Height / 2 - S(16), S(130), S(32));
+            bool ed = g_editMs == id;
+            add(SK_MS, id, b);
+            FillRound(g, ed || isHover(SK_MS, id) ? T.subtle3 : T.subtle2, b, S(6));
+            if (ed) { Pen ep(T.accent, S(1.5f)); GraphicsPath gp; AddRound(gp, b, S(6)); g.DrawPath(&ep, &gp); editRect = RectF(b.X + S(12), b.Y + S(8), b.Width - S(50), S(17)); }
+            else { wchar_t n[16]; swprintf(n, 16, L"%d", v); Text(g, n, &fBody13, T.t1, RectF(b.X + S(12), b.Y, b.Width - S(48), b.Height)); }
+            Text(g, L"ms", &fBody13, T.t3, RectF(b.X + b.Width - S(36), b.Y, S(26), b.Height), StringAlignmentFar);
             cardEnd(r);
         };
         auto linkCard = [&](int id, const wchar_t* t, const wchar_t* d) {
@@ -5020,6 +6409,49 @@ static void PaintSettings(HDC hdc) {
         }
         case SP_DISPLAY: {
             switchCard(3, L"Restore display brightness", L"Put a monitor back to its last brightness and contrast when it reconnects or the PC wakes", g_restoreBright);
+            if (std::any_of(g_mons.begin(), g_mons.end(), [](const MonUI& m) { return m.internal && m.rates.size() > 1; }))
+                switchCard(26, L"Lower refresh rate on battery", L"The laptop screen drops to 60 Hz on battery to last longer, and goes back to its highest when you plug in", g_rateBat, 9);
+            if (ArrReady()) {   // two screens: drawn at their real size, drag the other one where it is on your desk
+                h4(L"Arrangement");
+                snote(L"Windows places screens by their pixels, so a small sharp laptop screen can look bigger than a large monitor and the edges between them don't line up. Here they're drawn at their real size: drag the other screen to where it is on your desk, then Apply.");
+                top(0);
+                RectF r(x0, y, cw, S(300)); FillRound(g, card, r, S(6));
+                std::vector<const wchar_t*> LV = {L"Real size", L"As Windows has it"};
+                Text(g, g_arrPix ? L"How Windows lines them up now" : L"Real size, as on your desk", &fBody, T.t1, RectF(r.X + S(18), r.Y + S(12), r.Width - S(36), S(32)));
+                segc(RectF(r.X, r.Y + S(12), r.Width, S(32)), 3, SK_ARRVIEW, LV, g_arrPix ? 1 : 0);
+                RectF ma(r.X + S(18), r.Y + S(56), r.Width - S(36), r.Height - S(56) - S(60));
+                const MonUI& Mm = g_mons[g_arrMain.mon]; const MonUI& Mo = g_mons[g_arrOther.mon];
+                float mw, mh, ow, oh, ox, oy;   // the other screen's box relative to the main one (mm, or pixels in Windows' view)
+                if (g_arrPix) { mw = (float)(Mm.rc.right - Mm.rc.left); mh = (float)(Mm.rc.bottom - Mm.rc.top); ow = (float)(Mo.rc.right - Mo.rc.left); oh = (float)(Mo.rc.bottom - Mo.rc.top); ox = (float)(Mo.rc.left - Mm.rc.left); oy = (float)(Mo.rc.top - Mm.rc.top); }
+                else {
+                    mw = g_arrMain.wmm; mh = g_arrMain.hmm; ow = g_arrOther.wmm; oh = g_arrOther.hmm;
+                    ox = g_arrSide == 1 ? mw : g_arrSide == 3 ? -ow : mw / 2 + g_arrOff - ow / 2;
+                    oy = g_arrSide == 0 ? -oh : g_arrSide == 2 ? mh : mh / 2 + g_arrOff - oh / 2;
+                }
+                float bx0 = std::min(0.f, ox), by0 = std::min(0.f, oy), bx1 = std::max(mw, ox + ow), by1 = std::max(mh, oy + oh);
+                float k = std::min(ma.Width / (bx1 - bx0), ma.Height / (by1 - by0)) * 0.92f;
+                float cx = ma.X + (ma.Width - (bx1 - bx0) * k) / 2 - bx0 * k, cy = ma.Y + (ma.Height - (by1 - by0) * k) / 2 - by0 * k;
+                g_arrScale = k;
+                g_arrRMain = RectF(cx, cy, mw * k, mh * k); g_arrROther = RectF(cx + ox * k, cy + oy * k, ow * k, oh * k);
+                auto screen = [&](RectF sr, int num, const MonUI& mon, const ArrScreen& as, bool other) {
+                    RectF in(sr.X + S(1), sr.Y + S(1), sr.Width - S(2), sr.Height - S(2));
+                    FillRound(g, other && (g_arrDrag || isHover(SK_ARR, 0)) ? T.subtle3 : T.subtle2, in, S(5));
+                    Pen pn(other && g_arrDrag ? T.accent : WithAlpha(T.t1, 90), S(other && g_arrDrag ? 1.5f : 1)); GraphicsPath gp; AddRound(gp, in, S(5)); g.DrawPath(&pn, &gp);
+                    wchar_t nb[4]; swprintf(nb, 4, L"%d", num); Text(g, nb, &fTitle, T.t1, RectF(in.X, in.Y + in.Height / 2 - S(26), in.Width, S(30)), StringAlignmentCenter);
+                    wchar_t sub[96]; swprintf(sub, 96, L"%ls \u00B7 %.0f\u2033", mon.name.c_str(), hypotf(as.wmm, as.hmm) / 25.4f);
+                    if (tw(sub, &fDesc) > in.Width - S(12)) swprintf(sub, 96, L"%.0f\u2033", hypotf(as.wmm, as.hmm) / 25.4f);   // small on the map: just its size
+                    if (in.Height > S(54)) Text(g, sub, &fDesc, T.t3, RectF(in.X + S(4), in.Y + in.Height / 2 + S(4), in.Width - S(8), S(16)), StringAlignmentCenter);
+                    if (other && !g_arrPix) add(SK_ARR, 0, sr);
+                };
+                screen(g_arrRMain, g_arrMain.mon + 1, Mm, g_arrMain, false);
+                screen(g_arrROther, g_arrOther.mon + 1, Mo, g_arrOther, true);
+                float by = r.Y + r.Height - S(18) - S(32);
+                float aw = sbtnW(L"Apply", true), cw2 = sbtnW(L"Centre it");
+                sbtn(SK_BUTTON, 32, RectF(r.X + r.Width - S(18) - aw, by, aw, S(32)), L"Apply", true, g_arrDirty);
+                sbtn(SK_BUTTON, 31, RectF(r.X + r.Width - S(18) - aw - S(10) - cw2, by, cw2, S(32)), L"Centre it", false, !g_arrPix);
+                Text(g, g_arrMsg.c_str(), &fDesc, T.t3, RectF(r.X + S(18), by, r.Width - S(36) - aw - cw2 - S(20), S(32)));
+                after(r.Height, S(4));
+            }
             h4(L"Colour");
             snote(L"Per screen. Night light adds a soft orange tint that's easier on the eyes; set how strong it is here, and switch it on from the moon button in the Display tab or by schedule.");
             for (int i = 0; i < (int)g_mons.size(); i++) {
@@ -5060,6 +6492,27 @@ static void PaintSettings(HDC hdc) {
                 after(r.Height, S(4));
             }
             ddCard(5, L"Turn night light on automatically", L"Screens with night light switched on follow this", {L"Never — only with the moon button", L"Evenings (7 pm – 7 am)", L"Sunset to sunrise"}, g_nightAuto, 5);
+            {   // Screen off and Party screen
+                h4(L"Screen off and Party screen");
+                snote(L"What your screens show when you're not using them.");
+                auto names = ScreenNames();
+                ddCard(16, L"Turn off displays", L"When the Turn off button and its shortcut switch your screens off. With a delay, the button counts down and a click cancels", {L"Right away", L"After 15 minutes", L"After 30 minutes", L"After 1 hour", L"After 2 hours"}, g_offDelay, 6);
+                switchCard(29, L"Switch monitors fully off", L"Also sends each monitor its own power-down command (DDC/CI), so even an LCD's backlight goes dark. Any key or mouse move turns them back on; if one stays dark, press its power button. Some DisplayPort monitors disconnect while off, which can move your windows. Laptop screens go to their lowest brightness", g_offFull, 14);
+                switchCard(27, L"Clock on the black screen", L"The time and date in dim grey, like a phone's always-on screen. It drifts a little every minute so OLED screens don't burn in. Best on OLED; other screens keep their backlight on", g_offClock, 7);
+                if (g_offClock) {
+                    std::vector<std::wstring> o = {L"Every screen", L"Main screen"}; int cur = g_clockScr == L"*" ? 0 : 1;
+                    for (auto& n : names) { o.push_back(n); if (n == g_clockScr) cur = (int)o.size() - 1; }
+                    ddCard(17, L"Show the clock on", L"The other screens just go black", o, cur, -1);
+                }
+                btnCard(L"Party screen", L"Turns a screen into big blurred light that moves with the music, in the cover's colours. Any key or mouse move ends it. Start it from the Display tab or a shortcut", SK_BUTTON, 30, L"Show now");
+                {
+                    std::vector<std::wstring> o = {L"Main screen"}; int cur = 0;
+                    for (auto& n : names) { o.push_back(n); if (n == g_partyScr) cur = (int)o.size() - 1; }
+                    ddCard(18, L"Party screen shows on", L"", o, cur, -1);
+                }
+                ddCard(19, L"Look", L"All of them follow the music and use the cover's colours", {PARTY_LOOKS[0], PARTY_LOOKS[1], PARTY_LOOKS[2], PARTY_LOOKS[3]}, g_partyLook, -1);
+                switchCard(28, L"Show what's playing", L"The cover, title and artist, small in a corner", g_partyInfo);
+            }
             h4(L"Profiles");
             snote(L"Save the brightness and contrast of every display, then switch with one click from the Display tab.");
             for (int i = 0; i < (int)g_prof.size(); i++) {
@@ -5079,6 +6532,53 @@ static void PaintSettings(HDC hdc) {
             {
                 bool can = (int)g_prof.size() < MAX_PROFILES;
                 btnCard(can ? L"New profile from the current settings" : L"You can keep up to 8 profiles", L"", SK_PNEW, 0, L"+ New profile", true, can);
+            }
+            break;
+        }
+        case SP_FLYOUTS: {
+            snote(L"Small windows that appear by themselves, never take focus and stay hidden while a game or video runs full screen.");
+            switchCard(20, L"Media", L"When you press a media key: what's playing, its player, the controls and where you are in the song", g_popMedia, 11);
+            switchCard(21, L"Up next", L"When the next song starts on its own. Pressing next or previous shows Media instead", g_popNext, 12);
+            switchCard(22, L"Lock keys", L"When Caps Lock, Num Lock, Scroll Lock or Insert is pressed", g_popLock, 13);
+            {   // try them
+                float b1 = sbtnW(L"Media"), b2 = sbtnW(L"Song ends"), b3 = sbtnW(L"Lock keys");
+                RectF r; auto draw = cardStart(L"Try them", L"Pressing the keys works too", b1 + b2 + b3 + S(20), -1, r); draw(r, card);
+                float bx = r.X + r.Width - S(18), cy = r.Y + r.Height / 2 - S(16);
+                bx -= b3; sbtn(SK_BUTTON, 22, RectF(bx, cy, b3, S(32)), L"Lock keys");
+                bx -= S(10) + b2; sbtn(SK_BUTTON, 21, RectF(bx, cy, b2, S(32)), L"Song ends");
+                bx -= S(10) + b1; sbtn(SK_BUTTON, 20, RectF(bx, cy, b1, S(32)), L"Media");
+                cardEnd(r);
+            }
+            h4(L"Look and place");
+            ddCard(10, L"Position", L"", {L"Bottom centre", L"Bottom left", L"Bottom right", L"Top centre", L"Top left", L"Top right"}, g_fPos, -1);
+            ddCard(11, L"Screen", L"", {L"Main screen", L"Screen with the mouse", L"Screen with the active window"}, g_fScreen, -1);
+            msCard(0, L"Stay on screen", L"In milliseconds, longer while the mouse is on them. 0 keeps the media flyout until you close it", g_fStayMs);
+            msCard(1, L"Animation", L"How long they take to slide in and out, in milliseconds. 0 for no motion", g_fAnimMs);
+            switchCard(23, L"Colours from the cover", L"Buttons and the progress bar take the cover's colour; off uses Knob's accent colour", g_fCover);
+            snote(L"Solid or Glass and light or dark follow Settings \u203A Appearance.");
+            h4(L"Media");
+            ddCard(14, L"Layout", L"Compact is one slim row: cover, title and play controls", {L"Standard", L"Compact"}, g_fLayout, -1);
+            ddCard(15, L"Cover glow", L"The cover's colours behind the flyout. The moving ones only move while the flyout is on screen", {L"Off", L"Rising glow", L"Blurred cover", L"Aurora", L"Edge light", L"Pulse with the music"}, g_fGlow, -1);
+            if (g_fLayout == 0) {
+                switchCard(24, L"Centre the title and artist", L"", g_fCentre);
+                switchCard(25, L"Show the player", L"Its name, and a list to switch when more than one is playing", g_fPlayer);
+            }
+            h4(L"Lock keys");
+            {   // which keys show a flyout: one chip each
+                static const wchar_t* kn[4] = {L"Caps Lock", L"Num Lock", L"Scroll Lock", L"Insert"};
+                std::vector<float> ws; float total = 0; for (auto* k : kn) { ws.push_back(S(24) + tw(k, &fDesc)); total += ws.back(); }
+                total += S(6) * 3;
+                RectF r; auto draw = cardStart(L"Keys", L"Which keys show a flyout", total, -1, r); draw(r, card);
+                float bx = r.X + r.Width - S(18) - total, cy = r.Y + r.Height / 2 - S(14);
+                for (int i = 0; i < 4; i++) {
+                    RectF c(bx, cy, ws[i], S(28)); add(SK_CHIP, i, c);
+                    bool on = (g_lkKeys >> i) & 1, hv = isHover(SK_CHIP, i);
+                    FillRound(g, on ? WithAlpha(T.accent, hv ? 70 : 48) : (hv ? T.subtle3 : T.subtle2), c, S(14));
+                    if (on) { Pen pn(T.accent, S(1)); GraphicsPath gp; AddRound(gp, RectF(c.X + S(0.5f), c.Y + S(0.5f), c.Width - S(1), c.Height - S(1)), S(13.5f)); g.DrawPath(&pn, &gp); }
+                    Text(g, kn[i], on ? &fDesc600 : &fDesc, on ? T.t1 : T.t2, c, StringAlignmentCenter);
+                    bx += ws[i] + S(6);
+                }
+                cardEnd(r);
             }
             break;
         }
@@ -5281,6 +6781,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_sDragDelay >= 0) { SettingsDelayAt(x); return 0; }
         if (g_sDragColor) { SettingsColorAt(x); return 0; }
         if (g_sDragNl >= 0) { SettingsNlAt(x); return 0; }
+        if (g_arrDrag) {   // the other screen follows the mouse, snapping to the main screen's nearest side
+            float cx = g_arrGrabC.X + (x - g_arrGrab.X), cy = g_arrGrabC.Y + (y - g_arrGrab.Y);
+            float mx = (cx - (g_arrRMain.X + g_arrRMain.Width / 2)) / g_arrScale, my = (cy - (g_arrRMain.Y + g_arrRMain.Height / 2)) / g_arrScale;
+            float hx = (g_arrMain.wmm + g_arrOther.wmm) / 2, hy = (g_arrMain.hmm + g_arrOther.hmm) / 2;
+            if (fabsf(my) / hy > fabsf(mx) / hx) { g_arrSide = my < 0 ? 0 : 2; g_arrOff = mx; } else { g_arrSide = mx > 0 ? 1 : 3; g_arrOff = my; }
+            if (fabsf(g_arrOff) < 15) g_arrOff = 0;   // centred, give or take 1.5 cm
+            ArrClamp(); g_arrDirty = true; g_arrMsg.clear();
+            InvalidateRect(h, nullptr, FALSE); return 0;
+        }
         if (g_rtDrag != RT_NONE || g_rtDragDst >= 0) { g_rtMouse = PointF(x, y); InvalidateRect(h, nullptr, FALSE); return 0; }
         if (g_setPage == SP_SOUND) { int ln = SettingsHit(x, y) < 0 ? RtLineAt(x, y) : -1; if (ln != g_rtHoverLine) { g_rtHoverLine = ln; InvalidateRect(h, nullptr, FALSE); } }
         int hv = SettingsHit(x, y);
@@ -5293,7 +6802,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
         int hi = SettingsHit(x, y);
         if (g_capture >= 0 && (hi < 0 || g_sItems[hi].kind != SK_HK)) { g_capture = -1; RegisterHotkeys(); }
-        if (g_edit && (hi < 0 || (g_sItems[hi].kind != SK_PRENAME && g_sItems[hi].kind != SK_RTDELAY))) CommitRename(true);
+        if (g_edit && (hi < 0 || (g_sItems[hi].kind != SK_PRENAME && g_sItems[hi].kind != SK_RTDELAY && g_sItems[hi].kind != SK_MS))) CommitRename(true);
         if (hi < 0 && g_setPage == SP_SOUND && g_sddOpen < 0) {   // click a line: that sound stops playing there
             int ln = RtLineAt(x, y);
             if (ln >= 0) {
@@ -5334,6 +6843,15 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 g_sc.push_back(s2); g_capture = (int)g_sc.size() - 1; UnregisterHotkeys(); SaveSettings();
             }
             if (dd == 5) { g_nightAuto = std::min(2, k); SaveSettings(); GeoRefresh(); ApplyNight(); }
+            if (dd >= 10 && dd <= 15 && dd != 12 && dd != 13) { int* v[6] = {&g_fPos, &g_fScreen, nullptr, nullptr, &g_fLayout, &g_fGlow}; *v[dd - 10] = k; if (g_popShown) PopEnd(); SaveSettings(); }
+            if (dd == 16) { g_offDelay = std::max(0, std::min(4, k)); g_newSeen |= 1 << 6; SaveSettings(); }
+            if (dd == 17 || dd == 18) {
+                auto names = ScreenNames(); std::wstring v;
+                if (dd == 17) v = k == 0 ? L"*" : k == 1 ? L"" : (k - 2 < (int)names.size() ? names[k - 2] : L"");
+                else v = k >= 1 && k - 1 < (int)names.size() ? names[k - 1] : L"";
+                (dd == 17 ? g_clockScr : g_partyScr) = v; SaveSettings();
+            }
+            if (dd == 19) { g_partyLook = std::max(0, std::min(3, k)); SaveSettings(); }
             if (dd >= 1000 && dd - 1000 < (int)g_sc.size()) {   // which speaker / profile a shortcut uses
                 Shortcut& s2 = g_sc[dd - 1000];
                 if (HkParamKind(s2.act) == 1 && k < (int)g_out.size()) s2.param = OutLabel(g_out[k]);
@@ -5349,6 +6867,16 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (it.id == 1) { g_keepAwake = !g_keepAwake; ApplyKeepAwake(); }
             else if (it.id == 2) SetStartup(!StartupEnabled());
             else if (it.id == 3) g_restoreBright = !g_restoreBright;
+            else if (it.id == 20) { g_popMedia = !g_popMedia; g_newSeen |= 1 << 11; FlyoutKeysSync(); }
+            else if (it.id == 21) { g_popNext = !g_popNext; g_newSeen |= 1 << 12; FlyoutKeysSync(); }
+            else if (it.id == 22) { g_popLock = !g_popLock; g_newSeen |= 1 << 13; FlyoutKeysSync(); }
+            else if (it.id == 23) { g_fCover = !g_fCover; BuildGlows(); }
+            else if (it.id == 24) g_fCentre = !g_fCentre;
+            else if (it.id == 25) g_fPlayer = !g_fPlayer;
+            else if (it.id == 26) { g_rateBat = !g_rateBat; g_newSeen |= 1 << 9; RateBatApply(); }
+            else if (it.id == 27) { g_offClock = !g_offClock; g_newSeen |= 1 << 7; }
+            else if (it.id == 28) g_partyInfo = !g_partyInfo;
+            else if (it.id == 29) { g_offFull = !g_offFull; g_newSeen |= 1 << 14; }
             SaveSettings();
             break;
         case SK_LINK:
@@ -5363,6 +6891,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (it.id == 7) { OneSpeaker(); g_calStatus.clear(); }
             if (it.id == 6) ShellExecuteW(nullptr, L"open", L"https://github.com/" UPDATE_REPO L"/raw/main/dist/Knob.exe", nullptr, nullptr, SW_SHOWNORMAL);
             if (it.id == 4) StartUpdate();
+            if (it.id == 20 || it.id == 21) { MediaStart(); g_popTry = true; if (g_popShown) PopEnd(); g_popTry = true; PopShow(it.id == 20 ? POP_MEDIA : POP_NEXT); }
+            if (it.id == 22) {   // the next lock key that's switched on, alternating on and off
+                static int tk = -1; for (int n = 0; n < 4; n++) { tk = (tk + 1) % 4; if (g_lkKeys & (1 << tk)) break; }
+                if (g_lkKeys & (1 << tk)) { bool was = g_lockPop[tk]; g_lockPop[tk] = !was; bool keep = g_popLock; g_popLock = true; PopLockKey(tk, !was); g_popLock = keep; }
+            }
+            if (it.id == 30) PartyStart();
+            if (it.id == 31) { g_arrOff = 0; g_arrDirty = true; g_arrMsg.clear(); }
+            if (it.id == 32) { g_arrMsg = ArrApply() ? L"Done \u00B7 Windows has the new arrangement" : L"Windows didn't take the new arrangement"; BrightRequest(true, false); }
             if (it.id == 2 && MessageBoxW(h, L"Reset all Knob settings to their defaults? Knob will restart.", APP_NAME, MB_YESNO | MB_ICONQUESTION) == IDYES) {
                 g_noSave = true; DeleteFileW(g_iniPath.c_str()); g_restartAfterExit = true;
                 DestroyWindow(g_hwnd); return 0;
@@ -5392,6 +6928,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case SK_HKDEL: if (it.id < (int)g_sc.size()) { UnregisterHotkeys(); g_sc.erase(g_sc.begin() + it.id); g_capture = -1; RegisterHotkeys(); SaveSettings(); } break;
         case SK_HKADD: g_sddOpen = g_sddOpen == 4 ? -1 : 4; InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_NLSL: g_sDragNl = it.id; SetCapture(h); SettingsNlAt(x); return 0;
+        case SK_ARR: {   // pick up the other screen
+            g_arrDrag = true; g_arrGrab = PointF(x, y);
+            g_arrGrabC = PointF(g_arrROther.X + g_arrROther.Width / 2, g_arrROther.Y + g_arrROther.Height / 2);
+            SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
+        }
+        case SK_ARRVIEW: g_arrPix = it.id == 1; break;
+        case SK_CHIP: g_lkKeys ^= 1 << it.id; SaveSettings(); break;
+        case SK_MS: StartMsEdit(it.id); return 0;
         case SK_RTSRC: g_rtSel = it.id; g_rtSelDst = -1; g_rtDrag = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
         case SK_RTDST:   // a speaker: select it (its sounds light up), or drag from it to a sound
             g_rtSelDst = it.id; g_rtSel = RT_NONE; g_rtDragDst = it.id; g_rtMouse = PointF(x, y); SetCapture(h); InvalidateRect(h, nullptr, FALSE); return 0;
@@ -5416,6 +6960,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_sDragDelay >= 0) { g_sDragDelay = -1; ReleaseCapture(); SaveSettings(); RestartRouter(); SettingsChanged(); }
         if (g_sDragColor) { g_sDragColor = 0; ReleaseCapture(); SaveSettings(); UpdateTrayIcon(); SettingsChanged(); }
         if (g_sDragNl >= 0) { g_sDragNl = -1; ReleaseCapture(); SaveSettings(); SettingsChanged(); }
+        if (g_arrDrag) { g_arrDrag = false; ReleaseCapture(); InvalidateRect(h, nullptr, FALSE); }
         return 0;
     case WM_MOUSEWHEEL:
         if (g_sddOpen >= 0) {   // a list is open: the wheel moves the list (if it scrolls), never the page behind it
@@ -5440,7 +6985,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_STARTEDIT: StartRename((int)wp); return 0;
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wp;
-        COLORREF bg = g_setTheme.dark ? RGB(43, 43, 43) : RGB(251, 251, 251);
+        COLORREF bg = g_editMs >= 0 ? (g_setTheme.dark ? RGB(69, 69, 69) : RGB(228, 228, 228)) : g_setTheme.dark ? RGB(43, 43, 43) : RGB(251, 251, 251);   // the ms box is a shade lighter than its card
         SetTextColor(dc, g_setTheme.dark ? RGB(255, 255, 255) : RGB(26, 26, 26));
         SetBkColor(dc, bg);
         if (g_editBrush) DeleteObject(g_editBrush);
@@ -5588,6 +7133,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_set) InvalidateRect(g_set, nullptr, FALSE);
         return 0;
     }
+    case WM_APP_MEDIA: MediaApply((MediaSnap*)lp); if (g_party) PartyInfoBitmap(); return 0;
+    case WM_INPUT: {   // flyouts: a media key or a lock key, heard without taking it
+        RAWINPUT ri; UINT sz = sizeof(ri);
+        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 && ri.header.dwType == RIM_TYPEKEYBOARD) {
+            static std::set<USHORT> down;   // held keys repeat: only the first press counts
+            USHORT vk = ri.data.keyboard.VKey;
+            if (ri.data.keyboard.Flags & RI_KEY_BREAK) down.erase(vk);
+            else if (down.insert(vk).second) FlyoutKey(vk);
+        }
+        return DefWindowProcW(h, msg, wp, lp);
+    }
     case WM_APP_FOCUSPANEL:
         if (g_visible && !g_set) { SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); ForceForeground(h); }
         return 0;
@@ -5608,8 +7164,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         MonMsg* m = (MonMsg*)lp;
         if (g_demo) {   // the design's two screens
             m->mons.clear();
-            MonUI a; a.name = L"Built-in display"; a.detail = L"Laptop panel"; a.pct = 62; a.ok = true; a.internal = true; a.hdrOk = true; a.rates = {60, 120}; a.rate = 120; a.gdi = L"\\\\.\\DISPLAY1";
-            MonUI b; b.name = L"DELL G2724D"; b.detail = L"DisplayPort"; b.pct = 100; b.con = 50; b.ok = true; b.hasCon = true; b.hdrOk = true; b.rates = {60, 120, 144, 165}; b.rate = 165;
+            MonUI a; a.rc = {0, 0, 1920, 1200}; a.name = L"Built-in display"; a.detail = L"Laptop panel"; a.pct = 62; a.ok = true; a.internal = true; a.hdrOk = true; a.rates = {60, 120}; a.rate = 120; a.gdi = L"\\\\.\\DISPLAY1";
+            MonUI b; b.rc = {-320, -1440, 2240, 0}; b.name = L"DELL G2724D"; b.detail = L"DisplayPort"; b.pct = 100; b.con = 50; b.ok = true; b.hasCon = true; b.hdrOk = true; b.rates = {60, 120, 144, 165}; b.rate = 165;
             b.inputs = {15, 17, 18}; b.input = 15; b.gdi = L"\\\\.\\DISPLAY2";
             m->mons.push_back(a); m->mons.push_back(b);
         }
@@ -5688,7 +7244,14 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_IDENT) {
             KillTimer(h, TIMER_IDENT);
             CloseIdentify();
-        } else if (wp == TIMER_SCREENOFF) {
+        } else if (wp == TIMER_OFFAT) {   // Turn off displays is counting down
+            if (!g_offAt) { KillTimer(h, TIMER_OFFAT); return 0; }
+            if ((int)(GetTickCount() - g_offAt) >= 0) { ScreenOffNow(); return 0; }
+            if (g_visible && g_tab == T_DISPLAY) InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        } else if (wp == TIMER_POPKEY) { KillTimer(h, TIMER_POPKEY); PopShow(POP_MEDIA); return 0; }
+        else if (wp == TIMER_LOCKKEY) { KillTimer(h, TIMER_LOCKKEY); FlyoutLockNow(); return 0; }
+        else if (wp == TIMER_SCREENOFF) {
             KillTimer(h, TIMER_SCREENOFF);
             BlackoutStart();
             return 0;
@@ -5840,7 +7403,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case H_OFFEXT: case H_OFFDUP:
             if (!g_mons.empty()) { HideFlyout(); SetDisplayMode(0, ht.h == H_OFFEXT ? -1 : -3); CountScreens(); BrightRequest(true, false); }
             return 0;
-        case H_SCREENOFF: HideFlyout(); SetTimer(h, TIMER_SCREENOFF, 500, nullptr); return 0;   // after the click settles, or the mouse wakes them
+        case H_SCREENOFF: ScreenOffRequest(); return 0;   // right away, or the timer set in Settings (a click while counting cancels)
+        case H_PARTY: HideFlyout(); PartyStart(); return 0;
         case H_TAB: SetTab(ht.idx); return 0;
         case H_MICALL: MicToggleMute(); break;
         case H_UPDATE: StartUpdate(); break;
@@ -5917,14 +7481,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SETTINGCHANGE:
         if (lp && lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet") == 0) {
             LoadTheme(); ApplyStyle(); UpdateTrayIcon(); AllowDarkMenus();
+            if (g_cover) { CoverColours(); BuildGlows(); }
+            if (g_pop && g_popShown) { PopApplyStyle(); InvalidateRect(g_pop, nullptr, FALSE); }
             if (g_set) { BuildSettingsTheme(); ApplySettingsStyle(); }
         }
         return 0;
     case WM_DWMCOLORIZATIONCOLORCHANGED: LoadTheme(); if (g_visible) InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_POWERBROADCAST:
         if (wp == PBT_APMRESUMEAUTOMATIC) { g_restoreAllNext = true; BrightRequest(true, false); PostMessageW(h, WM_APP_AUDIOCHANGED, 0, 0); }
+        if (wp == PBT_APMPOWERSTATUSCHANGE) RateBatApply();   // plugged in or unplugged
         return TRUE;
-    case WM_DESTROY: BlackoutEnd(true); StopMicRouters(); CalMuteOthers(false); PostQuitMessage(0); return 0;   // never leave the screens dark; never leave a mic playing
+    case WM_DESTROY:
+        BlackoutEnd(true); StopMicRouters(); CalMuteOthers(false);
+        if (g_party) DestroyWindow(g_party);
+        if (g_pop) { if (g_popShown) PopEnd(); DestroyWindow(g_pop); g_pop = nullptr; }
+        PostQuitMessage(0); return 0;   // never leave the screens dark; never leave a mic playing
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -6037,6 +7608,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     g_volCb = new VolCallback;
     if (g_enum) { g_notif = new NotifClient; g_enum->RegisterEndpointNotificationCallback(g_notif); }
     InitializeCriticalSection(&g_bcs);
+    InitializeCriticalSection(&g_mcs);
     g_bEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     HANDLE bthread = CreateThread(nullptr, 0, BrightProc, nullptr, 0, nullptr);
     BrightRequest(true, false);
@@ -6048,6 +7620,17 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     TrayAdd();
     UpdateTrayTip();
     RegisterHotkeys();
+    FlyoutKeysSync();   // media and lock keys, if those flyouts are on
+    if (g_demo) {   // the design's sample song, for side-by-side checks
+        MediaSnap* m = new MediaSnap; MSess a; a.app = L"Brave"; a.aumid = L"brave"; a.title = L"Alfaaz | Hamza Malik x Zain Zohaib"; a.artist = L"Hamza Malik";
+        a.status = 4; a.canPP = a.canNext = a.canPrev = a.canShuf = a.canRep = a.canSeek = true; a.end = 2310000000LL; a.pos = 830000000LL;
+        FILETIME ft; GetSystemTimeAsFileTime(&ft); a.updated = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+        MSess b = a; b.app = L"Spotify"; b.aumid = L"spotify"; b.title = L"Kho Gaye Hum Kahan"; b.artist = L"Prateek Kuhad"; b.status = 5;
+        m->s = {a, b}; m->cur = 0; m->newCover = true;
+        m->cover = new Gdiplus::Bitmap(128, 128, PixelFormat32bppPARGB);
+        { Graphics g(m->cover); LinearGradientBrush lb(PointF(0, 0), PointF(128, 128), Color(255, 107, 128, 54), Color(255, 196, 180, 110)); g.FillRectangle(&lb, 0, 0, 128, 128); }
+        MediaApply(m);
+    }
     SetTimer(g_hwnd, TIMER_UPDCHECK, 15000, nullptr);   // first check 15 s after start
     SetTimer(g_hwnd, TIMER_NIGHT, 60000, nullptr);      // night light: follow the evening schedule, and come back if Windows resets it
     SetTimer(g_hwnd, TIMER_TRAYPIN, 3000, nullptr);
@@ -6057,6 +7640,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
 
     SaveSettings();
+    if (g_mediaThread) { PostThreadMessageW(g_mediaTid, MC_QUIT, 0, 0); WaitForSingleObject(g_mediaThread, 2000); CloseHandle(g_mediaThread); g_mediaThread = nullptr; }
     StopRouter();
     g_appExtra.clear(); RestartAppRouters();   // stop every app copy
     ResetGamma(); g_dim.clear(); ApplyDim();     // screens back to normal colour, no dark layer
