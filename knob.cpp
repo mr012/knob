@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.7"
+#define APP_VERSION L"1.42.8"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -141,7 +141,7 @@ static bool g_partyInfo = true;         // the cover, title and artist small in 
 static bool g_rateBat = false;          // the laptop screen drops to 60 Hz on battery and goes back to its highest on power
 // flyouts (Settings › Flyouts): off until you switch them on, so they never double up with another flyout app
 static bool g_popMedia = false, g_popNext = false, g_popLock = false;
-static int g_fStayMs = 2000, g_fAnimMs = 300;   // how long flyouts stay (0 = media stays until you close it) and how long they take to slide in (0 = no motion)
+static int g_fStayMs = 2000, g_fAnimMs = 300, g_lkStayMs = 2000;   // g_lkStayMs: how long the lock-key flyout stays, apart from the others;   // how long flyouts stay (0 = media stays until you close it) and how long they take to slide in (0 = no motion)
 static int g_fPos = 0, g_fScreen = 0, g_fLayout = 0, g_fGlow = 1, g_lkKeys = 15;   // g_lkKeys: Caps 1, Num 2, Scroll 4, Insert 8
 static bool g_fCover = true, g_fCentre = true, g_fPlayer = true;
 
@@ -353,7 +353,7 @@ static void LoadSettings() {
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
         g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); }   // the old list had Mirror bars second g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
-        g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000);
+        g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000); g_lkStayMs = gi(L"lkstayms", g_fStayMs ? g_fStayMs : 2000, 100, 60000);
         g_fLayout = gi(L"flayout", 0, 0, 1); g_fGlow = gi(L"fglow", 1, 0, 5); g_lkKeys = gi(L"lkkeys", 15, 0, 15);
         g_fCover = gi(L"fcover", 1, 0, 1); g_fCentre = gi(L"fcentre", 1, 0, 1); g_fPlayer = gi(L"fplayer", 1, 0, 1);
     }
@@ -428,7 +428,7 @@ static void SaveSettings() {
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
         WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook2", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
-        wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
+        wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"lkstayms", g_lkStayMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
         wi(L"fcover", g_fCover); wi(L"fcentre", g_fCentre); wi(L"fplayer", g_fPlayer);
     }
     if (g_geoLat < 900) { wchar_t b[64]; swprintf(b, 64, L"%.2f,%.2f,%lld", g_geoLat, g_geoLon, g_geoWhen); WritePrivateProfileStringW(L"main", L"geo", b, g_iniPath.c_str()); }
@@ -5261,7 +5261,7 @@ static void PopHide() {
     g_popDir = -1; g_popT0 = GetTickCount(); PopTimer();
 }
 static void PopArm() {   // how long it stays: the setting, longer while the mouse is on it; media can stay until closed
-    int ms = std::max(0, std::min(60000, g_fStayMs));
+    int ms = g_popKind == POP_LOCK ? std::max(100, std::min(60000, g_lkStayMs)) : std::max(0, std::min(60000, g_fStayMs));
     if (!ms && g_popKind != POP_MEDIA) ms = 2000;
     g_popHideAt = ms ? GetTickCount() + ms : 0;
 }
@@ -6056,7 +6056,7 @@ static void RtDisconnect(const RtLine& l) {   // clicked a line: that sound stop
 }
 static PointF g_rtMouse;
 static int g_editDelay = -1;    // speaker whose delay is being typed
-static int g_editMs = -1;       // Settings › Flyouts: which time is being typed (0 stay, 1 animation)
+static int g_editMs = -1;       // Settings › Flyouts: which time is being typed (0 stay, 1 animation, 2 lock keys stay)
 static std::vector<int> g_hkAddMap;   // "Add a shortcut" list row -> action
 static PointF Bez(const RtLine& l, float t) { float u = 1 - t; return PointF(u*u*u*l.p[0].X + 3*u*u*t*l.p[1].X + 3*u*t*t*l.p[2].X + t*t*t*l.p[3].X,
                                                                         u*u*u*l.p[0].Y + 3*u*u*t*l.p[1].Y + 3*u*t*t*l.p[2].Y + t*t*t*l.p[3].Y); }
@@ -6126,7 +6126,7 @@ static void CommitRename(bool keep) {
         if (keep) {
             wchar_t b[16]; GetWindowTextW(g_edit, b, 16);
             int v = _wtoi(b);
-            if (g_editMs == 0) g_fStayMs = std::max(0, std::min(60000, v)); else g_fAnimMs = std::max(0, std::min(2000, v));
+            if (g_editMs == 0) g_fStayMs = std::max(0, std::min(60000, v)); else if (g_editMs == 2) g_lkStayMs = std::max(100, std::min(60000, v)); else g_fAnimMs = std::max(0, std::min(2000, v));
             SaveSettings();
         }
         HWND e = g_edit; g_edit = nullptr; g_editMs = -1; DestroyWindow(e);
@@ -6202,7 +6202,7 @@ static void StartMsEdit(int id) {
     g_editMs = id;
     if (g_editFont) DeleteObject(g_editFont);
     g_editFont = CreateFontW(-(int)S(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(id == 0 ? g_fStayMs : g_fAnimMs).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
+    g_edit = CreateWindowExW(0, L"EDIT", std::to_wstring(id == 0 ? g_fStayMs : id == 2 ? g_lkStayMs : g_fAnimMs).c_str(), WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 10, 10, g_set, (HMENU)1, g_inst, nullptr);
     SendMessageW(g_edit, WM_SETFONT, (WPARAM)g_editFont, TRUE);
     SendMessageW(g_edit, EM_LIMITTEXT, 5, 0);
     g_editProc = (WNDPROC)SetWindowLongPtrW(g_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
@@ -6752,7 +6752,7 @@ static void PaintSettings(HDC hdc) {
             h4(L"Look and place");
             ddCard(10, L"Position", L"", {L"Bottom centre", L"Bottom left", L"Bottom right", L"Top centre", L"Top left", L"Top right"}, g_fPos, -1);
             ddCard(11, L"Screen", L"", {L"Main screen", L"Screen with the mouse", L"Screen with the active window"}, g_fScreen, -1);
-            msCard(0, L"Stay on screen", L"In milliseconds, longer while the mouse is on them. 0 keeps the media flyout until you close it", g_fStayMs);
+            msCard(0, L"Stay on screen", L"In milliseconds, longer while the mouse is on them. 0 keeps the media flyout until you close it. Lock keys have their own time below", g_fStayMs);
             msCard(1, L"Animation", L"How long they take to slide in and out, in milliseconds. 0 for no motion", g_fAnimMs);
             switchCard(23, L"Colours from the cover", L"Buttons and the progress bar take the cover's colour; off uses Knob's accent colour", g_fCover);
             snote(L"Solid or Glass and light or dark follow Settings \u203A Appearance.");
@@ -6779,6 +6779,7 @@ static void PaintSettings(HDC hdc) {
                 }
                 cardEnd(r);
             }
+            msCard(2, L"Stay on screen", L"How long the lock-key flyout stays, in milliseconds, apart from the other flyouts", g_lkStayMs);
             break;
         }
         case SP_APPEAR: {
