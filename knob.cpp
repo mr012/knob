@@ -46,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.10"
+#define APP_VERSION L"1.41.11"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -1925,13 +1925,34 @@ static bool KeepDisplayChange() {   // like Windows: keep the new layout, or go 
 }
 static std::wstring g_dispStatus;
 static int g_connScreens = 0;   // screens plugged in, including ones switched off by "Only this screen"
+struct OffScreen { std::wstring name; bool internal = false; };
+static std::vector<OffScreen> g_offScreens;   // plugged in but switched off: listed with their name and a way to bring them back
 static void CountScreens() {   // every screen plugged in, active or not
-    UINT32 np = 0, nm = 0; g_connScreens = 0;
+    UINT32 np = 0, nm = 0; g_connScreens = 0; g_offScreens.clear();
     if (GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &np, &nm) != ERROR_SUCCESS) return;
     std::vector<DISPLAYCONFIG_PATH_INFO> p(np); std::vector<DISPLAYCONFIG_MODE_INFO> m(nm);
     if (QueryDisplayConfig(QDC_ALL_PATHS, &np, p.data(), &nm, m.data(), nullptr) != ERROR_SUCCESS) return;
-    std::set<unsigned long long> seen;
-    for (UINT32 i = 0; i < np; i++) if (p[i].targetInfo.targetAvailable) seen.insert(((unsigned long long)p[i].targetInfo.adapterId.LowPart << 32) ^ p[i].targetInfo.id ^ ((unsigned long long)p[i].targetInfo.adapterId.HighPart << 48));
+    auto key = [](const DISPLAYCONFIG_PATH_INFO& x) { return ((unsigned long long)x.targetInfo.adapterId.LowPart << 32) ^ x.targetInfo.id ^ ((unsigned long long)x.targetInfo.adapterId.HighPart << 48); };
+    std::set<unsigned long long> seen, active;
+    for (UINT32 i = 0; i < np; i++) if (p[i].flags & DISPLAYCONFIG_PATH_ACTIVE) active.insert(key(p[i]));
+    for (UINT32 i = 0; i < np; i++) {
+        if (!p[i].targetInfo.targetAvailable) continue;
+        unsigned long long k = key(p[i]);
+        if (!seen.insert(k).second) continue;
+        if (active.count(k)) continue;
+        DISPLAYCONFIG_TARGET_DEVICE_NAME tgt = {};
+        tgt.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME; tgt.header.size = sizeof(tgt);
+        tgt.header.adapterId = p[i].targetInfo.adapterId; tgt.header.id = p[i].targetInfo.id;
+        OffScreen o;
+        if (DisplayConfigGetDeviceInfo(&tgt.header) == ERROR_SUCCESS) {
+            auto t = tgt.outputTechnology;
+            o.internal = t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL || t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EMBEDDED ||
+                         t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_UDI_EMBEDDED || t == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_LVDS;
+            o.name = tgt.monitorFriendlyDeviceName;
+        }
+        if (o.name.empty()) o.name = o.internal ? L"Built-in display" : L"Display";
+        g_offScreens.push_back(o);
+    }
     g_connScreens = (int)seen.size();
 }   // shown under the Display tab when Windows refuses a layout
 static bool ActivePathState(UINT32& n, bool& cloned) {   // how many screens are on, and whether two of them show the same picture
@@ -1971,7 +1992,7 @@ static void SetDisplayMode(int idx, int dupOf) {   // dupOf -1 = extend, else sh
                                   r = SetDisplayConfig(1, &one, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_SUPPLIED | SDC_ALLOW_PATH_ORDER_CHANGES); }
         if (r != ERROR_SUCCESS) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | (g_mons[idx].internal ? SDC_TOPOLOGY_INTERNAL : SDC_TOPOLOGY_EXTERNAL));
     }
-    else if (np == 2) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_CLONE | SDC_SAVE_TO_DATABASE);   // two screens: Windows' own Duplicate
+    else if (np == 2 || dupOf == -3) r = SetDisplayConfig(0, nullptr, 0, nullptr, SDC_APPLY | SDC_TOPOLOGY_CLONE | SDC_SAVE_TO_DATABASE);   // two screens: Windows' own Duplicate
     else {
         if (dupOf >= (int)g_mons.size()) return;
         auto find = [&](const MonUI& m) { for (UINT32 i = 0; i < np; i++) if (paths[i].targetInfo.id == m.target && paths[i].targetInfo.adapterId.LowPart == m.adapter.LowPart && paths[i].targetInfo.adapterId.HighPart == m.adapter.HighPart) return (int)i; return -1; };
@@ -2215,9 +2236,9 @@ enum : wchar_t {
 };
 
 // ---------------------------------------------------------------- layout model
-enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_DTOP };
+enum ElKind { E_H3, E_OUT, E_IN, E_MASTER, E_APP, E_MONHEAD, E_MONB, E_MONC, E_MONO, E_MONDIM, E_MONNL, E_NOTE, E_DTOP, E_MONOFF };
 struct El { ElKind k; int idx; RectF r; std::wstring text; };
-enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENUBG, H_MICALL, H_DELAYCHIP, H_UPDATE, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL };
+enum HitKind { H_NONE, H_TAB, H_ROW, H_SLIDER, H_MUTE, H_DROPDOWN, H_IDENT, H_GEAR, H_REFRESH, H_DDOPT, H_MENUBG, H_MICALL, H_DELAYCHIP, H_UPDATE, H_RATEDD, H_INPUTDD, H_PROFDD, H_SCREENOFF, H_APPOUT, H_RESETOUT, H_ROUTING, H_NIGHT, H_HDR, H_MODEDD, H_ONESPK, H_AUTOSYNC, H_DLMINUS, H_DLPLUS, H_DLSYNC, H_CALDONE, H_DLRESET, H_CALSTART, H_CALCANCEL, H_OFFEXT, H_OFFDUP };
 struct Hit { HitKind h = H_NONE; int el = -1; int idx = -1; };
 
 static const float LW = 380, TABH = 54, FTR = 44, PANEH = 470, ROWH = 78, ROWGAP = 3;
@@ -2281,6 +2302,10 @@ static void Layout() {
             if (g_night.count(g_mons[i].name) && g_night[g_mons[i].name].on) { g_els.push_back({E_MONNL, i, RectF(x, y, w, S(36)), L""}); y += S(36); }   // night light strength
             g_els.push_back({E_MONO, i, RectF(x, y, w, S(36)), L""}); y += S(36);
             y += S(2);
+        }
+        for (int k = 0; k < (int)g_offScreens.size(); k++) {   // switched-off screens: just the name and a way back, no sliders
+            y += S(g_mons.empty() && !k ? 4 : 14);
+            g_els.push_back({E_MONOFF, k, RectF(x, y, w, S(34)), L""}); y += S(34);
         }
     }
     g_contentH = y + g_scroll[SI()] - PaneTop() + S(14);
@@ -2371,6 +2396,8 @@ static bool InRect(const RectF& r, float x, float y) { return x >= r.X && x < r.
 
 // ---- Display tab controls and their lists (in-panel popups, styled like the panel)
 static const wchar_t* ORIENT_NAMES[4] = {L"Landscape", L"Portrait", L"Landscape (flipped)", L"Portrait (flipped)"};
+static RectF OffExt(const El& e) { float w = S(18) + MeasureW(L"Extend", g_fSmall); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y + S(2), w, S(30)); }
+static RectF OffDup(const El& e) { float w = S(18) + MeasureW(L"Duplicate", g_fSmall); RectF x = OffExt(e); return RectF(x.X - S(6) - w, e.r.Y + S(2), w, S(30)); }
 static RectF DTopOff(const El& e) { float w = S(12) + S(14) + S(6) + MeasureW(L"Turn off displays", g_fSmall) + S(12); return RectF(e.r.X + e.r.Width - S(10) - w, e.r.Y, w, S(32)); }
 static RectF DTopProfile(const El& e) { RectF o = DTopOff(e); return RectF(e.r.X + S(10), e.r.Y, o.X - S(8) - e.r.X - S(10), S(32)); }
 static bool HasRates(int i) { return i >= 0 && i < (int)g_mons.size() && g_mons[i].rates.size() >= 2; }
@@ -2524,6 +2551,9 @@ static Hit HitTest(float x, float y) {
             else if (InRect(CtlMute(e, cy2), x, y)) h.h = H_MUTE;
             else if (InRect(RectF(sl.X, cy2 - S(18), sl.Width, S(36)), x, y)) h.h = H_SLIDER;
             else h.h = (e.k == E_OUT || e.k == E_IN) ? H_ROW : H_NONE;
+        } else if (e.k == E_MONOFF) {
+            if (InRect(OffExt(e), x, y)) h.h = H_OFFEXT;
+            else if (InRect(OffDup(e), x, y)) h.h = H_OFFDUP;
         } else if (e.k == E_MONB || e.k == E_MONC || e.k == E_MONDIM || e.k == E_MONNL) {
             RectF sl = CtlSlider(e, SliderCy(e)); sl.X -= S(10); sl.Width += S(20);
             if (InRect(sl, x, y) && (g_mons[e.idx].ok || e.k == E_MONNL || e.k == E_MONDIM)) h.h = H_SLIDER;
@@ -3288,6 +3318,22 @@ static void DrawEl(Graphics& g, int index) {
         FillRound(g, hovEl && g_hover.h == H_SCREENOFF ? T.subtle3 : T.subtle2, ob, S(8));
         Icon(g, "power", S(14), hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, ob.X + S(12) + S(7), ob.Y + ob.Height / 2);
         PillText(g, L"Turn off displays", g_fSmall, hovEl && g_hover.h == H_SCREENOFF ? T.t1 : T.t2, RectF(ob.X + S(32), ob.Y, ob.Width - S(32), ob.Height));
+        return;
+    }
+    if (e.k == E_MONOFF) {   // a screen that is off: dimmed number and name, then the ways to turn it back on
+        const OffScreen& o = g_offScreens[e.idx];
+        float cy0 = e.r.Y + e.r.Height / 2, lx0 = e.r.X + S(8) + S(16);
+        RectF nb(lx0 - S(10), cy0 - S(7.5f), S(20), S(15));
+        GraphicsPath p; AddRound(p, RectF(nb.X + S(0.75f), nb.Y + S(0.75f), nb.Width - S(1.5f), nb.Height - S(1.5f)), S(3.5f));
+        Pen pen(T.t3, S(1.5f)); g.DrawPath(&pen, &p);
+        wchar_t num[4]; swprintf(num, 4, L"%d", (int)g_mons.size() + e.idx + 1);
+        Text(g, num, g_fNum, T.t3, nb, StringAlignmentCenter);
+        auto btn = [&](RectF b, const wchar_t* label, bool hov) { FillRound(g, hov ? T.ddBtnHover : T.ddBtn, b, S(9)); PillText(g, label, g_fSmall, T.t1, b, StringAlignmentCenter); };
+        btn(OffDup(e), L"Duplicate", hovEl && g_hover.h == H_OFFDUP);
+        btn(OffExt(e), L"Extend", hovEl && g_hover.h == H_OFFEXT);
+        float nx = e.r.X + S(50), maxW = OffDup(e).X - S(8) - nx;
+        std::wstring nm = o.name + L"  \u00B7  off";
+        Text(g, nm.c_str(), g_fName, T.t3, RectF(nx, cy0 - S(10), maxW, S(20)));
         return;
     }
     MonUI& m = g_mons[e.idx];
@@ -5791,6 +5837,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         case H_PROFDD: g_ddOpen = 0; g_ddKind = 3; break;
+        case H_OFFEXT: case H_OFFDUP:
+            if (!g_mons.empty()) { HideFlyout(); SetDisplayMode(0, ht.h == H_OFFEXT ? -1 : -3); CountScreens(); BrightRequest(true, false); }
+            return 0;
         case H_SCREENOFF: HideFlyout(); SetTimer(h, TIMER_SCREENOFF, 500, nullptr); return 0;   // after the click settles, or the mouse wakes them
         case H_TAB: SetTab(ht.idx); return 0;
         case H_MICALL: MicToggleMute(); break;
