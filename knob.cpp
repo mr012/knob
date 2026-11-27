@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.10"
+#define APP_VERSION L"1.42.11"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4636,6 +4636,7 @@ struct MSess { std::wstring aumid, app, title, artist; int status = 0; bool canP
 struct MediaSnap { std::vector<MSess> s; int cur = -1; Gdiplus::Bitmap* cover = nullptr; bool newCover = false; int why = 0; };   // why 2: the next song started on its own
 static MediaSnap g_ms;                  // what the flyouts and the party screen show (UI thread)
 static Gdiplus::Bitmap* g_cover = nullptr;
+static int g_coverGen = 0;   // changes with every new cover, so the flyout's pre-drawn copies know when to be redone
 static Color g_coverAcc, g_coverC1, g_coverC2; static bool g_coverHas = false;
 static DWORD g_mediaTid = 0; static HANDLE g_mediaThread = nullptr;
 static volatile DWORD g_mediaCmdTick = 0;   // a media key or a flyout button, just now: the song change that follows isn't "Up next"
@@ -4901,7 +4902,7 @@ static bool g_popTry = false;            // Settings › Flyouts › Try: shows 
 static MSess g_popNone;                  // what Try shows then
 static const wchar_t* LOCK_TXT[4][3] = {{L"Caps Lock", L"Caps Lock is on", L"Caps Lock is off"}, {L"Num Lock", L"Num Lock is on", L"Num Lock is off"},
                                        {L"Scroll Lock", L"Scroll Lock is on", L"Scroll Lock is off"}, {L"Insert", L"Overwrite mode", L"Insert mode"}};
-static int PopDur() { return std::max(0, std::min(2000, g_fAnimMs)); }
+static int PopDur() { int d = std::max(0, std::min(2000, g_fAnimMs)); return g_popKind == POP_LOCK ? std::min(d, 200) : d; }   // a lock-key flyout only needs a quick slide
 static Color PopAcc() { return g_fCover && g_coverHas ? g_coverAcc : T.accent; }
 static bool PopAnimatedGlow() { return g_popKind == POP_MEDIA && (g_fGlow == 3 || g_fGlow == 4 || g_fGlow == 5); }
 static void BoxBlur(std::vector<UINT32>& px, int w, int h, int r, int passes) {   // premultiplied ARGB, separable box blur (a few passes look Gaussian)
@@ -5000,8 +5001,8 @@ static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind 
     bool lt = !T.dark; Color a = PopAcc();
     float t = GetTickCount() / 1000.f;
     switch (g_fGlow) {
-    case 1: DrawFaded(g, g_glowRise, RectF(-0.2f * W, 0.3f * H, 1.4f * W, 1.1f * H), lt ? .3f : .42f); break;   // rising glow
-    case 2: DrawFaded(g, g_glowFull, RectF(-0.15f * W, -0.3f * H, 1.3f * W, 1.6f * H), lt ? .38f : .55f); break;   // blurred cover
+    case 1: DrawFaded(g, g_glowRise, RectF(-0.2f * W, 0.3f * H, 1.4f * W, 1.1f * H), lt ? .3f : .34f); break;   // rising glow
+    case 2: DrawFaded(g, g_glowFull, RectF(-0.15f * W, -0.3f * H, 1.3f * W, 1.6f * H), lt ? .38f : .45f); break;   // blurred cover
     case 3: {   // aurora: two soft bands of the cover's colours drifting slowly
         DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.5f * H), .18f);
         auto blob = [&](float cx, float cy, float rw, float rh, float rot, Color c, float al) {
@@ -5066,6 +5067,9 @@ static void PopIconBtn(Graphics& g, int id, RectF r, const char* icon, Color c, 
     if (enabled && g_popHot == id) FillRound(g, T.subtle2, r, S(6));
     Icon(g, icon, S(size), enabled ? c : WithAlpha(c, 77), r.X + r.Width / 2, r.Y + r.Height / 2);
 }
+struct PopCacheKey { int gen, glow, w, h, rad; bool lt; DWORD acc; };
+static Gdiplus::Bitmap* g_popGlowBmp = nullptr, *g_popCoverBmp = nullptr; static PopCacheKey g_popGlowK = {}, g_popCoverK = {};
+static void PopCacheFree() { delete g_popGlowBmp; g_popGlowBmp = nullptr; delete g_popCoverBmp; g_popCoverBmp = nullptr; }
 static void PaintPop(HDC hdc) {
     int w = g_popW, h = g_popH;
     if (w <= 0 || h <= 0) return;
@@ -5081,7 +5085,7 @@ static void PaintPop(HDC hdc) {
         g.SetTextRenderingHint(g_popGlass ? TextRenderingHintAntiAliasGridFit : TextRenderingHintClearTypeGridFit);
         g.SetPixelOffsetMode(PixelOffsetModeHalf);
         g.SetCompositingMode(CompositingModeSourceCopy);
-        { Color sf = g_popGlass ? T.surface : (T.dark ? Color(255, 32, 32, 32) : Color(255, 243, 243, 243)); SolidBrush b(sf); g.FillRectangle(&b, 0, 0, w, h); }
+        { Color sf = g_popGlass ? T.surface : (T.dark ? (g_popKind == POP_MEDIA ? Color(255, 22, 22, 22) : Color(255, 32, 32, 32)) : Color(255, 243, 243, 243)); SolidBrush b(sf); g.FillRectangle(&b, 0, 0, w, h); }
         g.SetCompositingMode(CompositingModeSourceOver);
         float W = (float)w, H = (float)h;
         Color acc = PopAcc();
@@ -5092,7 +5096,16 @@ static void PaintPop(HDC hdc) {
         auto cover = [&](RectF r, float rad, bool shadow) {
             if (shadow) { FillRound(g, Color(40, 0, 0, 0), RectF(r.X, r.Y + S(3), r.Width, r.Height + S(1)), rad + S(1)); FillRound(g, Color(30, 0, 0, 0), RectF(r.X - S(1), r.Y + S(2), r.Width + S(2), r.Height + S(4)), rad + S(2)); }
             GraphicsPath p; AddRound(p, r, rad);
-            if (g_cover) { GraphicsState st = g.Save(); g.SetClip(&p); g.SetInterpolationMode(InterpolationModeHighQualityBicubic); g.DrawImage(g_cover, r); g.Restore(st); }
+            if (g_cover) {   // scaled and rounded once per cover and size, then only copied
+                int cw = std::max(1, (int)lroundf(r.Width)), ch = std::max(1, (int)lroundf(r.Height));
+                PopCacheKey k = {g_coverGen, 0, cw, ch, (int)lroundf(rad), false, 0};
+                if (!g_popCoverBmp || memcmp(&k, &g_popCoverK, sizeof k) != 0) {
+                    delete g_popCoverBmp; g_popCoverBmp = new Gdiplus::Bitmap(cw, ch, PixelFormat32bppPARGB); g_popCoverK = k;
+                    Graphics cg(g_popCoverBmp); cg.SetSmoothingMode(SmoothingModeAntiAlias); cg.SetPixelOffsetMode(PixelOffsetModeHalf); cg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+                    GraphicsPath cp; AddRound(cp, RectF(0, 0, (float)cw, (float)ch), rad); cg.SetClip(&cp); cg.DrawImage(g_cover, RectF(0, 0, (float)cw, (float)ch));
+                }
+                g.DrawImage(g_popCoverBmp, Rect((int)lroundf(r.X), (int)lroundf(r.Y), cw, ch), 0, 0, cw, ch, UnitPixel);
+            }
             else { LinearGradientBrush lb(PointF(r.X, r.Y), PointF(r.X + r.Width, r.Y + r.Height), acc, WithAlpha(acc, 140)); g.FillPath(&lb, &p); Icon(g, "mPlay", r.Width * .4f, Color(230, 255, 255, 255), r.X + r.Width / 2, r.Y + r.Height / 2); }
             Pen edge(Color(20, 255, 255, 255), S(1)); g.DrawPath(&edge, &p);
         };
@@ -5106,7 +5119,16 @@ static void PaintPop(HDC hdc) {
             bool compact = g_fLayout == 1;
             INT64 pos = g_popDrag == 7 ? (INT64)(g_popSeek * m->end) : MediaPos(*m);
             float frac = m->end > 0 ? std::max(0.f, std::min(1.f, (float)pos / m->end)) : 0.f;
-            g_crumb = "flyout glow"; if (g_fGlow) PopGlow(g, W, H); g_crumb = "flyout body";
+            g_crumb = "flyout glow";
+            if (g_fGlow == 1 || g_fGlow == 2) {   // the still looks are drawn once, then copied
+                PopCacheKey k = {g_coverGen, g_fGlow, w, h, 0, !T.dark, (DWORD)PopAcc().GetValue()};
+                if (!g_popGlowBmp || memcmp(&k, &g_popGlowK, sizeof k) != 0) {
+                    delete g_popGlowBmp; g_popGlowBmp = new Gdiplus::Bitmap(w, h, PixelFormat32bppPARGB); g_popGlowK = k;
+                    Graphics cg(g_popGlowBmp); cg.SetSmoothingMode(SmoothingModeAntiAlias); PopGlow(cg, W, H);
+                }
+                g.DrawImage(g_popGlowBmp, Rect(0, 0, w, h), 0, 0, w, h, UnitPixel);
+            } else if (g_fGlow) PopGlow(g, W, H);
+            g_crumb = "flyout body";
             auto bar = [&](RectF tr) {   // the track, the part played, and the knob when the mouse is on it
                 g_popHits.push_back({7, RectF(tr.X - S(4), tr.Y - S(6), tr.Width + S(8), tr.Height + S(12))});
                 FillRound(g, T.track, tr, tr.Height / 2);
@@ -5200,11 +5222,11 @@ static void PaintPop(HDC hdc) {
             cover(RectF(cx, (H - S(32)) / 2, S(32), S(32)), S(7), false);
             textCol(m->title, m->artist, RectF(cx + S(42), (H - S(37)) / 2, W - cx - S(42) - S(16), S(40)), false);
         } else if (g_popKind == POP_LOCK) {   // lock keys: the lock closes or opens, the words change, the bar grows or shrinks
-            float t = (GetTickCount() - g_popLockT0) / 1000.f, ta = std::max(0.f, t - 0.14f);
+            float sp = std::max(0.4f, std::min(1.f, g_fAnimMs / 500.f)), t = (GetTickCount() - g_popLockT0) / 1000.f, ta = std::max(0.f, t - 0.05f * sp);   // sp: follows the Animation time, never slower than before
             bool still = g_fAnimMs == 0;
             auto backOut = [](float x) { x = std::max(0.f, std::min(1.f, x)); float c1 = 1.70158f, c3 = c1 + 1; return 1 + c3 * powf(x - 1, 3) + c1 * powf(x - 1, 2); };
             auto easeIO = [](float x) { x = std::max(0.f, std::min(1.f, x)); return x < .5f ? 4 * x * x * x : 1 - powf(-2 * x + 2, 3) / 2; };
-            float ks = still ? 1 : backOut(ta / 0.45f), kt = still ? 1 : easeIO(ta / 0.3f), kb = still ? 1 : easeIO(ta / 0.35f);
+            float ks = still ? 1 : backOut(ta / (0.32f * sp)), kt = still ? 1 : easeIO(ta / (0.2f * sp)), kb = still ? 1 : easeIO(ta / (0.24f * sp));
             bool on = g_popLockOn;
             {   // the lock, 20 x 22 units
                 float u = S(1), lx = S(14), ly = (H - S(22)) / 2;
@@ -5257,7 +5279,7 @@ static void PopEnd() {   // gone: let go of what only the flyout needed
     ShowWindow(g_pop, SW_HIDE);
     g_popShown = false; g_popDir = 0; g_popList = false; g_popHot = -1; g_popDrag = -1; g_popTry = false;
     if (g_popLv) { g_popLv = false; LevelsStop(); }
-    CanvasFree(g_cvPop);
+    CanvasFree(g_cvPop); PopCacheFree();
 }
 static void PopHide() {
     if (!g_popShown || g_popDir == -1) return;
@@ -5376,7 +5398,7 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (g_popDir == 0 && !g_popHover && g_popDrag < 0 && !g_popList && g_popHideAt && (int)(now - g_popHideAt) >= 0) { PopHide(); return 0; }
         PopTimer();
-        InvalidateRect(h, nullptr, FALSE);
+        if (g_popDir == 0 || PopAnimatedGlow() || g_popDrag >= 0 || (g_popKind == POP_LOCK && now - g_popLockT0 < 700)) InvalidateRect(h, nullptr, FALSE);   // sliding in or out only moves the window: its picture is already there
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -5423,7 +5445,7 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 static void MediaApply(MediaSnap* m) {   // a new snapshot from the media thread
     g_crumb = "MediaApply";
-    if (m->newCover) { delete g_cover; g_cover = m->cover; m->cover = nullptr; CoverColours(); BuildGlows(); }
+    if (m->newCover) { delete g_cover; g_coverGen++; g_cover = m->cover; m->cover = nullptr; CoverColours(); BuildGlows(); }
     int why = m->why;
     std::wstring prevId; int prevSt = -1;
     if (MSess* pc = MediaCur()) { prevId = pc->aumid; prevSt = pc->status; }
