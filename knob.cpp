@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.14"
+#define APP_VERSION L"1.42.16"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -6679,7 +6679,7 @@ static void PaintSettings(HDC hdc) {
                 MonUI& m = g_mons[i];
                 if (m.cloneOf >= 0) continue;   // a duplicate shares its source's colour
                 top(0);
-                RectF r(x0, y, cw, S(124)); FillRound(g, card, r, S(6));
+                RectF r(x0, y, cw, S(84)); FillRound(g, card, r, S(6));
                 float ix = r.X + S(18), iw = r.Width - S(36), yy = r.Y + S(10);
                 {   // number, name, connection
                     RectF nb(ix, yy, S(22), S(22)); FillRound(g, T.subtle2, nb, S(6));
@@ -6689,18 +6689,15 @@ static void PaintSettings(HDC hdc) {
                     Text(g, m.name.c_str(), &fBold14, T.t1, RectF(ix + S(32), yy, nw + S(4), S(22)));
                     Text(g, m.detail.c_str(), &fSmall115, T.t3, RectF(ix + S(32) + nw + S(10), yy + S(1), iw - nw - S(42), S(22)));
                 }
-                yy += S(22) + S(8);
-                {   // HDR (only screens that can)
-                    RectF hr(ix, yy, iw, S(40));
-                    Text(g, L"HDR", &fBody13, T.t1, RectF(hr.X, hr.Y, S(90), hr.Height));
+                {   // HDR sits on the name row, at the right (only screens that can)
                     if (m.hdrOk) {
+                        RectF hr(ix + iw - S(150), yy - S(4), S(150), S(30));
                         add(SK_SWITCH, 100 + i, hr);
-                        Text(g, m.hdr ? L"Brighter highlights, for HDR games and video" : L"Off", &fSmall115, T.t3, RectF(hr.X + S(100), hr.Y, hr.Width - S(100) - S(85), hr.Height));
                         DrawSwitch(g, hr.X + hr.Width - S(40), hr.Y + hr.Height / 2, m.hdr);
-                        Text(g, m.hdr ? L"On" : L"Off", &fBody13, T.t1, RectF(hr.X + hr.Width - S(40) - S(16) - S(60), hr.Y, S(60), hr.Height), StringAlignmentFar);
-                    } else Text(g, L"This screen doesn't support HDR", &fSmall115, T.t3, RectF(hr.X + S(100), hr.Y, hr.Width - S(100), hr.Height));
+                        Text(g, m.hdr ? L"HDR on" : L"HDR off", &fBody13, T.t1, RectF(hr.X, hr.Y, hr.Width - S(40) - S(12), hr.Height), StringAlignmentFar);
+                    } else Text(g, L"No HDR", &fSmall115, T.t3, RectF(ix + iw - S(100), yy, S(100), S(22)), StringAlignmentFar);
                 }
-                yy += S(40) + S(2);
+                yy += S(22) + S(6);
                 {   // night light strength
                     int str = g_night.count(m.name) ? g_night[m.name].str : 40;
                     Text(g, L"Night light", &fDesc, T.t2, RectF(ix, yy, S(80), S(32)));
@@ -6717,9 +6714,9 @@ static void PaintSettings(HDC hdc) {
                 h4(L"Screen off and Party screen");
                 snote(L"What your screens show when you're not using them.");
                 auto names = ScreenNames();
-                ddCard(16, L"Turn off displays", L"The Turn off button and its shortcut always switch your screens off right away. This also turns them off by themselves when you haven't used the keyboard or mouse for a while (not during full-screen video or games)", {L"Only with the button", L"After 15 minutes of no activity", L"After 30 minutes of no activity", L"After 1 hour of no activity", L"After 2 hours of no activity"}, g_offDelay, 6);
-                switchCard(29, L"Switch monitors fully off", L"Also sends each monitor its own power-down command (DDC/CI), so even an LCD's backlight goes dark. Any key or mouse move turns them back on; if one stays dark, press its power button. Some DisplayPort monitors disconnect while off, which can move your windows. Laptop screens go to their lowest brightness", g_offFull, 14);
-                switchCard(27, L"Clock on the black screen", L"The time and date in dim grey, like a phone's always-on screen. It drifts a little every minute so OLED screens don't burn in. Best on OLED; other screens keep their backlight on", g_offClock, 7);
+                ddCard(16, L"Turn off displays", L"The button and shortcut always turn them off at once. This also does it after a while of no keyboard or mouse use, but not during full-screen video or games", {L"Only with the button", L"After 15 minutes of no activity", L"After 30 minutes of no activity", L"After 1 hour of no activity", L"After 2 hours of no activity"}, g_offDelay, 6);
+                switchCard(29, L"Switch monitors fully off", L"Also tells each monitor to power down (DDC/CI), so the backlight goes dark. A key or mouse move wakes them; some DisplayPort monitors may move your windows", g_offFull, 14);
+                switchCard(27, L"Clock on the black screen", L"Dim grey time and date, like a phone's always-on screen. It drifts slowly to protect OLED screens", g_offClock, 7);
                 if (g_offClock) {
                     std::vector<std::wstring> o = {L"Every screen", L"Main screen"}; int cur = g_clockScr == L"*" ? 0 : 1;
                     for (auto& n : names) { o.push_back(n); if (n == g_clockScr) cur = (int)o.size() - 1; }
