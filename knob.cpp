@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.13"
+#define APP_VERSION L"1.42.14"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -2307,7 +2307,7 @@ static int SI() { return g_tab; }
 static float PaneTop() { return S(TABH); }
 static float PaneBottom() { return g_H - S(FTR); }
 static float PaneX() { return S(12); }
-static float PaneW() { return g_W - S(34); }   // rows are 346 wide: the pane keeps a 10 px gutter for its scrollbar, as in the design
+static float PaneW() { return g_W - S(24); }   // 12 px each side; the scrollbar sits in the margin, over the window edge
 
 static const float APPLINE = 22;
 static const int SP_SOUND_PAGE = 1;   // Settings › Sound (where the routing lives)
@@ -3617,7 +3617,7 @@ static std::vector<std::vector<RichWord>> CalText(float width) {   // the card's
     return lines;
 }
 static float CalBodyH() {
-    float w = PaneW() + S(10) - S(28);
+    float w = PaneW() - S(28);
     if (!g_calAsk && !g_calibrating && !CalFailed()) return S(4) + (float)UsedSpeakers().size() * S(21) - S(5) + S(12);   // the list
     float h = CalText(w).size() * S(17.25f) + S(10);
     if (g_calibrating) h += S(2) + S(4) + S(12);   // progress bar
