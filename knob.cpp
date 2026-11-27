@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.12"
+#define APP_VERSION L"1.42.13"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4809,7 +4809,7 @@ static DWORD WINAPI MediaProc(LPVOID) {
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == MC_QUIT) break;
         if (msg.message == MC_REFRESH) {   // events come in bursts: gather them, then read once
-            Sleep(60);
+            Sleep(15);
             MSG m2; bool resubNeeded = msg.wParam == 1;
             while (PeekMessageW(&m2, nullptr, MC_REFRESH, MC_REFRESH, PM_REMOVE)) if (m2.wParam == 1) resubNeeded = true;
             UINT32 n = 0; void* list = nullptr;
@@ -4827,7 +4827,7 @@ static DWORD WINAPI MediaProc(LPVOID) {
             case MCMD_SEEK: ((HRESULT(STDMETHODCALLTYPE*)(void*, INT64, void**))Vt(s)[24])(s, (INT64)msg.lParam, &op); break;
             }
             if (op) Await(op, nullptr, 1500);
-            Sleep(120);   // the player needs a moment before it reports the new state
+            Sleep(50);   // the player needs a moment before it reports the new state
             send();
         }
     }
@@ -5264,7 +5264,7 @@ static void PopEnd() {   // gone: let go of what only the flyout needed
     ShowWindow(g_pop, SW_HIDE);
     g_popShown = false; g_popDir = 0; g_popList = false; g_popHot = -1; g_popDrag = -1; g_popTry = false;
     if (g_popLv) { g_popLv = false; LevelsStop(); }
-    CanvasFree(g_cvPop); PopCacheFree();
+    CanvasFree(g_cvPop);
 }
 static void PopHide() {
     if (!g_popShown || g_popDir == -1) return;
@@ -5279,6 +5279,9 @@ static void PopArm() {   // how long it stays: the setting, longer while the mou
 static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp);
 static void PopApplyStyle() {
     bool wantGlass = g_style == 1 && TransparencyOn() && T.glass;
+    static int lastKey = -1; static HWND lastWnd = nullptr; int key = (wantGlass ? 1 : 0) | (T.dark ? 2 : 0);
+    if (lastWnd == g_pop && lastKey == key) return;   // nothing about the look changed since the last time
+    lastWnd = g_pop; lastKey = key;
     LONG ex = GetWindowLongW(g_pop, GWL_EXSTYLE);
     LONG want = wantGlass ? (ex & ~WS_EX_LAYERED) : (ex | WS_EX_LAYERED);
     if (want != ex) SetWindowLongW(g_pop, GWL_EXSTYLE, want);
@@ -5972,7 +5975,13 @@ static void FlyoutKeysSync() {
 static void FlyoutKey(USHORT vk) {
     if (vk >= VK_MEDIA_NEXT_TRACK && vk <= VK_MEDIA_PLAY_PAUSE && g_popMedia) {
         g_mediaCmdTick = GetTickCount(); MediaStart(); MediaRefresh();
-        SetTimer(g_hwnd, TIMER_POPKEY, 220, nullptr);   // a moment for the player to react, then show what it's doing
+        if (MSess* c = MediaCur()) {   // show it right now: play/pause is flipped here ahead of the player, whose real state follows a moment later
+            if (vk == VK_MEDIA_PLAY_PAUSE && (c->status == 4 || c->status == 5)) {
+                c->pos = MediaPos(*c); c->status = c->status == 4 ? 5 : 4;
+                FILETIME ft; GetSystemTimeAsFileTime(&ft); c->updated = ((INT64)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+            }
+            g_popVolT0 = 0; PopShow(POP_MEDIA);
+        } else SetTimer(g_hwnd, TIMER_POPKEY, 220, nullptr);   // nothing known yet (first press): wait for the player to be read
         return;
     }
     int k = vk == VK_CAPITAL ? 0 : vk == VK_NUMLOCK ? 1 : vk == VK_SCROLL ? 2 : vk == VK_INSERT ? 3 : -1;
@@ -7363,15 +7372,16 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_QUIT: DestroyWindow(h); return 0;
     case WM_APP_VOLCHANGED:
         InterlockedExchange(&g_volPending, 0);
-        RefreshEndpointLevels(g_out); RefreshEndpointLevels(g_in);
-        UpdateTrayTip();
-        if (g_visible && g_dragEl < 0) InvalidateRect(h, nullptr, FALSE);
-        {   // the main speaker's volume or mute really changed (not just a refresh): the media flyout shows it
+        RefreshEndpointLevels(g_out);
+        {   // the main speaker's volume or mute really changed (not just a refresh): the media flyout shows it, before anything else is updated
             static int lastSig = -1; int di = DefaultOut();
             int sig = di < 0 ? -1 : (int)lround(g_out[di].level * 100) * 2 + (g_out[di].mute ? 1 : 0);
             if (lastSig >= 0 && sig >= 0 && sig != lastSig && GetTickCount() > 5000) PopVolumeChanged();
             lastSig = sig;
         }
+        RefreshEndpointLevels(g_in);
+        UpdateTrayTip();
+        if (g_visible && g_dragEl < 0) InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_HOTKEY: if (wp >= 100 && (int)wp < 100 + (int)g_sc.size()) RunHotkey(g_sc[wp - 100].act, g_sc[wp - 100].param); return 0;
     case WM_APP_AUDIOCHANGED: SetTimer(h, TIMER_AUDIODEBOUNCE, 200, nullptr); return 0;
