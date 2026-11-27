@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.3"
+#define APP_VERSION L"1.42.4"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -132,6 +132,7 @@ static bool g_offFull = false;          // also tell monitors to power their scr
 static std::wstring g_clockScr;         // which screen shows it: "" the main screen, "*" every screen, else a screen's name
 static std::wstring g_partyScr;         // Party screen: "" the main screen, else a screen's name
 static int g_partyLook = 0;             // 0 glow waves, 1 mirror bars, 2 aurora, 3 light line
+static int g_partyClose = 0;            // 0 any key or mouse move ends it, 1 only Esc
 static bool g_partyInfo = true;         // the cover, title and artist small in a corner
 static bool g_rateBat = false;          // the laptop screen drops to 60 Hz on battery and goes back to its highest on power
 // flyouts (Settings › Flyouts): off until you switch them on, so they never double up with another flyout app
@@ -346,7 +347,7 @@ static void LoadSettings() {
         auto gi = [&](const wchar_t* k, int d, int lo, int hi) { return std::max(lo, std::min(hi, (int)GetPrivateProfileIntW(L"main", k, d, g_iniPath.c_str()))); };
         auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
-        g_partyScr = gs(L"partyscr"); g_partyLook = gi(L"partylook", 0, 0, 3); g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
+        g_partyScr = gs(L"partyscr"); g_partyLook = gi(L"partylook", 0, 0, 3); g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000);
         g_fLayout = gi(L"flayout", 0, 0, 1); g_fGlow = gi(L"fglow", 1, 0, 5); g_lkKeys = gi(L"lkkeys", 15, 0, 15);
@@ -421,7 +422,7 @@ static void SaveSettings() {
     {
         auto wi = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"main", k, std::to_wstring(v).c_str(), g_iniPath.c_str()); };
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
-        WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"ratebat", g_rateBat);
+        WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
         wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
         wi(L"fcover", g_fCover); wi(L"fcentre", g_fCentre); wi(L"fplayer", g_fPlayer);
@@ -5262,7 +5263,7 @@ static void PopShow(int kind) {
     else if (g_fScreen == 2) hm = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
     else hm = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
     UINT dx = 96, dy = 96; GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &dx, &dy);
-    if (!g_visible && !g_set) ApplyDpi((int)dx);   // the panel and Settings keep their own size while open
+    if (!g_visible && !g_set) ApplyDpi(kind == POP_MEDIA ? (int)(dx * 118 / 100) : (int)dx);   // the panel and Settings keep their own size while open; the media flyout is a bit larger
     MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(hm, &mi);
     RECT wa = mi.rcWork;
     int w = (int)S(380), hh = 0;
@@ -5594,12 +5595,13 @@ static LRESULT CALLBACK PartyProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
-        if (GetTickCount() - g_pTick < 800) return 0;   // ignore the click that started it
+        if (g_partyClose == 1 || GetTickCount() - g_pTick < 800) return 0;   // Esc only, or ignore the click that started it
         POINT p; GetCursorPos(&p);
         if (abs(p.x - g_pPt.x) > 6 || abs(p.y - g_pPt.y) > 6) PartyEnd();
         return 0;
     }
     case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_MOUSEWHEEL:
+        if (g_partyClose == 1 && !(msg == WM_KEYDOWN && wp == VK_ESCAPE)) return 0;   // Esc only: other keys and the mouse do nothing
         if (GetTickCount() - g_pTick > 300) PartyEnd();
         return 0;
     case WM_DESTROY:
@@ -6529,12 +6531,13 @@ static void PaintSettings(HDC hdc) {
                     for (auto& n : names) { o.push_back(n); if (n == g_clockScr) cur = (int)o.size() - 1; }
                     ddCard(17, L"Show the clock on", L"The other screens just go black", o, cur, -1);
                 }
-                btnCard(L"Party screen", L"Turns a screen into big blurred light that moves with the music, in the cover's colours. Any key or mouse move ends it. Start it from the Display tab or a shortcut", SK_BUTTON, 30, L"Show now");
+                btnCard(L"Party screen", L"Turns a screen into big blurred light that moves with the music, in the cover's colours. Start it from the Display tab or a shortcut; choose below how it ends", SK_BUTTON, 30, L"Show now");
                 {
                     std::vector<std::wstring> o = {L"Main screen"}; int cur = 0;
                     for (auto& n : names) { o.push_back(n); if (n == g_partyScr) cur = (int)o.size() - 1; }
                     ddCard(18, L"Party screen shows on", L"", o, cur, -1);
                 }
+                ddCard(31, L"End the Party screen with", L"Esc only keeps it going when the mouse moves or other keys are pressed", {L"Any key or mouse move", L"Esc only"}, g_partyClose, -1);
                 ddCard(19, L"Look", L"All of them follow the music and use the cover's colours", {PARTY_LOOKS[0], PARTY_LOOKS[1], PARTY_LOOKS[2], PARTY_LOOKS[3]}, g_partyLook, -1);
                 switchCard(28, L"Show what's playing", L"The cover, title and artist, small in a corner", g_partyInfo);
             }
@@ -6875,6 +6878,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else v = k >= 1 && k - 1 < (int)names.size() ? names[k - 1] : L"";
                 (dd == 17 ? g_clockScr : g_partyScr) = v; SaveSettings();
             }
+            if (dd == 31) { g_partyClose = std::max(0, std::min(1, k)); SaveSettings(); }
             if (dd == 19) { g_partyLook = std::max(0, std::min(3, k)); SaveSettings(); }
             if (dd >= 1000 && dd - 1000 < (int)g_sc.size()) {   // which speaker / profile a shortcut uses
                 Shortcut& s2 = g_sc[dd - 1000];
