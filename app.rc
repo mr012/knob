@@ -2,8 +2,8 @@
 1 ICON "app.ico"
 1 24 "app.manifest"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,42,9,0
-PRODUCTVERSION 1,42,9,0
+FILEVERSION 1,42,10,0
+PRODUCTVERSION 1,42,10,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -13,8 +13,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Knob - tray volume, audio outputs and display brightness"
       VALUE "ProductName", "Knob"
-      VALUE "FileVersion", "1.42.9"
-      VALUE "ProductVersion", "1.42.9"
+      VALUE "FileVersion", "1.42.10"
+      VALUE "ProductVersion", "1.42.10"
       VALUE "OriginalFilename", "Knob.exe"
     END
   END

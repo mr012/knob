@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.9"
+#define APP_VERSION L"1.42.10"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4883,6 +4883,7 @@ static void CoverColours() {   // the cover's colours: an accent for buttons and
 // Small windows that appear by themselves near the edge of a screen, never take focus, and stay hidden while
 // something runs full screen. Same surface as the panel (Solid or Glass); buttons take the cover's colour.
 enum { POP_MEDIA, POP_NEXT, POP_LOCK };
+extern const char* g_crumb;
 static DWORD g_popVolT0 = 0;   // the media flyout was opened by a volume change just now: it shows the volume too
 static HWND g_pop = nullptr;
 static int g_popKind = -1, g_popW = 0, g_popH = 0, g_popDir = 0;   // g_popDir 1 arriving, -1 leaving, 0 resting
@@ -4980,11 +4981,13 @@ static Gdiplus::Bitmap* MediaIcon(const std::wstring& aumid) {
         HBITMAP hb = nullptr;
         if (SUCCEEDED(fac->GetImage(SIZE{64, 64}, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hb)) && hb) {
             DIBSECTION ds = {};
-            if (GetObjectW(hb, sizeof(ds), &ds) && ds.dsBm.bmBitsPixel == 32 && ds.dsBm.bmBits) {
-                int w = ds.dsBm.bmWidth, h = ds.dsBm.bmHeight, st = ds.dsBm.bmWidthBytes; BYTE* bits = (BYTE*)ds.dsBm.bmBits;
+            if (GetObject(hb, sizeof(ds), &ds) >= (int)sizeof(BITMAP) && ds.dsBm.bmBitsPixel == 32 && ds.dsBm.bmBits && ds.dsBm.bmWidth > 0 && ds.dsBm.bmWidth <= 1024 && ds.dsBm.bmHeight > 0 && ds.dsBm.bmHeight <= 1024) {
+                int w = ds.dsBm.bmWidth, h = ds.dsBm.bmHeight, st = ds.dsBm.bmWidthBytes; const BYTE* bits = (const BYTE*)ds.dsBm.bmBits;
                 bool bottomUp = ds.dsBmih.biHeight > 0;
-                Gdiplus::Bitmap tmp(w, h, bottomUp ? -st : st, PixelFormat32bppPARGB, bottomUp ? bits + (size_t)(h - 1) * st : bits);
-                out = tmp.Clone(0, 0, w, h, PixelFormat32bppPARGB);
+                std::vector<UINT32> px((size_t)w * h);   // copied row by row: no borrowed memory, no odd strides
+                for (int y = 0; y < h; y++) memcpy(px.data() + (size_t)y * w, bits + (size_t)(bottomUp ? h - 1 - y : y) * st, (size_t)w * 4);
+                out = BitmapFrom(px, w, h);
+                if (out && out->GetLastStatus() != Ok) { delete out; out = nullptr; }
             }
             DeleteObject(hb);
         }
@@ -5103,7 +5106,7 @@ static void PaintPop(HDC hdc) {
             bool compact = g_fLayout == 1;
             INT64 pos = g_popDrag == 7 ? (INT64)(g_popSeek * m->end) : MediaPos(*m);
             float frac = m->end > 0 ? std::max(0.f, std::min(1.f, (float)pos / m->end)) : 0.f;
-            if (g_fGlow) PopGlow(g, W, H);
+            g_crumb = "flyout glow"; if (g_fGlow) PopGlow(g, W, H); g_crumb = "flyout body";
             auto bar = [&](RectF tr) {   // the track, the part played, and the knob when the mouse is on it
                 g_popHits.push_back({7, RectF(tr.X - S(4), tr.Y - S(6), tr.Width + S(8), tr.Height + S(12))});
                 FillRound(g, T.track, tr, tr.Height / 2);
@@ -5146,7 +5149,8 @@ static void PaintPop(HDC hdc) {
                     static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
                     unsigned hsh = 0; for (wchar_t ch : m->app) hsh = hsh * 31 + ch;
                     RectF ic(chip.X + S(3.5f), chip.Y + S(3), S(14), S(14));
-                    if (Gdiplus::Bitmap* pic = MediaIcon(m->aumid)) DrawAppIcon(g, pic, ic);
+                    g_crumb = "flyout player icon"; Gdiplus::Bitmap* pic = MediaIcon(m->aumid); g_crumb = "flyout player chip";
+                    if (pic) DrawAppIcon(g, pic, ic);
                     else { FillRound(g, Hex(tint[hsh % 6]), ic, S(3)); Font fI(g_famSemi, S(8), FontStyleBold, UnitPixel); Text(g, m->app.substr(0, 1).c_str(), &fI, Color(255, 255, 255, 255), ic, StringAlignmentCenter); }
                     Text(g, m->app.c_str(), &fChip, g_popList || g_popHot == 6 ? T.t1 : T.t2, RectF(ic.X + S(18), chip.Y, tw2 + S(2), chip.Height));
                     if (many) Icon(g, "chevron", S(11), T.t2, chip.X + chip.Width - S(7) - S(5.5f), chip.Y + chip.Height / 2, g_popList ? 180.f : 0.f);
@@ -5280,6 +5284,7 @@ static void PopApplyStyle() {
     COLORREF bc = 0xFFFFFFFE; DwmSetWindowAttribute(g_pop, 34, &bc, sizeof(bc));
 }
 static void PopShow(int kind) {
+    g_crumb = "PopShow";
     if ((kind == POP_MEDIA || kind == POP_NEXT) && !MediaCur() && !g_popTry) return;
     if (FullscreenBusy()) return;
     if (!g_pop) {
@@ -5417,6 +5422,7 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 static void MediaApply(MediaSnap* m) {   // a new snapshot from the media thread
+    g_crumb = "MediaApply";
     if (m->newCover) { delete g_cover; g_cover = m->cover; m->cover = nullptr; CoverColours(); BuildGlows(); }
     int why = m->why;
     std::wstring prevId; int prevSt = -1;
@@ -7754,7 +7760,21 @@ static bool InstallOrUpdate() {
 }
 
 // ---------------------------------------------------------------- entry
+const char* g_crumb = "start";   // the last step the flyouts reached: written to crash.txt if Knob ever crashes
+static LONG WINAPI CrashLog(EXCEPTION_POINTERS* ep) {
+    std::wstring p = g_iniPath; size_t k = p.find_last_of(L'\\'); if (k != std::wstring::npos) p = p.substr(0, k + 1); else p.clear();
+    HANDLE f = CreateFileW((p + L"crash.txt").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        char b[400]; HMODULE m = GetModuleHandleW(nullptr);
+        int n = snprintf(b, sizeof(b), "Knob %ls crash: code %08lX at +%llX (access %llu at %llX), last step: %s\r\n", APP_VERSION, ep->ExceptionRecord->ExceptionCode,
+            (unsigned long long)((BYTE*)ep->ExceptionRecord->ExceptionAddress - (BYTE*)m), (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0),
+            (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0), g_crumb);
+        DWORD w; WriteFile(f, b, n, &w, nullptr); CloseHandle(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
+    SetUnhandledExceptionFilter(CrashLog);
 #ifdef KNOB_DEMO
     g_demo = cmd && wcsstr(cmd, L"--demo");
 #endif
