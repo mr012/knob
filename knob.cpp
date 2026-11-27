@@ -17,6 +17,7 @@
 #include <windowsx.h>
 #include <objbase.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <shellscalingapi.h>
@@ -54,7 +55,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.16"
+#define APP_VERSION L"1.42.17"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -131,6 +132,11 @@ static int g_newSeen = 0;   // "NEW" tags in Settings: a bit per setting, cleare
 static const int OFF_MIN[5] = {0, 15, 30, 60, 120};
 static int g_offDelay = 0;              // Turn off displays: 0 right away, else after OFF_MIN[g_offDelay] minutes
 static DWORD g_offAt = 0;               // a timer is running: GetTickCount() when the screens go off
+// the clock on the black screen: its look, a picture, and what's playing
+static int g_ckStyle = 0, g_ckSize = 1, g_ckBright = 0, g_ckColour = 0, g_ckHour = 0, g_picDim = 1;   // style 0 light 1 bold 2 small 3 stacked; size 0..2; brightness 0..2; colour grey/warm/cool/accent; hours system/12/24; picture dimming
+static int g_ckPos = 0, g_ckDrift = 0;   // where the clock sits (a 3 x 3 grid, 0 = centre) and how far it wanders each minute (off, a little, more)
+static bool g_ckDate = true, g_ckNow = false, g_picFull = false, g_picSmall = false;
+static std::wstring g_picFile;
 static bool g_offClock = false;         // the time and date in dim grey on the black screen
 static bool g_offFull = false;          // also tell monitors to power their screen down (DDC/CI), so an LCD's backlight goes dark too
 static std::wstring g_clockScr;         // which screen shows it: "" the main screen, "*" every screen, else a screen's name
@@ -351,7 +357,9 @@ static void LoadSettings() {
         auto gi = [&](const wchar_t* k, int d, int lo, int hi) { return std::max(lo, std::min(hi, (int)GetPrivateProfileIntW(L"main", k, d, g_iniPath.c_str()))); };
         auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
-        g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); }   // the old list had Mirror bars second g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
+        g_ckStyle = gi(L"ckstyle", 0, 0, 3); g_ckSize = gi(L"cksize", 1, 0, 2); g_ckBright = gi(L"ckbright", 0, 0, 2); g_ckColour = gi(L"ckcolour", 0, 0, 3); g_ckHour = gi(L"ckhour", 0, 0, 2);
+        g_ckDate = gi(L"ckdate", 1, 0, 1); g_ckNow = gi(L"cknow", 0, 0, 1); g_picFull = gi(L"picfull", 0, 0, 1); g_picSmall = gi(L"picsmall", 0, 0, 1); g_picDim = gi(L"picdim", 1, 0, 2); g_picFile = gs(L"picfile"); g_ckPos = gi(L"ckpos", 0, 0, 8); g_ckDrift = gi(L"ckdrift", 0, 0, 2);
+        g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); } g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);   // the old look list had Mirror bars second
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000); g_lkStayMs = gi(L"lkstayms", g_fStayMs ? g_fStayMs : 2000, 100, 60000);
         g_fLayout = gi(L"flayout", 0, 0, 1); { int og = gi(L"fglow", 1, 0, 5); og = og == 3 ? 1 : og > 3 ? og - 1 : og; g_fGlow = gi(L"fglow2", og, 0, 4); } g_lkKeys = gi(L"lkkeys", 15, 0, 15);   // the old glow list had Aurora fourth
@@ -426,6 +434,8 @@ static void SaveSettings() {
     {
         auto wi = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"main", k, std::to_wstring(v).c_str(), g_iniPath.c_str()); };
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
+        wi(L"ckstyle", g_ckStyle); wi(L"cksize", g_ckSize); wi(L"ckbright", g_ckBright); wi(L"ckcolour", g_ckColour); wi(L"ckhour", g_ckHour); wi(L"ckdate", g_ckDate); wi(L"cknow", g_ckNow);
+        wi(L"picfull", g_picFull); wi(L"picsmall", g_picSmall); wi(L"picdim", g_picDim); wi(L"ckpos", g_ckPos); wi(L"ckdrift", g_ckDrift); WritePrivateProfileStringW(L"main", L"picfile", g_picFile.c_str(), g_iniPath.c_str());
         WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook2", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
         wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"lkstayms", g_lkStayMs); wi(L"flayout", g_fLayout); wi(L"fglow2", g_fGlow); wi(L"lkkeys", g_lkKeys);
@@ -4268,10 +4278,12 @@ static BOOL CALLBACK BlackMonProc(HMONITOR, HDC, LPRECT rc, LPARAM) {
     if (w) { SetLayeredWindowAttributes(w, 0, 0, LWA_ALPHA); ShowWindow(w, SW_SHOW); g_blackWnds.push_back(w); }   // starts see-through, then fades to black
     return TRUE;
 }
+static void MediaStart();
 static void BlackoutStart() {
     if (!g_blackWnds.empty()) return;
     static bool reg = false;
     if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = BlackProc; wc.hInstance = g_inst; wc.lpszClassName = L"KnobBlack"; wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); RegisterClassW(&wc); reg = true; }
+    if (g_offClock && g_ckNow) MediaStart();
     EnumDisplayMonitors(nullptr, nullptr, BlackMonProc, 0);
     if (g_blackWnds.empty()) return;
     SetForegroundWindow(g_blackWnds[0]);
@@ -5443,6 +5455,7 @@ static void MediaApply(MediaSnap* m) {   // a new snapshot from the media thread
         bool flip = nc->aumid == prevId && ((prevSt == 4 && nc->status == 5) || (prevSt == 5 && nc->status == 4));
         if (flip && g_popMedia && !g_visible && !g_set && GetTickCount() > 5000) { g_popVolT0 = 0; PopShow(POP_MEDIA); }
     }
+    if (g_ckNow) for (HWND bw : g_blackWnds) if (GetWindowLongPtrW(bw, GWLP_USERDATA) & 1) InvalidateRect(bw, nullptr, FALSE);   // the clock screen shows what's playing
     if (why == 2 && g_popNext) PopShow(POP_NEXT);
     if (g_popShown && g_pop) { if (!MediaCur() && g_popKind != POP_LOCK && !g_popTry) PopHide(); else InvalidateRect(g_pop, nullptr, FALSE); }
 }
@@ -5850,25 +5863,103 @@ static bool IsClockScreen(const RECT& rc) {   // does this screen show the clock
     MONITORINFO mi = {sizeof(mi)}; GetMonitorInfoW(want, &mi);
     return EqualRect(&mi.rcMonitor, &rc) != 0;
 }
-static void PaintClock(HWND h, HDC dc) {   // dim grey time and date, like a phone's always-on screen; drifts a little every minute
+static Gdiplus::Bitmap* g_picBmp = nullptr; static std::wstring g_picLoaded;
+static Gdiplus::Bitmap* ClockPic() {   // the chosen picture, read once (at most 1920 wide) so the file isn't kept open
+    if (g_picFile != g_picLoaded) {
+        delete g_picBmp; g_picBmp = nullptr; g_picLoaded = g_picFile;
+        if (!g_picFile.empty()) {
+            Gdiplus::Bitmap src(g_picFile.c_str());
+            if (src.GetLastStatus() == Ok && src.GetWidth() > 0 && src.GetHeight() > 0) {
+                float k = std::min(1.f, 1920.f / std::max(src.GetWidth(), src.GetHeight()));
+                int nw = std::max(1, (int)(src.GetWidth() * k)), nh = std::max(1, (int)(src.GetHeight() * k));
+                Gdiplus::Bitmap* out = new Gdiplus::Bitmap(nw, nh, PixelFormat32bppPARGB);
+                { Graphics gg(out); gg.SetInterpolationMode(InterpolationModeHighQualityBicubic); gg.SetPixelOffsetMode(PixelOffsetModeHalf); gg.DrawImage(&src, RectF(0, 0, (float)nw, (float)nh), 0, 0, (float)src.GetWidth(), (float)src.GetHeight(), UnitPixel); }
+                g_picBmp = out;
+            }
+        }
+    }
+    return g_picBmp;
+}
+static void DrawDimmed(Graphics& g, Gdiplus::Bitmap* b, RectF dst, float k) {   // a picture at a fraction of its brightness
+    ColorMatrix cm = {{{k, 0, 0, 0, 0}, {0, k, 0, 0, 0}, {0, 0, k, 0, 0}, {0, 0, 0, 1, 0}, {0, 0, 0, 0, 1}}};
+    ImageAttributes ia; ia.SetColorMatrix(&cm); ia.SetWrapMode(WrapModeTileFlipXY);
+    g.DrawImage(b, dst, 0, 0, (float)b->GetWidth(), (float)b->GetHeight(), UnitPixel, &ia);
+}
+static void PaintClock(HWND h, HDC dc) {   // the time and date on the black screen, like a phone's always-on screen; drifts a little every minute
     RECT rc; GetClientRect(h, &rc); int w = rc.right, hh = rc.bottom;
     HDC mdc = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, w, hh); HGDIOBJ old = SelectObject(mdc, bm);
     {
-        Graphics g(mdc); g.Clear(Color(255, 0, 0, 0)); g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        Graphics g(mdc); g.Clear(Color(255, 0, 0, 0)); g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit); g.SetSmoothingMode(SmoothingModeAntiAlias);
         static FontFamily* thin = nullptr; if (!thin) thin = PickFamily({L"Segoe UI Variable Display Light", L"Segoe UI Light", L"Segoe UI"});
-        float big = std::max(64.f * g_scale, std::min(150.f * g_scale, w * 0.11f)), small = std::max(14.f * g_scale, std::min(20.f * g_scale, w * 0.016f));
-        wchar_t tb[64] = {}, db[128] = {};
-        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS | TIME_NOTIMEMARKER, nullptr, nullptr, tb, 64);
+        static FontFamily* semi = nullptr; if (!semi) semi = PickFamily({L"Segoe UI Variable Display Semibold", L"Segoe UI Semibold", L"Segoe UI"});
+        float lev = g_ckBright == 0 ? 0.36f : g_ckBright == 1 ? 0.62f : 0.9f;
+        float cr = 1, cg = 1, cb = 1;
+        if (g_ckColour == 1) { cr = 1.f; cg = 0.78f; cb = 0.55f; }
+        else if (g_ckColour == 2) { cr = 0.72f; cg = 0.85f; cb = 1.f; }
+        else if (g_ckColour == 3) { Color a = T.accent; float m = std::max(1.f, (float)std::max(a.GetR(), std::max(a.GetG(), a.GetB()))); cr = a.GetR() / m; cg = a.GetG() / m; cb = a.GetB() / m; }
+        auto tone = [&](float k) { return Color(255, (BYTE)(cr * lev * k * 255), (BYTE)(cg * lev * k * 255), (BYTE)(cb * lev * k * 255)); };
+        LONG_PTR seed = GetWindowLongPtrW(h, GWLP_USERDATA) >> 1;   // the drift for this minute
+        static const float driftK[3] = {0.f, 0.02f, 0.06f};
+        static const float gridX[9] = {0.5f, 0.5f, 0.5f, 0.2f, 0.8f, 0.2f, 0.8f, 0.2f, 0.8f}, gridY[9] = {0.5f, 0.2f, 0.8f, 0.5f, 0.5f, 0.2f, 0.2f, 0.8f, 0.8f};   // centre, top, bottom, left, right, then the corners
+        int gp = std::max(0, std::min(8, g_ckPos));
+        float wx = ((seed % 97) / 48.f - 1) * w * driftK[g_ckDrift], wy = (((seed / 97) % 97) / 48.f - 1) * hh * driftK[g_ckDrift];
+        float dx = w * (gridX[gp] - 0.5f) + wx, dy = hh * (gridY[gp] - 0.5f) + wy;
+        Gdiplus::Bitmap* pic = ClockPic();
+        if (pic && g_picFull) {   // the picture over the whole screen, cropped to fit, dimmed
+            static const float dim[3] = {0.12f, 0.22f, 0.38f};
+            float pw = (float)pic->GetWidth(), ph = (float)pic->GetHeight(), k = std::max(w / pw, hh / ph);
+            g.SetInterpolationMode(InterpolationModeHighQualityBilinear);
+            DrawDimmed(g, pic, RectF((w - pw * k) / 2, (hh - ph * k) / 2, pw * k, ph * k), dim[g_picDim]);
+        }
+        float sz = g_ckSize == 0 ? 0.7f : g_ckSize == 2 ? 1.35f : 1.f;
+        float big = std::max(64.f * g_scale, std::min(150.f * g_scale, w * 0.11f)) * sz * (g_ckStyle == 2 ? 0.55f : g_ckStyle == 3 ? 0.8f : 1.f);
+        float small = std::max(14.f * g_scale, std::min(20.f * g_scale, w * 0.016f)) * std::min(1.25f, std::max(0.85f, sz));
+        wchar_t tb[64] = {}, db[128] = {}; SYSTEMTIME st; GetLocalTime(&st);
+        if (g_ckHour == 1) swprintf(tb, 64, L"%d:%02d", st.wHour % 12 ? st.wHour % 12 : 12, st.wMinute);
+        else if (g_ckHour == 2) swprintf(tb, 64, L"%02d:%02d", st.wHour, st.wMinute);
+        else GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS | TIME_NOTIMEMARKER, nullptr, nullptr, tb, 64);
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"dddd, MMMM d", db, 128, nullptr);
         std::wstring ts = tb; while (!ts.empty() && ts.back() == L' ') ts.pop_back();
-        LONG_PTR seed = GetWindowLongPtrW(h, GWLP_USERDATA) >> 1;   // the drift for this minute
-        float dx = ((seed % 97) / 48.f - 1) * w * 0.06f, dy = (((seed / 97) % 97) / 48.f - 1) * hh * 0.06f;
-        Font ft(thin, big, FontStyleRegular, UnitPixel), fd(g_famText, small, FontStyleRegular, UnitPixel);
+        FontFamily* fam = g_ckStyle == 1 ? semi : thin;
+        Font ft(fam, big, g_ckStyle == 1 ? FontStyleBold : FontStyleRegular, UnitPixel), fd(g_famText, small, FontStyleRegular, UnitPixel);
         StringFormat sf; sf.SetAlignment(StringAlignmentCenter);
-        SolidBrush b1(Color(255, 92, 92, 92)), b2(Color(255, 74, 74, 74));
-        float cy = hh / 2.f + dy;
-        g.DrawString(ts.c_str(), -1, &ft, RectF(dx, cy - big * 0.75f, (float)w, big * 1.3f), &sf, &b1);
-        g.DrawString(db, -1, &fd, RectF(dx, cy + big * 0.5f, (float)w, small * 2), &sf, &b2);
+        SolidBrush b1(tone(1.f)), b2(tone(0.8f));
+        float cy = hh / 2.f + dy, glyphTop;
+        if (g_ckStyle == 3) {   // hours over minutes
+            std::wstring a1, a2; size_t i = 0; while (i < ts.size() && iswdigit(ts[i])) i++;
+            a1 = ts.substr(0, i); while (i < ts.size() && !iswdigit(ts[i])) i++; a2 = ts.substr(i);
+            float lh = big * 0.95f, y1 = cy - lh * 1.15f;
+            g.DrawString(a1.c_str(), -1, &ft, RectF(dx, y1, (float)w, big * 1.3f), &sf, &b1);
+            g.DrawString(a2.c_str(), -1, &ft, RectF(dx, y1 + lh, (float)w, big * 1.3f), &sf, &b1);
+            if (g_ckDate) g.DrawString(db, -1, &fd, RectF(dx, y1 + lh * 2 + big * 0.25f, (float)w, small * 2), &sf, &b2);
+            glyphTop = y1 + big * 0.2f;
+        } else {
+            g.DrawString(ts.c_str(), -1, &ft, RectF(dx, cy - big * 0.75f, (float)w, big * 1.3f), &sf, &b1);
+            if (g_ckDate) g.DrawString(db, -1, &fd, RectF(dx, cy + big * 0.5f, (float)w, small * 2), &sf, &b2);
+            glyphTop = cy - big * 0.5f;
+        }
+        if (pic && g_picSmall) {   // a small picture right above the clock
+            float ps = std::min(w, hh) * 0.17f * (sz > 1.f ? 1.15f : sz < 1.f ? 0.85f : 1.f), gap = hh * 0.03f;
+            RectF pr(w / 2.f + dx - ps / 2, std::max(hh * 0.02f, glyphTop - gap - ps), ps, ps);
+            GraphicsPath cp; AddRound(cp, pr, ps * 0.2f);
+            GraphicsState gs0 = g.Save(); g.SetClip(&cp); g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            float pw = (float)pic->GetWidth(), ph = (float)pic->GetHeight(), k = std::max(ps / pw, ps / ph);
+            DrawDimmed(g, pic, RectF(pr.X + (ps - pw * k) / 2, pr.Y + (ps - ph * k) / 2, pw * k, ph * k), std::min(1.f, lev + 0.1f));
+            g.Restore(gs0);
+        }
+        if (g_ckNow) {   // what's playing, small in the lower left (it drifts a little too)
+            MSess* m = MediaCur();
+            if (m && !m->title.empty()) {
+                float cs = std::max(40.f * g_scale, small * 2.4f), x = w * 0.03f + wx * 0.3f, y = hh - hh * 0.04f - cs + wy * 0.3f;
+                if (g_cover) { GraphicsPath cp; AddRound(cp, RectF(x, y, cs, cs), cs * 0.14f); GraphicsState gs0 = g.Save(); g.SetClip(&cp); g.SetInterpolationMode(InterpolationModeHighQualityBicubic); DrawDimmed(g, g_cover, RectF(x, y, cs, cs), std::min(1.f, lev + 0.1f)); g.Restore(gs0); }
+                else x -= cs + small * 0.7f;
+                StringFormat lf; lf.SetAlignment(StringAlignmentNear); lf.SetTrimming(StringTrimmingEllipsisCharacter); lf.SetFormatFlags(StringFormatFlagsNoWrap);
+                Font f1(g_famSemi, small * 0.95f, FontStyleRegular, UnitPixel), f2(g_famText, small * 0.82f, FontStyleRegular, UnitPixel);
+                float tx = x + cs + small * 0.7f, tw2 = w * 0.34f;
+                g.DrawString(m->title.c_str(), -1, &f1, RectF(tx, y + cs * 0.5f - small * 1.25f, tw2, small * 1.4f), &lf, &b1);
+                g.DrawString(m->artist.c_str(), -1, &f2, RectF(tx, y + cs * 0.5f + small * 0.1f, tw2, small * 1.3f), &lf, &b2);
+            }
+        }
     }
     BitBlt(dc, 0, 0, w, hh, mdc, 0, 0, SRCCOPY);
     SelectObject(mdc, old); DeleteObject(bm); DeleteDC(mdc);
@@ -6710,18 +6801,42 @@ static void PaintSettings(HDC hdc) {
                 after(r.Height, S(4));
             }
             ddCard(5, L"Turn night light on automatically", L"Screens with night light switched on follow this", {L"Never — only with the moon button", L"Evenings (7 pm – 7 am)", L"Sunset to sunrise"}, g_nightAuto, 5);
-            {   // Screen off and Party screen
-                h4(L"Screen off and Party screen");
-                snote(L"What your screens show when you're not using them.");
+            {   // Screen off
+                h4(L"Screen off");
+                snote(L"What happens when you turn your screens off.");
                 auto names = ScreenNames();
                 ddCard(16, L"Turn off displays", L"The button and shortcut always turn them off at once. This also does it after a while of no keyboard or mouse use, but not during full-screen video or games", {L"Only with the button", L"After 15 minutes of no activity", L"After 30 minutes of no activity", L"After 1 hour of no activity", L"After 2 hours of no activity"}, g_offDelay, 6);
                 switchCard(29, L"Switch monitors fully off", L"Also tells each monitor to power down (DDC/CI), so the backlight goes dark. A key or mouse move wakes them; some DisplayPort monitors may move your windows", g_offFull, 14);
-                switchCard(27, L"Clock on the black screen", L"Dim grey time and date, like a phone's always-on screen. It drifts slowly to protect OLED screens", g_offClock, 7);
+                switchCard(27, L"Clock on the black screen", L"Time and date, like a phone's always-on screen. Off means completely black", g_offClock, 7);
                 if (g_offClock) {
                     std::vector<std::wstring> o = {L"Every screen", L"Main screen"}; int cur = g_clockScr == L"*" ? 0 : 1;
                     for (auto& n : names) { o.push_back(n); if (n == g_clockScr) cur = (int)o.size() - 1; }
                     ddCard(17, L"Show the clock on", L"The other screens just go black", o, cur, -1);
+                    ddCard(40, L"Clock style", L"", {L"Light", L"Bold", L"Small", L"Stacked"}, g_ckStyle, -1);
+                    ddCard(41, L"Clock size", L"", {L"Small", L"Medium", L"Large"}, g_ckSize, -1);
+                    ddCard(42, L"Brightness", L"Keep it low on OLED", {L"Dim", L"Medium", L"Bright"}, g_ckBright, -1);
+                    ddCard(43, L"Colour", L"", {L"Grey", L"Warm", L"Cool", L"Accent"}, g_ckColour, -1);
+                    ddCard(44, L"Hours", L"", {L"Same as Windows", L"12-hour", L"24-hour"}, g_ckHour, -1);
+                    ddCard(46, L"Position", L"", {L"Centre", L"Top", L"Bottom", L"Left", L"Right", L"Top left", L"Top right", L"Bottom left", L"Bottom right"}, g_ckPos, -1);
+                    ddCard(47, L"Move around", L"Shifts a little every minute so OLED screens don't burn in", {L"Off", L"A little", L"More"}, g_ckDrift, -1);
+                    switchCard(40, L"Show the date", L"", g_ckDate);
+                    switchCard(41, L"Show what's playing", L"Cover, title and artist, small in a corner. Not shown on a completely black screen", g_ckNow);
+                    {
+                        size_t sl = g_picFile.find_last_of(L'\\');
+                        std::wstring nm = g_picFile.empty() ? L"None chosen" : (sl == std::wstring::npos ? g_picFile : g_picFile.substr(sl + 1));
+                        btnCard(L"Picture", nm.c_str(), SK_BUTTON, 40, g_picFile.empty() ? L"Choose…" : L"Change…");
+                        if (!g_picFile.empty()) btnCard(L"Remove the picture", L"", SK_BUTTON, 41, L"Remove");
+                    }
+                    switchCard(42, L"Full-screen picture", L"Dimmed behind the clock", g_picFull);
+                    if (g_picFull) ddCard(45, L"Picture dimming", L"", {L"Very dim", L"Dim", L"Medium"}, g_picDim, -1);
+                    switchCard(43, L"Small picture above the clock", L"", g_picSmall);
+                    btnCard(L"Try it", L"Turns your screens off now, as the button does", SK_BUTTON, 42, L"Turn off now");
                 }
+            }
+            {   // Party screen
+                h4(L"Party screen");
+                snote(L"Big blurred light that moves with the music, in the cover's colours. Start it from the Display tab or a shortcut.");
+                auto names = ScreenNames();
                 {
                     std::vector<std::wstring> o = {L"Main screen"}; int cur = 0;
                     for (auto& n : names) { o.push_back(n); if (n == g_partyScr) cur = (int)o.size() - 1; }
@@ -7069,6 +7184,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else v = k >= 1 && k - 1 < (int)names.size() ? names[k - 1] : L"";
                 (dd == 17 ? g_clockScr : g_partyScr) = v; SaveSettings();
             }
+            if (dd >= 40 && dd <= 47) {
+                int* v[8] = {&g_ckStyle, &g_ckSize, &g_ckBright, &g_ckColour, &g_ckHour, &g_picDim, &g_ckPos, &g_ckDrift};
+                *v[dd - 40] = k; SaveSettings();
+            }
             if (dd == 31) { g_partyClose = std::max(0, std::min(1, k)); SaveSettings(); }
             if (dd == 19) { g_partyLook = std::max(0, std::min(2, k)); SaveSettings(); }
             if (dd >= 1000 && dd - 1000 < (int)g_sc.size()) {   // which speaker / profile a shortcut uses
@@ -7096,6 +7215,10 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (it.id == 27) { g_offClock = !g_offClock; g_newSeen |= 1 << 7; }
             else if (it.id == 28) g_partyInfo = !g_partyInfo;
             else if (it.id == 29) { g_offFull = !g_offFull; g_newSeen |= 1 << 14; }
+            else if (it.id == 40) g_ckDate = !g_ckDate;
+            else if (it.id == 41) g_ckNow = !g_ckNow;
+            else if (it.id == 42) g_picFull = !g_picFull;
+            else if (it.id == 43) g_picSmall = !g_picSmall;
             SaveSettings();
             break;
         case SK_LINK:
@@ -7115,6 +7238,14 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 static int tk = -1; for (int n = 0; n < 4; n++) { tk = (tk + 1) % 4; if (g_lkKeys & (1 << tk)) break; }
                 if (g_lkKeys & (1 << tk)) { bool was = g_lockPop[tk]; g_lockPop[tk] = !was; bool keep = g_popLock; g_popLock = true; PopLockKey(tk, !was); g_popLock = keep; }
             }
+            if (it.id == 40) {   // pick the picture for the black screen
+                wchar_t f[MAX_PATH] = {}; OPENFILENAMEW of = {sizeof(of)};
+                of.hwndOwner = h; of.lpstrFilter = L"Pictures\0*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff\0All files\0*.*\0"; of.lpstrFile = f; of.nMaxFile = MAX_PATH;
+                of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR; of.lpstrTitle = L"Picture for the black screen";
+                if (GetOpenFileNameW(&of)) { g_picFile = f; g_picLoaded = L"\x01"; }
+            }
+            if (it.id == 41) { g_picFile.clear(); g_picFull = false; g_picSmall = false; }
+            if (it.id == 42) ScreenOffRequest();
             if (it.id == 30) PartyStart();
             if (it.id == 31) { g_arrOff = 0; g_arrDirty = true; g_arrMsg.clear(); }
             if (it.id == 32) { g_arrMsg = ArrApply() ? L"Done \u00B7 Windows has the new arrangement" : L"Windows didn't take the new arrangement"; BrightRequest(true, false); }
@@ -7500,7 +7631,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_TRIM) {
             KillTimer(h, TIMER_TRIM);
             if (!g_visible && !g_set) {   // nothing on screen: free the frame buffers and let Windows reclaim idle memory
-                CanvasFree(g_cvFly); FadeFree(g_fadeFly);
+                if (!g_popShown) PopCacheFree(); CanvasFree(g_cvFly); FadeFree(g_fadeFly);
                 SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
             }
             return 0;
