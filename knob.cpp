@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.8"
+#define APP_VERSION L"1.42.9"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -6703,7 +6703,6 @@ static void PaintSettings(HDC hdc) {
                     for (auto& n : names) { o.push_back(n); if (n == g_clockScr) cur = (int)o.size() - 1; }
                     ddCard(17, L"Show the clock on", L"The other screens just go black", o, cur, -1);
                 }
-                btnCard(L"Party screen", L"Turns a screen into big blurred light that moves with the music, in the cover's colours. Start it from the Display tab or a shortcut; choose below how it ends", SK_BUTTON, 30, L"Show now");
                 {
                     std::vector<std::wstring> o = {L"Main screen"}; int cur = 0;
                     for (auto& n : names) { o.push_back(n); if (n == g_partyScr) cur = (int)o.size() - 1; }
