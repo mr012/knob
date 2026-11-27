@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.5"
+#define APP_VERSION L"1.42.6"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4958,9 +4958,37 @@ static void DrawFaded(Graphics& g, Gdiplus::Bitmap* b, RectF r, float alpha) {
     ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, alpha, 0}, {0, 0, 0, 0, 1}}};
     ImageAttributes ia; ia.SetColorMatrix(&cm); ia.SetWrapMode(WrapModeTileFlipXY);
     g.SetInterpolationMode(InterpolationModeBilinear);
-    g.DrawImage(b, r, 0, 0, (REAL)b->GetWidth(), (REAL)b->GetHeight(), UnitPixel, &ia);
+    float bw = (float)b->GetWidth(), bh = (float)b->GetHeight();
+    float cx0 = 0, cy0 = 0, cx1 = (float)std::max(1, g_popW), cy1 = (float)std::max(1, g_popH);   // the flyout's canvas
+    float x0 = std::max(r.X, cx0), y0 = std::max(r.Y, cy0), x1 = std::min(r.X + r.Width, cx1), y1 = std::min(r.Y + r.Height, cy1);
+    if (x1 <= x0 || y1 <= y0) return;
+    float sx = (x0 - r.X) / r.Width * bw, sy = (y0 - r.Y) / r.Height * bh, sw = (x1 - x0) / r.Width * bw, sh = (y1 - y0) / r.Height * bh;
+    g.DrawImage(b, RectF(x0, y0, x1 - x0, y1 - y0), sx, sy, sw, sh, UnitPixel, &ia);
 }
 static std::wstring Mmss(INT64 t100ns) { int s = (int)(t100ns / 10000000); wchar_t b[16]; swprintf(b, 16, L"%d:%02d", s / 60, s % 60); return b; }
+static std::map<std::wstring, Gdiplus::Bitmap*> g_mediaIcons;   // the player's own icon by app id (null: it has none we can find)
+static Gdiplus::Bitmap* MediaIcon(const std::wstring& aumid) {
+    if (aumid.empty()) return nullptr;
+    auto it = g_mediaIcons.find(aumid); if (it != g_mediaIcons.end()) return it->second;
+    Gdiplus::Bitmap* out = nullptr;
+    IShellItemImageFactory* fac = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName((L"shell:AppsFolder\\" + aumid).c_str(), nullptr, IID_PPV_ARGS(&fac))) && fac) {
+        HBITMAP hb = nullptr;
+        if (SUCCEEDED(fac->GetImage(SIZE{64, 64}, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &hb)) && hb) {
+            DIBSECTION ds = {};
+            if (GetObjectW(hb, sizeof(ds), &ds) && ds.dsBm.bmBitsPixel == 32 && ds.dsBm.bmBits) {
+                int w = ds.dsBm.bmWidth, h = ds.dsBm.bmHeight, st = ds.dsBm.bmWidthBytes; BYTE* bits = (BYTE*)ds.dsBm.bmBits;
+                bool bottomUp = ds.dsBmih.biHeight > 0;
+                Gdiplus::Bitmap tmp(w, h, bottomUp ? -st : st, PixelFormat32bppPARGB, bottomUp ? bits + (size_t)(h - 1) * st : bits);
+                out = tmp.Clone(0, 0, w, h, PixelFormat32bppPARGB);
+            }
+            DeleteObject(hb);
+        }
+        fac->Release();
+    }
+    g_mediaIcons[aumid] = out;
+    return out;
+}
 static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind the media flyout
     bool lt = !T.dark; Color a = PopAcc();
     float t = GetTickCount() / 1000.f;
@@ -5113,8 +5141,9 @@ static void PaintPop(HDC hdc) {
                     FillRound(g, g_popList || (many && g_popHot == 6) ? T.subtle3 : T.subtle2, chip, S(10));
                     static const DWORD tint[6] = {0xd9532b, 0x5865f2, 0x1a9f48, 0x2a7de1, 0xe07a10, 0x8e44ad};
                     unsigned hsh = 0; for (wchar_t ch : m->app) hsh = hsh * 31 + ch;
-                    RectF ic(chip.X + S(4), chip.Y + S(3.5f), S(13), S(13)); FillRound(g, Hex(tint[hsh % 6]), ic, S(3));
-                    Font fI(g_famSemi, S(8), FontStyleBold, UnitPixel); Text(g, m->app.substr(0, 1).c_str(), &fI, Color(255, 255, 255, 255), ic, StringAlignmentCenter);
+                    RectF ic(chip.X + S(3.5f), chip.Y + S(3), S(14), S(14));
+                    if (Gdiplus::Bitmap* pic = MediaIcon(m->aumid)) DrawAppIcon(g, pic, ic);
+                    else { FillRound(g, Hex(tint[hsh % 6]), ic, S(3)); Font fI(g_famSemi, S(8), FontStyleBold, UnitPixel); Text(g, m->app.substr(0, 1).c_str(), &fI, Color(255, 255, 255, 255), ic, StringAlignmentCenter); }
                     Text(g, m->app.c_str(), &fChip, g_popList || g_popHot == 6 ? T.t1 : T.t2, RectF(ic.X + S(18), chip.Y, tw2 + S(2), chip.Height));
                     if (many) Icon(g, "chevron", S(11), T.t2, chip.X + chip.Width - S(7) - S(5.5f), chip.Y + chip.Height / 2, g_popList ? 180.f : 0.f);
                 }
