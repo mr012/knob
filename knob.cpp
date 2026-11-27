@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.4"
+#define APP_VERSION L"1.42.5"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -5646,14 +5646,7 @@ static void PartyStart() {
 
 // ---------------------------------------------------------------- Turn off displays: the timer, and the clock on the black screen
 static void ScreenOffNow() { g_offAt = 0; KillTimer(g_hwnd, TIMER_OFFAT); HideFlyout(); SetTimer(g_hwnd, TIMER_SCREENOFF, 500, nullptr); }   // after the click settles
-static void ScreenOffRequest() {   // the button or the shortcut: right away, or start (or cancel) the timer from Settings
-    if (g_offAt) { g_offAt = 0; KillTimer(g_hwnd, TIMER_OFFAT); if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE); return; }
-    int mins = OFF_MIN[std::max(0, std::min(4, g_offDelay))];
-    if (!mins) { ScreenOffNow(); return; }
-    g_offAt = GetTickCount() + mins * 60000u; if (!g_offAt) g_offAt = 1;
-    SetTimer(g_hwnd, TIMER_OFFAT, 1000, nullptr);
-    if (g_visible) InvalidateRect(g_hwnd, nullptr, FALSE);
-}
+static void ScreenOffRequest() { ScreenOffNow(); }   // the button or the shortcut: right away. (Settings can also switch them off by themselves after no activity)
 static std::wstring OffLeft() { int s = g_offAt ? std::max(0, (int)(g_offAt - GetTickCount()) / 1000) : 0; wchar_t b[24]; swprintf(b, 24, L"Off in %d:%02d", s / 60, s % 60); return b; }
 static bool IsClockScreen(const RECT& rc) {   // does this screen show the clock on the black screen?
     if (!g_offClock) return false;
@@ -6523,7 +6516,7 @@ static void PaintSettings(HDC hdc) {
                 h4(L"Screen off and Party screen");
                 snote(L"What your screens show when you're not using them.");
                 auto names = ScreenNames();
-                ddCard(16, L"Turn off displays", L"When the Turn off button and its shortcut switch your screens off. With a delay, the button counts down and a click cancels", {L"Right away", L"After 15 minutes", L"After 30 minutes", L"After 1 hour", L"After 2 hours"}, g_offDelay, 6);
+                ddCard(16, L"Turn off displays", L"The Turn off button and its shortcut always switch your screens off right away. This also turns them off by themselves when you haven't used the keyboard or mouse for a while (not during full-screen video or games)", {L"Only with the button", L"After 15 minutes of no activity", L"After 30 minutes of no activity", L"After 1 hour of no activity", L"After 2 hours of no activity"}, g_offDelay, 6);
                 switchCard(29, L"Switch monitors fully off", L"Also sends each monitor its own power-down command (DDC/CI), so even an LCD's backlight goes dark. Any key or mouse move turns them back on; if one stays dark, press its power button. Some DisplayPort monitors disconnect while off, which can move your windows. Laptop screens go to their lowest brightness", g_offFull, 14);
                 switchCard(27, L"Clock on the black screen", L"The time and date in dim grey, like a phone's always-on screen. It drifts a little every minute so OLED screens don't burn in. Best on OLED; other screens keep their backlight on", g_offClock, 7);
                 if (g_offClock) {
@@ -7278,10 +7271,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_IDENT) {
             KillTimer(h, TIMER_IDENT);
             CloseIdentify();
-        } else if (wp == TIMER_OFFAT) {   // Turn off displays is counting down
-            if (!g_offAt) { KillTimer(h, TIMER_OFFAT); return 0; }
-            if ((int)(GetTickCount() - g_offAt) >= 0) { ScreenOffNow(); return 0; }
-            if (g_visible && g_tab == T_DISPLAY) InvalidateRect(h, nullptr, FALSE);
+        } else if (wp == TIMER_OFFAT) {   // Turn off displays after no keyboard or mouse activity (when Settings asks for it)
+            int mins = OFF_MIN[std::max(0, std::min(4, g_offDelay))];
+            if (!mins || !g_blackWnds.empty() || g_party || FullscreenBusy()) return 0;   // not set, already off, a party, or a full-screen video / game
+            LASTINPUTINFO li = {sizeof(li)};
+            if (GetLastInputInfo(&li) && GetTickCount() - li.dwTime >= (DWORD)mins * 60000u) ScreenOffNow();
             return 0;
         } else if (wp == TIMER_POPKEY) { KillTimer(h, TIMER_POPKEY); PopShow(POP_MEDIA); return 0; }
         else if (wp == TIMER_LOCKKEY) { KillTimer(h, TIMER_LOCKKEY); FlyoutLockNow(); return 0; }
@@ -7666,6 +7660,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
         MediaApply(m);
     }
     SetTimer(g_hwnd, TIMER_UPDCHECK, 15000, nullptr);   // first check 15 s after start
+    SetTimer(g_hwnd, TIMER_OFFAT, 15000, nullptr);      // Turn off displays after no activity: looked at every 15 seconds, only when set
     SetTimer(g_hwnd, TIMER_NIGHT, 60000, nullptr);      // night light: follow the evening schedule, and come back if Windows resets it
     SetTimer(g_hwnd, TIMER_TRAYPIN, 3000, nullptr);
     if (cmd && wcsstr(cmd, L"--show")) PostMessageW(g_hwnd, WM_APP_SHOW, 0, 0);   // just installed / updated: show it
