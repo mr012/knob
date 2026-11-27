@@ -54,7 +54,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.11"
+#define APP_VERSION L"1.42.12"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -354,7 +354,7 @@ static void LoadSettings() {
         g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); }   // the old list had Mirror bars second g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000); g_lkStayMs = gi(L"lkstayms", g_fStayMs ? g_fStayMs : 2000, 100, 60000);
-        g_fLayout = gi(L"flayout", 0, 0, 1); g_fGlow = gi(L"fglow", 1, 0, 5); g_lkKeys = gi(L"lkkeys", 15, 0, 15);
+        g_fLayout = gi(L"flayout", 0, 0, 1); { int og = gi(L"fglow", 1, 0, 5); og = og == 3 ? 1 : og > 3 ? og - 1 : og; g_fGlow = gi(L"fglow2", og, 0, 4); } g_lkKeys = gi(L"lkkeys", 15, 0, 15);   // the old glow list had Aurora fourth
         g_fCover = gi(L"fcover", 1, 0, 1); g_fCentre = gi(L"fcentre", 1, 0, 1); g_fPlayer = gi(L"fplayer", 1, 0, 1);
     }
     { wchar_t b[64]; GetPrivateProfileStringW(L"main", L"geo", L"", b, 64, g_iniPath.c_str()); double la, lo; long long w;
@@ -428,7 +428,7 @@ static void SaveSettings() {
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
         WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook2", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
-        wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"lkstayms", g_lkStayMs); wi(L"flayout", g_fLayout); wi(L"fglow", g_fGlow); wi(L"lkkeys", g_lkKeys);
+        wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"lkstayms", g_lkStayMs); wi(L"flayout", g_fLayout); wi(L"fglow2", g_fGlow); wi(L"lkkeys", g_lkKeys);
         wi(L"fcover", g_fCover); wi(L"fcentre", g_fCentre); wi(L"fplayer", g_fPlayer);
     }
     if (g_geoLat < 900) { wchar_t b[64]; swprintf(b, 64, L"%.2f,%.2f,%lld", g_geoLat, g_geoLon, g_geoWhen); WritePrivateProfileStringW(L"main", L"geo", b, g_iniPath.c_str()); }
@@ -4904,7 +4904,7 @@ static const wchar_t* LOCK_TXT[4][3] = {{L"Caps Lock", L"Caps Lock is on", L"Cap
                                        {L"Scroll Lock", L"Scroll Lock is on", L"Scroll Lock is off"}, {L"Insert", L"Overwrite mode", L"Insert mode"}};
 static int PopDur() { int d = std::max(0, std::min(2000, g_fAnimMs)); return g_popKind == POP_LOCK ? std::min(d, 200) : d; }   // a lock-key flyout only needs a quick slide
 static Color PopAcc() { return g_fCover && g_coverHas ? g_coverAcc : T.accent; }
-static bool PopAnimatedGlow() { return g_popKind == POP_MEDIA && (g_fGlow == 3 || g_fGlow == 4 || g_fGlow == 5); }
+static bool PopAnimatedGlow() { return g_popKind == POP_MEDIA && (g_fGlow == 3 || g_fGlow == 4); }
 static void BoxBlur(std::vector<UINT32>& px, int w, int h, int r, int passes) {   // premultiplied ARGB, separable box blur (a few passes look Gaussian)
     if (r < 1 || w < 2 || h < 2) return;
     std::vector<UINT32> tmp(px.size());
@@ -5003,23 +5003,8 @@ static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind 
     switch (g_fGlow) {
     case 1: DrawFaded(g, g_glowRise, RectF(-0.2f * W, 0.3f * H, 1.4f * W, 1.1f * H), lt ? .3f : .34f); break;   // rising glow
     case 2: DrawFaded(g, g_glowFull, RectF(-0.15f * W, -0.3f * H, 1.3f * W, 1.6f * H), lt ? .38f : .45f); break;   // blurred cover
-    case 3: {   // aurora: two soft bands of the cover's colours drifting slowly
-        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.5f * H), .18f);
-        auto blob = [&](float cx, float cy, float rw, float rh, float rot, Color c, float al) {
-            GraphicsPath p; p.AddEllipse(-rw / 2, -rh / 2, rw, rh);
-            PathGradientBrush pb(&p); Color mid((BYTE)(al * 255), c.GetR(), c.GetG(), c.GetB()), edge(0, c.GetR(), c.GetG(), c.GetB());
-            pb.SetCenterColor(mid); int n = 1; pb.SetSurroundColors(&edge, &n);
-            Matrix m; m.Translate(cx, cy); m.Rotate(rot); GraphicsState st = g.Save(); g.MultiplyTransform(&m); g.FillPath(&pb, &p); g.Restore(st);
-        };
-        auto ease = [](float x) { return 0.5f - 0.5f * cosf(x * 3.14159265f); };
-        float p1 = ease(fmodf(t / 7, 2) < 1 ? fmodf(t / 7, 1) : 1 - fmodf(t / 7, 1)), p2 = ease(fmodf(t / 9, 2) < 1 ? fmodf(t / 9, 1) : 1 - fmodf(t / 9, 1));
-        Color c2 = g_coverHas ? g_coverC2 : a; float h2, s2, l2; RgbToHsl(c2.GetR() / 255.f, c2.GetG() / 255.f, c2.GetB() / 255.f, h2, s2, l2);
-        blob(W * (0.15f + 0.45f * 0.7f * p1), H * (0.5f + 0.1f - 0.18f * p1), 0.9f * W, 1.3f * H, -12 + 30 * p1, g_coverHas ? g_coverC1 : a, lt ? .3f : .45f);
-        blob(W * (0.85f - 0.5f * 0.7f * p2), H * (0.5f - 0.06f + 0.18f * p2), 0.9f * W, 1.3f * H, 10 - 26 * p2, Hsl(h2 + 35, std::max(s2, .4f), l2), lt ? .3f : .45f);
-        break;
-    }
-    case 4: {   // edge light: a line in the cover's colour travelling round the edge, with a soft glow around it
-        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.4f * H), .14f);
+    case 3: {   // edge light: a line in the cover's colour travelling round the edge, with a soft glow around it
+        DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.4f * H), .12f);
         float head = fmodf(t / 3.2f, 1.f) * 360.f, rad = S(8), cx = W / 2, cy = H / 2;
         std::vector<PointF> pts;   // the rounded edge, one point every few pixels
         auto arc = [&](float ax, float ay, float a0) { for (int i = 0; i <= 6; i++) { float an = (a0 + i * 15) * 3.14159265f / 180; pts.push_back(PointF(ax + rad * cosf(an), ay + rad * sinf(an))); } };
@@ -5031,7 +5016,7 @@ static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind 
         line(PointF(in, H - in - rad), PointF(in, in + rad)); arc(in + rad, in + rad, 180);
         auto f = [](float u) { return u < .45f ? 0.f : u < .68f ? (u - .45f) / .23f * .55f : u < .8f ? .55f + (u - .68f) / .12f * .45f : u < .9f ? 1 - (u - .8f) / .1f * .45f : .55f * (1 - (u - .9f) / .1f); };
         for (int pass = 0; pass < 4; pass++) {   // three wide faint strokes for the glow, then the line
-            static const float wd[4] = {12, 8, 5, 2}, al[4] = {.12f, .16f, .22f, .55f};
+            static const float wd[4] = {20, 13, 7, 2.5f}, al[4] = {.06f, .09f, .13f, .30f};
             for (size_t i = 0; i + 1 < pts.size() + 1; i++) {
                 PointF p0 = pts[i], p1 = pts[(i + 1) % pts.size()];
                 float ang = atan2f((p0.X + p1.X) / 2 - cx, -((p0.Y + p1.Y) / 2 - cy)) * 180 / 3.14159265f; if (ang < 0) ang += 360;
@@ -5043,7 +5028,7 @@ static void PopGlow(Graphics& g, float W, float H) {   // the cover glow behind 
         }
         break;
     }
-    case 5: {   // pulse with the music: 22 blurred bars rising from the bottom edge (zero = the edge)
+    case 4: {   // pulse with the music: 22 blurred bars rising from the bottom edge (zero = the edge)
         DrawFaded(g, g_glowFull, RectF(-0.2f * W, -0.2f * H, 1.4f * W, 1.4f * H), .1f);
         const int n = 22, bw = 88, bh = 40; std::vector<UINT32> px(bw * bh, 0);
         for (int k = 0; k < n; k++) {
@@ -5342,8 +5327,8 @@ static void PopShow(int kind) {
     int y = top ? wa.top + mH : wa.bottom - mB - hh;
     g_popAt = POINT{x, y}; g_popSlide = (int)S(20) * (top ? -1 : 1);
     if (!sameKind) { g_popList = false; g_popHot = -1; }
-    if (kind == POP_MEDIA && g_fGlow == 5 && !g_popLv) { g_popLv = true; LevelsStart(); }
-    if ((kind != POP_MEDIA || g_fGlow != 5) && g_popLv) { g_popLv = false; LevelsStop(); }
+    if (kind == POP_MEDIA && g_fGlow == 4 && !g_popLv) { g_popLv = true; LevelsStart(); }
+    if ((kind != POP_MEDIA || g_fGlow != 4) && g_popLv) { g_popLv = false; LevelsStop(); }
     PopArm();
     if (wasShown) { if (g_popDir == 0) PopPlace(true, 1); }
     else {
@@ -6785,7 +6770,7 @@ static void PaintSettings(HDC hdc) {
             snote(L"Solid or Glass and light or dark follow Settings \u203A Appearance.");
             h4(L"Media");
             ddCard(14, L"Layout", L"Compact is one slim row: cover, title and play controls", {L"Standard", L"Compact"}, g_fLayout, -1);
-            ddCard(15, L"Cover glow", L"The cover's colours behind the flyout. The moving ones only move while the flyout is on screen", {L"Off", L"Rising glow", L"Blurred cover", L"Aurora", L"Edge light", L"Pulse with the music"}, g_fGlow, -1);
+            ddCard(15, L"Cover glow", L"The cover's colours behind the flyout. The moving ones only move while the flyout is on screen", {L"Off", L"Rising glow", L"Blurred cover", L"Edge light", L"Pulse with the music"}, g_fGlow, -1);
             if (g_fLayout == 0) {
                 switchCard(24, L"Centre the title and artist", L"", g_fCentre);
                 switchCard(25, L"Show the player", L"Its name, and a list to switch when more than one is playing", g_fPlayer);
