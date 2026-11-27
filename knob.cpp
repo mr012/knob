@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.1"
+#define APP_VERSION L"1.42.2"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -6599,7 +6599,6 @@ static void PaintSettings(HDC hdc) {
                     RectF c(bx, cy, ws[i], S(28)); add(SK_CHIP, i, c);
                     bool on = (g_lkKeys >> i) & 1, hv = isHover(SK_CHIP, i);
                     FillRound(g, on ? WithAlpha(T.accent, hv ? 70 : 48) : (hv ? T.subtle3 : T.subtle2), c, S(14));
-                    if (on) { Pen pn(T.accent, S(1)); GraphicsPath gp; AddRound(gp, RectF(c.X + S(0.5f), c.Y + S(0.5f), c.Width - S(1), c.Height - S(1)), S(13.5f)); g.DrawPath(&pn, &gp); }
                     Text(g, kn[i], on ? &fDesc600 : &fDesc, on ? T.t1 : T.t2, c, StringAlignmentCenter);
                     bx += ws[i] + S(6);
                 }
