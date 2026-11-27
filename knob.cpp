@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.0"
+#define APP_VERSION L"1.42.1"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -4878,6 +4878,7 @@ static void CoverColours() {   // the cover's colours: an accent for buttons and
 // Small windows that appear by themselves near the edge of a screen, never take focus, and stay hidden while
 // something runs full screen. Same surface as the panel (Solid or Glass); buttons take the cover's colour.
 enum { POP_MEDIA, POP_NEXT, POP_LOCK };
+static DWORD g_popVolT0 = 0;   // the media flyout was opened by a volume change just now: it shows the volume too
 static HWND g_pop = nullptr;
 static int g_popKind = -1, g_popW = 0, g_popH = 0, g_popDir = 0;   // g_popDir 1 arriving, -1 leaving, 0 resting
 static DWORD g_popT0 = 0, g_popHideAt = 0;
@@ -5077,6 +5078,19 @@ static void PaintPop(HDC hdc) {
                 if (g_popHot == 7 || g_popDrag == 7) { float kx = tr.X + tr.Width * frac, cy = tr.Y + tr.Height / 2; SolidBrush sh(Color(70, 0, 0, 0)); g.FillEllipse(&sh, kx - S(6), cy - S(5), S(12), S(12)); SolidBrush wb(Color(255, 255, 255, 255)); g.FillEllipse(&wb, kx - S(6), cy - S(6), S(12), S(12)); }
             };
             bool playing = m->status == 4;
+            auto volPill = [&](float rightEdge, float y) {   // after a volume change: the speaker and its level, for a moment
+                if (!g_popVolT0 || GetTickCount() - g_popVolT0 > 2200) return;
+                int di = DefaultOut(); if (di < 0) return;
+                bool mu = g_out[di].mute; int pc = (int)lround(g_out[di].level * 100);
+                std::wstring t = mu ? L"Mute" : std::to_wstring(pc);
+                float tw = TextW(g, t.c_str(), &fChip), w = S(8) + S(14) + S(5) + std::max(tw, S(16)) + S(9);
+                RectF pr(rightEdge - w, y, w, S(20));
+                FillRound(g, T.subtle2, pr, S(10));
+                Glyph(g, mu ? G_MUTE : G_VOLUME, g_fIcon, T.t1, pr.X + S(8) + S(7), pr.Y + S(10));
+                Text(g, t.c_str(), &fChip, T.t1, RectF(pr.X + S(8) + S(14) + S(5), pr.Y, std::max(tw, S(16)) + S(4), pr.Height));
+            };
+            if (compact) volPill(W - S(12), S(3));
+            else volPill(W - S(14) - (g_fStayMs == 0 ? S(30) : 0), S(10));
             if (!compact) {
                 cover(RectF(S(14), S(18), S(58), S(58)), S(10), true);
                 textCol(m->title, m->artist, RectF(S(84), S(36), W - S(84) - S(14), S(40)), g_fCentre);
@@ -5280,6 +5294,11 @@ static void PopShow(int kind) {
     PopTimer();
     InvalidateRect(g_pop, nullptr, FALSE);
 }
+static void PopVolumeChanged() {   // the volume moved (a key, a Knob shortcut, Windows' slider): show the media flyout with the level
+    if (!g_popMedia || g_visible || g_set || !MediaCur()) return;
+    g_popVolT0 = GetTickCount();
+    PopShow(POP_MEDIA);
+}
 static void PopLockKey(int k, bool on) {   // a lock key changed: show the old state turning into the new one
     if (!g_popLock || !(g_lkKeys & (1 << k))) return;
     g_popLockKey = k; g_popLockOn = on; g_popLockT0 = GetTickCount();
@@ -5366,8 +5385,14 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 static void MediaApply(MediaSnap* m) {   // a new snapshot from the media thread
     if (m->newCover) { delete g_cover; g_cover = m->cover; m->cover = nullptr; CoverColours(); BuildGlows(); }
     int why = m->why;
+    std::wstring prevId; int prevSt = -1;
+    if (MSess* pc = MediaCur()) { prevId = pc->aumid; prevSt = pc->status; }
     g_ms.s = std::move(m->s); g_ms.cur = m->cur;
     delete m->cover; delete m;
+    if (MSess* nc = MediaCur()) {   // play or pause, from a key, a website, the player itself: the media flyout shows it
+        bool flip = nc->aumid == prevId && ((prevSt == 4 && nc->status == 5) || (prevSt == 5 && nc->status == 4));
+        if (flip && g_popMedia && !g_visible && !g_set && GetTickCount() > 5000) { g_popVolT0 = 0; PopShow(POP_MEDIA); }
+    }
     if (why == 2 && g_popNext) PopShow(POP_NEXT);
     if (g_popShown && g_pop) { if (!MediaCur() && g_popKind != POP_LOCK && !g_popTry) PopHide(); else InvalidateRect(g_pop, nullptr, FALSE); }
 }
@@ -7153,6 +7178,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         RefreshEndpointLevels(g_out); RefreshEndpointLevels(g_in);
         UpdateTrayTip();
         if (g_visible && g_dragEl < 0) InvalidateRect(h, nullptr, FALSE);
+        {   // the main speaker's volume or mute really changed (not just a refresh): the media flyout shows it
+            static int lastSig = -1; int di = DefaultOut();
+            int sig = di < 0 ? -1 : (int)lround(g_out[di].level * 100) * 2 + (g_out[di].mute ? 1 : 0);
+            if (lastSig >= 0 && sig >= 0 && sig != lastSig && GetTickCount() > 5000) PopVolumeChanged();
+            lastSig = sig;
+        }
         return 0;
     case WM_HOTKEY: if (wp >= 100 && (int)wp < 100 + (int)g_sc.size()) RunHotkey(g_sc[wp - 100].act, g_sc[wp - 100].param); return 0;
     case WM_APP_AUDIOCHANGED: SetTimer(h, TIMER_AUDIODEBOUNCE, 200, nullptr); return 0;
