@@ -46,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.8"
+#define APP_VERSION L"1.41.9"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -575,11 +575,13 @@ static bool InBtContainer(IPropertyStore* ps) {
 }
 static void Classify(Endpoint& e, bool capture, UINT ff, const std::wstring& path) {
     std::wstring nm = e.rawName, ifc = e.rawIface, both = ToLower(nm + L" " + ifc);
+    bool inCont = path.find(L"|btcontainer") != std::wstring::npos;   // the physical device also has a Bluetooth part: only believed when the sound chip isn't the PC's own
     bool bt = path.find(L"bth") != std::wstring::npos || path.find(L"bluetooth") != std::wstring::npos;
+    bool builtChip = path.find(L"hdaudio") != std::wstring::npos || path.find(L"intelaudio") != std::wstring::npos || path.find(L"intcaudio") != std::wstring::npos ||
+                     path.find(L"acp") != std::wstring::npos || path.find(L"sst") != std::wstring::npos || path.find(L"soundwire") != std::wstring::npos || path.find(L"pci") != std::wstring::npos;
+    if (!bt && inCont && !builtChip && path.find(L"usb") == std::wstring::npos) bt = true;
     bool usb = !bt && path.find(L"usb") != std::wstring::npos;
-    bool codec = !bt && !usb && (path.find(L"hdaudio") != std::wstring::npos || path.find(L"intelaudio") != std::wstring::npos ||
-                 path.find(L"intcaudio") != std::wstring::npos || path.find(L"acp") != std::wstring::npos || path.find(L"sst") != std::wstring::npos ||
-                 path.find(L"soundwire") != std::wstring::npos || path.find(L"pci") != std::wstring::npos);   // built-in sound chip
+    bool codec = !bt && !usb && builtChip;   // built-in sound chip
     if (!bt && !usb && !codec && (ff == 3 || ff == 5) && !IsCodecName(ifc) && !ifc.empty() && LooksLikeEarbuds(ifc)) bt = true;   // earbuds are wireless
     bool virt = path.find(L"root#") != std::wstring::npos || path.find(L"\\root") != std::wstring::npos;
     for (auto w : {L"vb-audio", L"voicemeeter", L"virtual", L"steam streaming", L"nvidia broadcast", L"cable input", L"cable output"}) if (both.find(w) != std::wstring::npos) virt = true;
@@ -675,7 +677,7 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         if (e.name.empty()) e.name = L"Audio device";
         e.rawName = e.name; e.rawIface = e.detail;
         std::wstring hwPath;
-        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); if (InBtContainer(ps)) hwPath += L"|bluetooth"; ps->Release(); ps = nullptr; }
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); if (InBtContainer(ps)) hwPath += L"|btcontainer"; ps->Release(); ps = nullptr; }
         Classify(e, flow == eCapture, ff, hwPath + L"|" + ConnectedPath(dev));
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
