@@ -50,7 +50,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.2"
+#define APP_VERSION L"1.42.3"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -5275,7 +5275,7 @@ static void PopShow(int kind) {
         w = (int)(S(14) + S(20) + S(11) + tw + S(18)); hh = (int)S(48);
     }
     g_popW = w; g_popH = hh; g_popKind = kind;
-    int mH = (int)S(24), mB = (int)S(12);
+    int mH = (int)S(24), mB = (int)S(30);
     int x = g_fPos == 1 || g_fPos == 4 ? wa.left + mH : g_fPos == 2 || g_fPos == 5 ? wa.right - mH - w : wa.left + (wa.right - wa.left - w) / 2;
     bool top = g_fPos >= 3;
     int y = top ? wa.top + mH : wa.bottom - mB - hh;
