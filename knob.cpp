@@ -46,7 +46,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.41.9"
+#define APP_VERSION L"1.41.10"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -165,6 +165,7 @@ struct Endpoint {
     std::wstring rawName, rawIface;  // what Windows calls it
     int kind = DK_SPEAKER, icon = DI_SPEAKER;
     bool bt = false;
+    int battery = -1;   // Bluetooth devices that report it, percent
     bool isDefault = false;
     IAudioEndpointVolume* vol = nullptr;
     float level = 0;
@@ -546,9 +547,11 @@ static std::wstring ConnectedPath(IMMDevice* dev) {   // the hardware behind the
 // Bluetooth speakers often report a plain hardware path, so also ask: does this endpoint's physical device (container) have a Bluetooth part?
 static const PROPERTYKEY PK_ContainerId = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
 static std::set<std::wstring> g_btContainers;
+static std::map<std::wstring, int> g_btBattery;   // container -> battery percent, for Bluetooth devices that report it
 static std::wstring GuidKey(const GUID& g) { wchar_t b[64]; swprintf(b, 64, L"%08lx-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x", g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]); return b; }
 static void RefreshBtContainers() {
-    g_btContainers.clear();
+    g_btContainers.clear(); g_btBattery.clear();
+    static const DEVPROPKEY bk = {{0x104ea319, 0x6ee2, 0x4701, {0xbd, 0x47, 0x8d, 0xdb, 0xf4, 0x25, 0xbb, 0xe5}}, 2};   // Windows keeps a Bluetooth device's battery here
     static const DEVPROPKEY dk = {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
     for (auto en : {L"BTHENUM", L"BTHLEENUM", L"BTHHFENUM", L"BTHLE"}) {
         ULONG len = 0;
@@ -560,16 +563,22 @@ static void RefreshBtContainers() {
             GUID g{}; DEVPROPTYPE ty = 0; ULONG sz = sizeof(g);
             if (CM_Get_DevNode_PropertyW(di, &dk, &ty, (PBYTE)&g, &sz, 0) == CR_SUCCESS && sz == sizeof(g)) {
                 std::wstring k = GuidKey(g);
-                if (k != L"00000000-0000-0000-ffff-ffffffffffff" && k != L"00000000-0000-0000-0000-000000000000") g_btContainers.insert(k);   // not the PC itself: the Bluetooth radio lives there, and the built-in speakers too
+                if (k != L"00000000-0000-0000-ffff-ffffffffffff" && k != L"00000000-0000-0000-0000-000000000000") {   // not the PC itself: the Bluetooth radio lives there, and the built-in speakers too
+                    g_btContainers.insert(k);
+                    BYTE pct = 0; DEVPROPTYPE bt2 = 0; ULONG bs = sizeof(pct);
+                    if (CM_Get_DevNode_PropertyW(di, &bk, &bt2, &pct, &bs, 0) == CR_SUCCESS && bs >= 1 && pct <= 100) { auto it = g_btBattery.find(k); if (it == g_btBattery.end() || pct > it->second) g_btBattery[k] = pct; }
+                }
             }
         }
     }
 }
-static bool InBtContainer(IPropertyStore* ps) {
-    PROPVARIANT pv; PropVariantInit(&pv); bool r = false;
+static bool InBtContainer(IPropertyStore* ps, int* battery = nullptr) {
+    PROPVARIANT pv; PropVariantInit(&pv); bool r = false; std::wstring key;
     if (SUCCEEDED(ps->GetValue(PK_ContainerId, &pv))) {
-        if (pv.vt == VT_CLSID && pv.puuid) r = g_btContainers.count(GuidKey(*pv.puuid)) > 0;
-        else if (pv.vt == VT_LPWSTR && pv.pwszVal) { GUID g; if (SUCCEEDED(CLSIDFromString(pv.pwszVal, &g))) r = g_btContainers.count(GuidKey(g)) > 0; }
+        if (pv.vt == VT_CLSID && pv.puuid) key = GuidKey(*pv.puuid);
+        else if (pv.vt == VT_LPWSTR && pv.pwszVal) { GUID g; if (SUCCEEDED(CLSIDFromString(pv.pwszVal, &g))) key = GuidKey(g); }
+        r = !key.empty() && g_btContainers.count(key) > 0;
+        if (r && battery) { auto it = g_btBattery.find(key); if (it != g_btBattery.end()) *battery = it->second; }
     }
     PropVariantClear(&pv); return r;
 }
@@ -631,7 +640,7 @@ static void DemoEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
     static const D in[] = {{L"Realtek(R) Audio", L"Microphone Array", DK_MIC, DI_MIC, false, 100, true}, {L"Arctis Nova 5", L"Headset Microphone", DK_HEADPHONES, DI_HEADPHONES, false, 85, false}};
     bool o = flow == eRender; const D* L = o ? out : in; int n = o ? 6 : 2;
     for (int i = 0; i < n; i++) { Endpoint e; e.id = (o ? L"demo-out-" : L"demo-in-") + std::to_wstring(i); e.name = L[i].n; e.detail = L[i].d; e.kind = L[i].kind; e.icon = L[i].icon;
-        e.bt = L[i].bt; e.level = L[i].lvl / 100.f; e.isDefault = L[i].def; v.push_back(e); }
+        e.bt = L[i].bt; if (e.bt) e.battery = i == 2 ? 82 : 64; e.level = L[i].lvl / 100.f; e.isDefault = L[i].def; v.push_back(e); }
     static bool once = false;
     if (o && !once) { once = true; g_mirror = {L"demo-out-1"}; g_delay[L"demo-out-1"] = -10; g_delay[L"demo-out-2"] = -200; }   // the design's state: two speakers together, synced
     if (o && !g_demoDefault.empty()) for (auto& e : v) e.isDefault = e.id == g_demoDefault;
@@ -676,9 +685,10 @@ static void LoadEndpoints(EDataFlow flow, std::vector<Endpoint>& v) {
         }
         if (e.name.empty()) e.name = L"Audio device";
         e.rawName = e.name; e.rawIface = e.detail;
-        std::wstring hwPath;
-        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); if (InBtContainer(ps)) hwPath += L"|btcontainer"; ps->Release(); ps = nullptr; }
+        std::wstring hwPath; int batt = -1;
+        if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps))) { hwPath = ToLower(PropStr(ps, PK_HwInstance)); if (InBtContainer(ps, &batt)) hwPath += L"|btcontainer"; ps->Release(); ps = nullptr; }
         Classify(e, flow == eCapture, ff, hwPath + L"|" + ConnectedPath(dev));
+        if (e.bt && flow != eCapture) e.battery = batt;
         dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&e.vol);
         e.isDefault = (e.id == defId);
         if (e.vol) { e.vol->GetMasterVolumeLevelScalar(&e.level); e.vol->GetMute(&e.mute); if (g_volCb) e.vol->RegisterControlChangeNotify(g_volCb); }
@@ -3234,6 +3244,19 @@ static void DrawEl(Graphics& g, int index) {
         Text(g, name.c_str(), nf, T.t1, RectF(nx, cy1 - S(10), nw + S(2), S(20)));
         float after = nx + nw + S(10);
         if (!detail.empty()) Text(g, detail.c_str(), g_fSmall, calDetail ? T.accent : T.t3, RectF(after, cy1 - S(9), std::max(0.f, maxW - nw - S(10)), S(18)));
+        if (e.k == E_OUT && g_out[e.idx].battery >= 0 && !calDetail) {   // Bluetooth battery: a small battery and the percent, after the name
+            int pc = g_out[e.idx].battery;
+            float dw = detail.empty() ? 0.f : std::min(TextW(g, detail.c_str(), g_fSmall), std::max(0.f, maxW - nw - S(10))) + S(9);
+            std::wstring pt = std::to_wstring(pc) + L"%";
+            float bx0 = after + dw, bw = S(15), bh = S(8), by0 = cy1 - bh / 2;
+            if (bx0 + bw + S(4) + TextW(g, pt.c_str(), g_fSmall) <= e.r.X + e.r.Width - S(8)) {
+                Color bc = pc <= 15 ? Color(255, 226, 74, 63) : T.t3;
+                Pen bp(bc, S(1.2f)); GraphicsPath bpth; AddRound(bpth, RectF(bx0, by0, bw, bh), S(2.2f)); g.DrawPath(&bp, &bpth);
+                SolidBrush tip(bc); g.FillRectangle(&tip, bx0 + bw + S(1), cy1 - S(1.8f), S(1.5f), S(3.6f));
+                float fw = std::max(S(1.5f), (bw - S(3.2f)) * pc / 100.f); FillRound(g, bc, RectF(bx0 + S(1.6f), by0 + S(1.6f), fw, bh - S(3.2f)), S(1));
+                Text(g, pt.c_str(), g_fSmall, bc, RectF(bx0 + bw + S(5), cy1 - S(9), S(40), S(18)));
+            }
+        }
         if (playing) {   // live bars driven by the app's real peak level
             float lvl = std::min(1.f, g_live[g_apps[e.idx].key].smooth * 4.f);
             DWORD t = GetTickCount();
