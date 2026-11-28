@@ -55,7 +55,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.19"
+#define APP_VERSION L"1.42.20"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -134,6 +134,8 @@ static int g_offDelay = 0;              // Turn off displays: 0 right away, else
 static DWORD g_offAt = 0;               // a timer is running: GetTickCount() when the screens go off
 // the clock on the black screen: its look, a picture, and what's playing
 static int g_ckStyle = 0, g_ckSize = 1, g_ckBright = 0, g_ckColour = 0, g_ckHour = 0, g_picDim = 1;   // style 0 light 1 bold 2 small 3 stacked; size 0..2; brightness 0..2; colour grey/warm/cool/accent; hours system/12/24; picture dimming
+static bool g_crashLog = true;   // a log of crashes on this PC (nothing is sent anywhere)
+static void ReportProblem();
 static int g_ckPos = 0, g_ckDrift = 0;   // where the clock sits (a 3 x 3 grid, 0 = centre) and how far it wanders each minute (off, a little, more)
 static bool g_ckDate = true, g_ckNow = false, g_picFull = false, g_picSmall = false;
 static std::wstring g_picFile, g_picFile2;   // the full-screen picture and the small one are separate files
@@ -358,7 +360,7 @@ static void LoadSettings() {
         auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
         g_ckStyle = gi(L"ckstyle", 0, 0, 3); g_ckSize = gi(L"cksize", 1, 0, 2); g_ckBright = gi(L"ckbright", 0, 0, 2); g_ckColour = gi(L"ckcolour", 0, 0, 3); g_ckHour = gi(L"ckhour", 0, 0, 2);
-        g_ckDate = gi(L"ckdate", 1, 0, 1); g_ckNow = gi(L"cknow", 0, 0, 1); g_picFull = gi(L"picfull", 0, 0, 1); g_picSmall = gi(L"picsmall", 0, 0, 1); g_picDim = gi(L"picdim", 1, 0, 2); g_picFile = gs(L"picfile"); g_picFile2 = gs(L"picfile2"); if (g_picFile2.empty() && gi(L"picsmall", 0, 0, 1)) g_picFile2 = g_picFile; g_ckPos = gi(L"ckpos", 0, 0, 8); g_ckDrift = gi(L"ckdrift", 0, 0, 1);
+        g_ckDate = gi(L"ckdate", 1, 0, 1); g_ckNow = gi(L"cknow", 0, 0, 1); g_picFull = gi(L"picfull", 0, 0, 1); g_picSmall = gi(L"picsmall", 0, 0, 1); g_picDim = gi(L"picdim", 1, 0, 2); g_picFile = gs(L"picfile"); g_picFile2 = gs(L"picfile2"); if (g_picFile2.empty() && gi(L"picsmall", 0, 0, 1)) g_picFile2 = g_picFile; g_crashLog = gi(L"crashlog", 1, 0, 1); g_ckPos = gi(L"ckpos", 0, 0, 8); g_ckDrift = gi(L"ckdrift", 0, 0, 1);
         g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); } g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);   // the old look list had Mirror bars second
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000); g_lkStayMs = gi(L"lkstayms", g_fStayMs ? g_fStayMs : 2000, 100, 60000);
@@ -435,7 +437,7 @@ static void SaveSettings() {
         auto wi = [&](const wchar_t* k, int v) { WritePrivateProfileStringW(L"main", k, std::to_wstring(v).c_str(), g_iniPath.c_str()); };
         wi(L"offdelay", g_offDelay); wi(L"offclock", g_offClock); wi(L"offfull", g_offFull); WritePrivateProfileStringW(L"main", L"clockscr", g_clockScr.c_str(), g_iniPath.c_str());
         wi(L"ckstyle", g_ckStyle); wi(L"cksize", g_ckSize); wi(L"ckbright", g_ckBright); wi(L"ckcolour", g_ckColour); wi(L"ckhour", g_ckHour); wi(L"ckdate", g_ckDate); wi(L"cknow", g_ckNow);
-        wi(L"picfull", g_picFull); wi(L"picsmall", g_picSmall); wi(L"picdim", g_picDim); wi(L"ckpos", g_ckPos); wi(L"ckdrift", g_ckDrift); WritePrivateProfileStringW(L"main", L"picfile", g_picFile.c_str(), g_iniPath.c_str()); WritePrivateProfileStringW(L"main", L"picfile2", g_picFile2.c_str(), g_iniPath.c_str());
+        wi(L"picfull", g_picFull); wi(L"picsmall", g_picSmall); wi(L"picdim", g_picDim); wi(L"crashlog", g_crashLog); wi(L"ckpos", g_ckPos); wi(L"ckdrift", g_ckDrift); WritePrivateProfileStringW(L"main", L"picfile", g_picFile.c_str(), g_iniPath.c_str()); WritePrivateProfileStringW(L"main", L"picfile2", g_picFile2.c_str(), g_iniPath.c_str());
         WritePrivateProfileStringW(L"main", L"partyscr", g_partyScr.c_str(), g_iniPath.c_str()); wi(L"partylook2", g_partyLook); wi(L"partyinfo", g_partyInfo); wi(L"partyclose", g_partyClose); wi(L"ratebat", g_rateBat);
         wi(L"popmedia", g_popMedia); wi(L"popnext", g_popNext); wi(L"poplock", g_popLock);
         wi(L"fpos", g_fPos); wi(L"fscreen", g_fScreen); wi(L"fstayms", g_fStayMs); wi(L"fanimms", g_fAnimMs); wi(L"lkstayms", g_lkStayMs); wi(L"flayout", g_fLayout); wi(L"fglow2", g_fGlow); wi(L"lkkeys", g_lkKeys);
@@ -5336,7 +5338,7 @@ static void PopShow(int kind) {
         w = (int)(S(14) + S(20) + S(11) + tw + S(18)); hh = (int)S(48);
     }
     g_popW = w; g_popH = hh; g_popKind = kind;
-    int mH = (int)S(24), mB = (int)S(30);
+    int mH = (int)S(24), mB = (int)S(g_fPos == 0 ? 100 : 44);   // bottom centre sits above Windows' own volume and brightness bar
     int x = g_fPos == 1 || g_fPos == 4 ? wa.left + mH : g_fPos == 2 || g_fPos == 5 ? wa.right - mH - w : wa.left + (wa.right - wa.left - w) / 2;
     bool top = g_fPos >= 3;
     int y = top ? wa.top + mH : wa.bottom - mB - hh;
@@ -7017,6 +7019,8 @@ static void PaintSettings(HDC hdc) {
                 else btnCard(L"Updates", st.c_str(), SK_BUTTON, 3, g_updState == UPD_DOWNLOADING ? L"Updating…" : L"Check now", false, g_updState != UPD_DOWNLOADING);
             }
             linkCard(3, L"Open the settings folder", L"settings.ini lives in %APPDATA%\\Knob");
+            switchCard(45, L"Keep a crash log", L"Saved only on this PC, in the settings folder: version, where it crashed, Windows build. Nothing is sent anywhere", g_crashLog);
+            btnCard(L"Report a problem", L"Opens a GitHub issue with those details filled in. You review it, and nothing goes out unless you press Submit", SK_BUTTON, 70, L"Report\u2026");
             btnCard(L"Reset all settings", L"Back to defaults: style, accent, shortcut, profiles, delays and remembered brightness", SK_BUTTON, 2, L"Reset settings");
             break;
         }
@@ -7253,6 +7257,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (it.id == 42) g_picFull = !g_picFull;
             else if (it.id == 43) g_picSmall = !g_picSmall;
             else if (it.id == 44) g_ckDrift = g_ckDrift ? 0 : 1;
+            else if (it.id == 45) g_crashLog = !g_crashLog;
             SaveSettings();
             break;
         case SK_LINK:
@@ -7300,6 +7305,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SaveSettings();
             }
             if (it.id == 42) ScreenOffRequest();
+            if (it.id == 70) ReportProblem();
             if (it.id == 30) PartyStart();
             if (it.id == 31) { g_arrOff = 0; g_arrDirty = true; g_arrMsg.clear(); }
             if (it.id == 32) { g_arrMsg = ArrApply() ? L"Done \u00B7 Windows has the new arrangement" : L"Windows didn't take the new arrangement"; BrightRequest(true, false); }
@@ -7960,17 +7966,66 @@ static bool InstallOrUpdate() {
 
 // ---------------------------------------------------------------- entry
 const char* g_crumb = "start";   // the last step the flyouts reached: written to crash.txt if Knob ever crashes
+static std::wstring CrashDir() { size_t k = g_iniPath.find_last_of(L'\\'); return k == std::wstring::npos ? L"" : g_iniPath.substr(0, k + 1); }
+static unsigned WinBuild() {
+    typedef LONG (WINAPI* RtlGetVersion_t)(OSVERSIONINFOW*);
+    RtlGetVersion_t f = (RtlGetVersion_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    OSVERSIONINFOW v = {sizeof(v)}; if (f && f(&v) == 0) return v.dwBuildNumber; return 0;
+}
+static void CrashAppend(const char* line, int n) {   // one line in crash.txt, which never grows past about 60 KB
+    if (!g_crashLog || n <= 0) return;
+    HANDLE f = CreateFileW((CrashDir() + L"crash.txt").c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz = {}; GetFileSizeEx(f, &sz);
+    if (sz.QuadPart > 60000) { SetFilePointer(f, 0, nullptr, FILE_BEGIN); SetEndOfFile(f); } else SetFilePointer(f, 0, nullptr, FILE_END);
+    DWORD w; WriteFile(f, line, n, &w, nullptr); CloseHandle(f);
+}
 static LONG WINAPI CrashLog(EXCEPTION_POINTERS* ep) {
-    std::wstring p = g_iniPath; size_t k = p.find_last_of(L'\\'); if (k != std::wstring::npos) p = p.substr(0, k + 1); else p.clear();
-    HANDLE f = CreateFileW((p + L"crash.txt").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f != INVALID_HANDLE_VALUE) {
-        char b[400]; HMODULE m = GetModuleHandleW(nullptr);
-        int n = snprintf(b, sizeof(b), "Knob %ls crash: code %08lX at +%llX (access %llu at %llX), last step: %s\r\n", APP_VERSION, ep->ExceptionRecord->ExceptionCode,
-            (unsigned long long)((BYTE*)ep->ExceptionRecord->ExceptionAddress - (BYTE*)m), (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0),
-            (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0), g_crumb);
-        DWORD w; WriteFile(f, b, n, &w, nullptr); CloseHandle(f);
+    if (!g_crashLog) return EXCEPTION_CONTINUE_SEARCH;
+    BYTE* base = (BYTE*)GetModuleHandleW(nullptr);
+    DWORD imgSize = ((IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew))->OptionalHeader.SizeOfImage;
+    char b[900]; int n = snprintf(b, sizeof(b), "Knob %ls, Windows build %u: crash %08lX at +%llX (access %llu at %llX), last step: %s, stack:", APP_VERSION, WinBuild(), ep->ExceptionRecord->ExceptionCode,
+        (unsigned long long)((BYTE*)ep->ExceptionRecord->ExceptionAddress - base), (unsigned long long)(ep->ExceptionRecord->NumberParameters > 0 ? ep->ExceptionRecord->ExceptionInformation[0] : 0),
+        (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0), g_crumb);
+    ULONG_PTR stk[256]; SIZE_T got = 0;   // the places in Knob's own code that the stack points back to: a trail of where it was
+    if (ReadProcessMemory(GetCurrentProcess(), (void*)ep->ContextRecord->Rsp, stk, sizeof(stk), &got)) {
+        int found = 0;
+        for (size_t i = 0; i < got / sizeof(ULONG_PTR) && found < 14 && n < (int)sizeof(b) - 24; i++)
+            if (stk[i] >= (ULONG_PTR)base + 0x1000 && stk[i] < (ULONG_PTR)base + imgSize) { n += snprintf(b + n, sizeof(b) - n, " +%llX", (unsigned long long)(stk[i] - (ULONG_PTR)base)); found++; }
     }
+    n += snprintf(b + n, sizeof(b) - n, "\r\n");
+    CrashAppend(b, n);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+static std::wstring RunFlagPath() { return CrashDir() + L"running.flag"; }
+static void RunFlagStart() {   // a file that exists only while Knob runs: if it's still there next time, the last run ended unexpectedly
+    std::wstring fl = RunFlagPath(); char old[32] = {}; DWORD rd = 0;
+    HANDLE f = CreateFileW(fl.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        ReadFile(f, old, sizeof(old) - 1, &rd, nullptr); CloseHandle(f);
+        char b[160]; int n = snprintf(b, sizeof(b), "Knob %s: the run before this one ended without a clean exit (crash, kill or power loss)\r\n", old);
+        CrashAppend(b, n);
+    }
+    f = CreateFileW(fl.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { char v[32]; int n = snprintf(v, sizeof(v), "%ls", APP_VERSION); DWORD w; WriteFile(f, v, n, &w, nullptr); CloseHandle(f); }
+}
+static void RunFlagEnd() { DeleteFileW(RunFlagPath().c_str()); }
+static std::string UrlEnc(const std::string& in) {
+    std::string o; char h[4];
+    for (unsigned char c : in) { if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') o += (char)c; else { snprintf(h, sizeof(h), "%%%02X", c); o += h; } }
+    return o;
+}
+static void ReportProblem() {   // opens a GitHub issue with the version, Windows build and the last crash lines filled in; nothing is sent unless the person submits it
+    std::string log; HANDLE f = CreateFileW((CrashDir() + L"crash.txt").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { char buf[60001]; DWORD rd = 0; ReadFile(f, buf, 60000, &rd, nullptr); CloseHandle(f); log.assign(buf, rd); }
+    while (!log.empty() && (log.back() == '\n' || log.back() == '\r')) log.pop_back();
+    size_t pos = log.size(); for (int i = 0; i < 3 && pos != std::string::npos && pos > 0; i++) pos = log.rfind('\n', pos - 1);   // the last three lines
+    log = pos == std::string::npos ? log : (pos + 1 <= log.size() ? log.substr(pos + 1) : log);
+    char head[160]; snprintf(head, sizeof(head), "Knob %ls, Windows build %u", APP_VERSION, WinBuild());
+    std::string body = std::string("**What happened?**\n\n\n\n**What did you expect?**\n\n\n---\n") + head + "\n" + (log.empty() ? "" : "\nCrash log:\n```\n" + log + "\n```\n");
+    std::wstring url = L"https://github.com/" UPDATE_REPO L"/issues/new?title=" + std::wstring(UrlEnc("Problem with Knob ").begin(), UrlEnc("Problem with Knob ").end()) + L"&body=";
+    std::string enc = UrlEnc(body); url += std::wstring(enc.begin(), enc.end());
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     SetUnhandledExceptionFilter(CrashLog);
@@ -7997,6 +8052,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     GdiplusStartup(&gtoken, &gsi, nullptr);
 
     LoadSettings();
+    RunFlagStart();
     if (StartupEnabled()) SetStartup(true);   // point "Start with Windows" at this copy (and drop the old LiteMix entry)
     LoadTheme();
     AllowDarkMenus();
@@ -8067,6 +8123,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
 
     SaveSettings();
+    RunFlagEnd();
     if (g_mediaThread) { PostThreadMessageW(g_mediaTid, MC_QUIT, 0, 0); WaitForSingleObject(g_mediaThread, 2000); CloseHandle(g_mediaThread); g_mediaThread = nullptr; }
     StopRouter();
     g_appExtra.clear(); RestartAppRouters();   // stop every app copy
