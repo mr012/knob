@@ -55,7 +55,7 @@ namespace Gdiplus { using std::min; using std::max; }
 using namespace Gdiplus;
 
 #define APP_NAME    L"Knob"
-#define APP_VERSION L"1.42.17"
+#define APP_VERSION L"1.42.18"
 #define UPDATE_REPO L"mr012/knob"   // GitHub repo whose latest release is checked for updates   // compared when a newer exe replaces a running one
 
 // ---------------------------------------------------------------- globals
@@ -358,7 +358,7 @@ static void LoadSettings() {
         auto gs = [&](const wchar_t* k) { wchar_t b[256] = {}; GetPrivateProfileStringW(L"main", k, L"", b, 256, g_iniPath.c_str()); return std::wstring(b); };
         g_offDelay = gi(L"offdelay", 0, 0, 4); g_offClock = gi(L"offclock", 0, 0, 1); g_offFull = gi(L"offfull", 0, 0, 1); g_clockScr = gs(L"clockscr");
         g_ckStyle = gi(L"ckstyle", 0, 0, 3); g_ckSize = gi(L"cksize", 1, 0, 2); g_ckBright = gi(L"ckbright", 0, 0, 2); g_ckColour = gi(L"ckcolour", 0, 0, 3); g_ckHour = gi(L"ckhour", 0, 0, 2);
-        g_ckDate = gi(L"ckdate", 1, 0, 1); g_ckNow = gi(L"cknow", 0, 0, 1); g_picFull = gi(L"picfull", 0, 0, 1); g_picSmall = gi(L"picsmall", 0, 0, 1); g_picDim = gi(L"picdim", 1, 0, 2); g_picFile = gs(L"picfile"); g_ckPos = gi(L"ckpos", 0, 0, 8); g_ckDrift = gi(L"ckdrift", 0, 0, 2);
+        g_ckDate = gi(L"ckdate", 1, 0, 1); g_ckNow = gi(L"cknow", 0, 0, 1); g_picFull = gi(L"picfull", 0, 0, 1); g_picSmall = gi(L"picsmall", 0, 0, 1); g_picDim = gi(L"picdim", 1, 0, 2); g_picFile = gs(L"picfile"); g_ckPos = gi(L"ckpos", 0, 0, 8); g_ckDrift = gi(L"ckdrift", 0, 0, 1);
         g_partyScr = gs(L"partyscr"); { int old = gi(L"partylook", 0, 0, 3); old = old == 1 ? 0 : old > 1 ? old - 1 : 0; g_partyLook = gi(L"partylook2", old, 0, 2); } g_partyInfo = gi(L"partyinfo", 1, 0, 1); g_partyClose = gi(L"partyclose", 0, 0, 1); g_rateBat = gi(L"ratebat", 0, 0, 1);   // the old look list had Mirror bars second
         g_popMedia = gi(L"popmedia", 0, 0, 1); g_popNext = gi(L"popnext", 0, 0, 1); g_popLock = gi(L"poplock", 0, 0, 1);
         g_fPos = gi(L"fpos", 0, 0, 5); g_fScreen = gi(L"fscreen", 0, 0, 2); g_fStayMs = gi(L"fstayms", 2000, 0, 60000); g_fAnimMs = gi(L"fanimms", 300, 0, 2000); g_lkStayMs = gi(L"lkstayms", g_fStayMs ? g_fStayMs : 2000, 100, 60000);
@@ -5899,7 +5899,7 @@ static void PaintClock(HWND h, HDC dc) {   // the time and date on the black scr
         else if (g_ckColour == 3) { Color a = T.accent; float m = std::max(1.f, (float)std::max(a.GetR(), std::max(a.GetG(), a.GetB()))); cr = a.GetR() / m; cg = a.GetG() / m; cb = a.GetB() / m; }
         auto tone = [&](float k) { return Color(255, (BYTE)(cr * lev * k * 255), (BYTE)(cg * lev * k * 255), (BYTE)(cb * lev * k * 255)); };
         LONG_PTR seed = GetWindowLongPtrW(h, GWLP_USERDATA) >> 1;   // the drift for this minute
-        static const float driftK[3] = {0.f, 0.02f, 0.06f};
+        static const float driftK[2] = {0.f, 0.035f};
         static const float gridX[9] = {0.5f, 0.5f, 0.5f, 0.2f, 0.8f, 0.2f, 0.8f, 0.2f, 0.8f}, gridY[9] = {0.5f, 0.2f, 0.8f, 0.5f, 0.5f, 0.2f, 0.2f, 0.8f, 0.8f};   // centre, top, bottom, left, right, then the corners
         int gp = std::max(0, std::min(8, g_ckPos));
         float wx = ((seed % 97) / 48.f - 1) * w * driftK[g_ckDrift], wy = (((seed / 97) % 97) / 48.f - 1) * hh * driftK[g_ckDrift];
@@ -6818,7 +6818,7 @@ static void PaintSettings(HDC hdc) {
                     ddCard(43, L"Colour", L"", {L"Grey", L"Warm", L"Cool", L"Accent"}, g_ckColour, -1);
                     ddCard(44, L"Hours", L"", {L"Same as Windows", L"12-hour", L"24-hour"}, g_ckHour, -1);
                     ddCard(46, L"Position", L"", {L"Centre", L"Top", L"Bottom", L"Left", L"Right", L"Top left", L"Top right", L"Bottom left", L"Bottom right"}, g_ckPos, -1);
-                    ddCard(47, L"Move around", L"Shifts a little every minute so OLED screens don't burn in", {L"Off", L"A little", L"More"}, g_ckDrift, -1);
+                    switchCard(44, L"Move around", L"Shifts a little every minute so OLED screens don't burn in", g_ckDrift != 0);
                     switchCard(40, L"Show the date", L"", g_ckDate);
                     switchCard(41, L"Show what's playing", L"Cover, title and artist, small in a corner. Not shown on a completely black screen", g_ckNow);
                     {
@@ -7184,8 +7184,8 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else v = k >= 1 && k - 1 < (int)names.size() ? names[k - 1] : L"";
                 (dd == 17 ? g_clockScr : g_partyScr) = v; SaveSettings();
             }
-            if (dd >= 40 && dd <= 47) {
-                int* v[8] = {&g_ckStyle, &g_ckSize, &g_ckBright, &g_ckColour, &g_ckHour, &g_picDim, &g_ckPos, &g_ckDrift};
+            if (dd >= 40 && dd <= 46) {
+                int* v[7] = {&g_ckStyle, &g_ckSize, &g_ckBright, &g_ckColour, &g_ckHour, &g_picDim, &g_ckPos};
                 *v[dd - 40] = k; SaveSettings();
             }
             if (dd == 31) { g_partyClose = std::max(0, std::min(1, k)); SaveSettings(); }
@@ -7219,6 +7219,7 @@ static LRESULT CALLBACK SettingsProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             else if (it.id == 41) g_ckNow = !g_ckNow;
             else if (it.id == 42) g_picFull = !g_picFull;
             else if (it.id == 43) g_picSmall = !g_picSmall;
+            else if (it.id == 44) g_ckDrift = g_ckDrift ? 0 : 1;
             SaveSettings();
             break;
         case SK_LINK:
